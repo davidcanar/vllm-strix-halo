@@ -36,7 +36,6 @@ exec vllm serve "$MODEL_DIR" \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   --quantization compressed-tensors \
-  --kv-cache-dtype fp8 \
   --enforce-eager \
   --skip-mm-profiling \
   --gpu-memory-utilization ${VSH_GLM53_GPU_UTIL:-0.83} \
