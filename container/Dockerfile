@@ -134,6 +134,16 @@ RUN cd /opt/venv/lib/python3.12/site-packages && \
 RUN find /opt/venv/lib/python3.12/site-packages/vllm \
          -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 
+# gfx1151 defaults, baked into the image so EVERY process (raylet, ray
+# workers, driver) sees them from birth. vLLM snapshots VLLM_ROCM_USE_AITER
+# at module import — propagating it only via the driver->worker RPC arrives
+# too late (the worker has already imported vllm). The cluster env files
+# (host/vsh-cluster-env.sh) re-export the same values, so they stay tunable.
+# - aiter ON: the glm5next sparse-attention indexer's ROCm path requires it
+# - aiter MoE OFF: aiter's MoE kernels do not support gfx1151
+ENV VLLM_ROCM_USE_AITER=1 \
+    VLLM_ROCM_USE_AITER_MOE=0
+
 # com.github.containers.toolbox is what `toolbox create` checks for.
 LABEL com.github.containers.toolbox="true" \
       org.opencontainers.image.title="vllm-strix-halo" \

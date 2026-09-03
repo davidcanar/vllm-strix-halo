@@ -17,6 +17,7 @@
 # below: a '#' there silently comments out every remaining argument.
 set -u
 source "$HOME/vsh-cluster-env.${VSH_TRANSPORT:-rdma}.sh"
+echo "[vsh-serve] HOME=$HOME VLLM_ROCM_USE_AITER=$VLLM_ROCM_USE_AITER VLLM_ROCM_USE_AITER_MOE=${VLLM_ROCM_USE_AITER_MOE:-unset} VSH_TBV_AR2=${VSH_TBV_AR2:-unset}"
 
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
 PORT=${VSH_GLM53_API_PORT:-1235}
