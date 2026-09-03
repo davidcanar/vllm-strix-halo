@@ -16,3 +16,14 @@ diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/
          return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
      else:
          return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+@@ -639,2 +639,10 @@
+     if aiter_paged_mqa_logits_module is not None:
++        # vllm-strix-halo: q arrives as NVIDIA-style fp8 (fp8e4nv); the
++        # aiter paged-MQA triton kernels expect the ROCm-native fp8
++        # (fp8e4m3fnuz) and triton rejects fp8e4nv on AMD.
++        if (
++            current_platform.is_rocm()
++            and q_fp8.dtype == torch.float8_e4m3fn
++        ):
++            q_fp8 = q_fp8.to(current_platform.fp8_dtype())
+         if _ON_GFX942 or _ON_GFX950:
