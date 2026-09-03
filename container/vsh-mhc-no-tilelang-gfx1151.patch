@@ -1,0 +1,15 @@
+diff --git a/vllm/model_executor/layers/mhc.py b/vllm/model_executor/layers/mhc.py
+--- a/vllm/model_executor/layers/mhc.py
++++ b/vllm/model_executor/layers/mhc.py
+@@ -21,7 +21,10 @@
+     if current_platform.is_rocm():
+         from vllm.platforms.rocm import on_gfx942
++        from vllm.platforms.rocm import on_gfx1151
+ 
+         # TileLang MHC currently produces incorrect results on gfx942. Keep
+         # gfx942 on the existing torch/triton fallbacks until that path is fixed.
+-        return not on_gfx942()
++        # vllm-strix-halo: gfx1151 (Strix Halo) crashes natively in the
++        # compiled TileLang MHC kernels (worker dies on the first forward).
++        return not on_gfx942() and not on_gfx1151()
+     return False

@@ -119,12 +119,15 @@ RUN /opt/venv/bin/hipcc -O2 --offload-arch=gfx1151 -shared -fPIC \
       /tmp/vsh-native/tbv_ar.c -libverbs && \
     rm -rf /tmp/vsh-native
 
-# RDMA all-reduce hook (VSH_TBV_AR2) in the CUDA communicator. Model-agnostic,
-# env-gated, fail-open. Reviewed in PATCHES.md.
-COPY container/patches/vsh-rdma-allreduce.patch /tmp/
+# RDMA all-reduce hook (VSH_TBV_AR2) in the CUDA communicator, and the
+# gfx1151 TileLang-MHC gate fix. Model-agnostic, env-gated, fail-open.
+# Reviewed in PATCHES.md.
+COPY container/patches/vsh-rdma-allreduce.patch \
+     container/patches/vsh-mhc-no-tilelang-gfx1151.patch /tmp/
 RUN cd /opt/venv/lib/python3.12/site-packages && \
-    git apply -p1 --whitespace=nowarn /tmp/vsh-rdma-allreduce.patch && \
-    rm /tmp/vsh-rdma-allreduce.patch
+    git apply -p1 --whitespace=nowarn \
+      /tmp/vsh-rdma-allreduce.patch /tmp/vsh-mhc-no-tilelang-gfx1151.patch && \
+    rm /tmp/vsh-rdma-allreduce.patch /tmp/vsh-mhc-no-tilelang-gfx1151.patch
 
 # Drop stale bytecode for the touched package so the first import recompiles
 # from the patched sources.
