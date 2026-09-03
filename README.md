@@ -73,7 +73,7 @@ Full ordered runbook with gates and gotchas: **[AGENTS.md](AGENTS.md)**.
 
 | profile | model | weights | API port | quantization |
 |---|---|---|---|---|
-| `glm53` | GLM-5.3-Flash | `wtdcode/GLM-5.3-Flash-AWQ-W4A16` (~191 GB) | 1235 | compressed-tensors W4A16 (+ fp8 KV), MTP on |
+| `glm53` | GLM-5.3-Flash | `wtdcode/GLM-5.3-Flash-AWQ-W4A16` (~191 GB) | 1235 | compressed-tensors W4A16, bf16 KV; MTP supported but disabled on the reference rig (gfx1151 crash — PATCHES.md §5.4) |
 | `ds4` | DeepSeek-V4-Flash | `deepseek-ai/DeepSeek-V4-Flash-0731` (~156 GB) | 1234 | fp8 KV + DSpark MTP (ds4-vllm image) |
 
 > The official `zai-org/GLM-5.3-Flash` checkpoint is FP8 ≈ 335 GB — it cannot
@@ -82,10 +82,17 @@ Full ordered runbook with gates and gotchas: **[AGENTS.md](AGENTS.md)**.
 
 ## Performance note
 
-GLM-5.3-Flash on this rig is a *memory-bound* deployment: the AWQ weights are
-~95 GB/box and decode is a single stream through 46 hybrid layers over the
-Thunderbolt all-reduce. Numbers are measured during bring-up and recorded in
-the [README of the running cluster](AGENTS.md#performance); treat anything
+Validated on the reference rig (2× Ryzen AI Max+ 395 / 128 GB each), single
+stream, temperature 0, TP all-reduce over the Thunderbolt RoCE rail (RCCL
+`Using network IB` on `usb4_rdma0`, 40 Gbps), MTP off:
+
+| context | total (100-token generation) |
+|---|---|
+| 512 | ~6.7 tok/s |
+| 4.5k | ~2.4 tok/s |
+
+First-bring-up baselines; the per-step fp8→fnuz conversion on the sparse-MQA
+path is the known next optimization (PATCHES.md §1.3). Treat any figure
 quoted elsewhere as unverified.
 
 ## License & attribution

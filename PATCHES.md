@@ -28,7 +28,7 @@ files, layered on `kyuz0/vllm-therock-gfx1151` (ROCm 7.14).
 | Disk KV tier (`fs_lru`, `distributed.py`, offload batch bounds) | ❌ **No** | Valuable work, but a DS4-specific tier. vLLM upstream has its own offloading stack; we start without a disk tier (see §5). |
 | OpenAI reasoning/tool fixes (`deepseek_v4_encoding.py`, structured-output `</think>` boundary) | ❌ **No** | DS4 tokenizer/parser work. GLM-5.3 uses the standard chat path. |
 | **Thunderbolt RDMA kernel modules** (`tbv/`: patched `thunderbolt`, `thunderbolt_net`, `thunderbolt_ibverbs`, `nhi_throttle`) | ✅ **Yes — verbatim** | This is the fabric itself. It is model-agnostic. Already built & loaded on the reference rig; vendored here (`tbv/`) so a fresh pair of boxes can be rebuilt. GPL-2.0 (kernel side) — see THIRD_PARTY_NOTICES.md. |
-| **`usb4_rdma` libibverbs provider built into the image** | ✅ **Yes — adapted** | Without it `ibv_devices` is empty inside the container and RCCL silently falls back to TCP. ds4-vllm built it against rdma-core v57 (its base's ABI); this repo's ROCm 10 base ships libibverbs 1.16.62 → **provider ABI rdmav59**, so we build against rdma-core v59.0. |
+| **`usb4_rdma` libibverbs provider built into the image** | ✅ **Yes — adapted** | Without it `ibv_devices` is empty inside the container and RCCL silently falls back to TCP. ds4-vllm built it against rdma-core v57 (its base's ABI); this repo ships the same proven pair — provider rdmav57 + libibverbs 1.14.58 — because the ROCm 10 base's rdmav59-era libibverbs gets EINVAL from the thunderbolt kernel driver's uverbs dispatch (verified with RCCL falling back to `Using network Socket` until the swap, then `Using network IB`). |
 | **`DS4_TBV_AR2` custom all-reduce hook** (`cuda_communicator.py`) + `tbv_ar2.hip` native | ✅ **Yes — rebased, renamed `VSH_TBV_AR2`** | Model-agnostic, env-gated, fail-open. Carries the small decode all-reduce (~105 µs/op) while prefill-sized collectives go over RCCL-over-IB on the same rail. The hook lives in vLLM's *distributed* layer, not in any model file — the DS4 model patches (`deepseek_v4/amd/model.py`) are **not** part of it. Rebased against vLLM main and shipped as `container/patches/vsh-rdma-allreduce.patch`. |
 | `tbv_ar` v1 native (`tbv_ar.c`) | ⚠️ Vendored, not wired | DS4's v1 path was superseded by v2 and its hook is not carried. The native builds for experimentation; only v2 is hooked. |
 | RCCL CQ warm-up (DS4 `deepseek_v4/amd/model.py` +67) | ⚠️ **Candidate, not applied** | DS4 pre-creates RCCL's RDMA completion queue before the ~80 GiB weight load to dodge an ENOMEM crash on ROCm 7.14. If the failure reproduces on the ROCm 10 stack we will port it (it's ~15 lines, model-local). Not applied preemptively — see §5. |
@@ -37,22 +37,43 @@ files, layered on `kyuz0/vllm-therock-gfx1151` (ROCm 7.14).
 | `breakable_cudagraph.py` stream-sync fix | ❌ **No (for now)** | We serve `--enforce-eager` (same as DS4). If cudagraphs are enabled later, revisit. |
 | Scheduler / KV / MTP tweaks (`kv_cache_utils.py`, `llm_base_proposer.py`, …) | ❌ **No** | DS4-specific layouts and DSpark drafter. GLM-5.3's KV grouping and its MTP (`glm5_next_mtp`) are upstream. |
 
-**Net:** this repo patches **two** vLLM files (the all-reduce hook + the
-TileLang-MHC gate) and builds two RDMA pieces into the image (provider +
-natives). Everything else is upstream vLLM + configuration.
+**Net:** this repo patches **three** vLLM files (the all-reduce hook, the
+TileLang-MHC gate, the aiter support gate + fp8 casts) and replaces three
+RDMA userspace pieces in the image (provider, libibverbs, tools). Everything
+else is upstream vLLM + configuration.
 
-The second patch (`vsh-mhc-no-tilelang-gfx1151.patch`) was found during the
-reference-rig bring-up, not inherited from ds4-vllm: upstream vLLM enables
-TileLang `mhc` fused kernels on ROCm for everything except gfx942, but the
-compiled kernels crash natively on gfx1151 (both TP ranks die without a
-traceback on the first forward, right after `TileLang begins to compile
-mhc_pre_big_fuse_with_norm_tilelang`). The patch routes gfx1151 to the same
-torch/triton fallbacks upstream already maintains for gfx942.
+The non-DS4 patches were found during the reference-rig bring-up (all
+gfx1151-specific, all upstream-bug-class):
 
-Also from the bring-up (config-only, no patch): the vision-encoder cache
-profiling (`Encoder cache will be initialized...`) kills the worker on
-gfx1151, so the serve script passes `--skip-mm-profiling` — text-only serving
-does not need the multimodal encoder cache.
+1. **TileLang MHC gate** (`vsh-mhc-no-tilelang-gfx1151.patch`): upstream
+   enables TileLang `mhc` fused kernels on ROCm for everything except gfx942,
+   but the compiled kernels crash natively on gfx1151 (both TP ranks die on
+   the first forward). The patch routes gfx1151 to the torch/triton
+   fallbacks upstream already maintains for gfx942.
+2. **AITER support gate** (`vsh-aiter-gfx1151-gate.patch`): upstream gates
+   aiter to `get_cdna_version() > 2`, hiding kyuz0's gfx1151 aiter build
+   (which ships the sparse-attention indexer op) and making the glm5next
+   sparse indexer raise "Sparse attention indexer ROCm path is only
+   supported on AITER" no matter the env. The patch admits gfx1151 when
+   aiter is present.
+3. **fp8 format** (`vsh-fp8-fnuz-mqa.patch` + the aiter
+   `pa_mqa_logits.py` overlay): this stack's `current_platform.fp8_dtype()`
+   is `fp8e4nv` (NVIDIA format), but triton's `tl.dot` on AMD only accepts
+   `fp8e4m3fnuz` — the sparse-MQA logits kernels die with "Unsupported lhs
+   dtype fp8e4nv". q is cast to fnuz at the vLLM call sites and the aiter
+   wrapper converts the packed K payload.
+4. **RDMA userspace ABI**: the base image's rdmav59-era libibverbs marshals
+   `query_device` in a way the thunderbolt kernel driver rejects (EINVAL) —
+   RCCL silently fell back to TCP. The image now ships the DS4-proven pair:
+   provider `rdmav57` + libibverbs `1.14.58` (+ matching `ibv_*` tools),
+   and RCCL logs `Using network IB` (`usb4_rdma0`, RoCE, 40 Gbps).
+
+Config-only bring-up findings (no patch): the vision-encoder cache profiling
+kills the worker on gfx1151 → `--skip-mm-profiling`; the aiter env must be
+baked into the image (vLLM snapshots it at import, before the driver→worker
+env RPC lands); `VLLM_ROCM_USE_AITER_MOE=0` (aiter MoE kernels don't support
+gfx1151); aiter needs the gfx1151 GEMM/BATCHED_GEMM tuned configs (cloned
+from the gfx1201 RDNA4 tunes into the image).
 
 ## 2. Why the image rebuilds vLLM at all
 
@@ -123,8 +144,16 @@ together. See AGENTS.md §RDMA.
 2. **No disk KV tier.** DS4's `fs_lru` tier is DS4-specific and not carried.
    `glm53_max_ctx` starts at 32 K for the ~4 GiB KV pin; raise as memory allows.
 3. **No cudagraphs.** `--enforce-eager` (matches the validated DS4 profile).
-4. **MTP** is on by default (`glm5_next_mtp`, 3 draft tokens, configurable via
-   `glm53_mtp_tokens`; 0 disables).
+4. **MTP** is on by default in the repo (`glm5_next_mtp`, 3 draft tokens) but
+   **crashes the worker on gfx1151** in the reference deployment: the
+   drafter's multi-token decode exercises the aiter indexer's CDNA-only
+   decode path (SIGABRT, no traceback). The reference config therefore runs
+   `glm53_mtp_tokens: 0` until the indexer decode gets a gfx1151 triton path
+   (same work class as DS4's `ds4_topk.py`). Validated baseline without MTP:
+   **~6.7 tok/s** at 512 ctx, **~2.4 tok/s** at 4.5k ctx (100-token
+   generations, single stream, temperature 0; first-request JIT warm-up
+   excluded; RDMA transport confirmed via RCCL `Using network IB` on
+   `usb4_rdma0`).
 5. **RCCL CQ warm-up** not pre-applied (see §1). Symptom to watch: EngineCore
    SIGSEGV during weight load on a memory-tight box.
 6. **NVFP4/EXL3 4-bit formats** seen in the wild for GLM-5.3 are NVIDIA-only;

@@ -79,7 +79,8 @@ toolbox run -c vllm-glm bash -c 'ls /dev/infiniband && ibv_devices'   # must lis
 ```
 
 If `ibv_devices` is empty inside the container, the provider ABI is wrong —
-see PATCHES.md §1 (provider must match the base's libibverbs ABI, rdmav59).
+see PATCHES.md §1 (the image ships provider rdmav57 + libibverbs 1.14.58,
+the pairing the thunderbolt kernel driver's uverbs dispatch accepts).
 
 ## 3. Model weights — both boxes
 
@@ -111,8 +112,9 @@ host/deploy.sh                                # installs scripts + unit; syncs b
 
 Bring-up gates: containers exec-able on both boxes → Ray 2.0 GPU → API 200 on
 `:1235` → warmup dispatched. A cold kernel cache adds ~25 min of Triton/LLVM
-compiles on first boot. RDMA verification greps the serve journal for
-`tbv_ar2: rank[0-9] ready (qpn=... peer_qpn=...)`.
+compiles on first boot. RDMA verification greps the serve journal for RCCL's
+`Using network IB` (with `NCCL_DEBUG=INFO`; the tbv_ar2 fast-path is off by
+default — PATCHES.md §5.0).
 
 ## 6. Model switching / coexistence
 
@@ -131,8 +133,9 @@ compiles on first boot. RDMA verification greps the serve journal for
 |---|---|---|
 | `glm53_max_ctx` | 32768 | context cap (KV pin / block size bound) |
 | `glm53_kv_bytes` | 4294967296 | pinned GPU KV pool |
-| `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off |
-| `glm53_aiter` | 0 | allow aiter kernels (DS4 ran aiter-less) |
+| `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off (MTP crashes gfx1151 — PATCHES.md §5.4; reference rig runs 0) |
+| `glm53_aiter` | 1 | aiter must be ON — the sparse-attention indexer's ROCm path requires it |
+| `glm53_tbv_ar2` | 0 | tbv_ar2 decode fast-path (crashes the ROCm 10 stack — PATCHES.md §5.0) |
 | `transport` | rdma | rdma \| tcp fallback |
 | `rdma_hca` | usb4_rdma0 | pin one unambiguous HCA |
 
@@ -150,7 +153,16 @@ compiles on first boot. RDMA verification greps the serve journal for
 
 ## 9. Performance
 
-Measured during validation on the reference rig (2× Ryzen AI Max+ 395 / 128 GB
-each), single stream, temperature 0 — numbers are recorded here after each
-bring-up change. The first measured run after the initial bring-up is the
-baseline; treat any figure quoted before that as unverified.
+Validated on the reference rig (2× Ryzen AI Max+ 395 / 128 GB each), single
+stream, temperature 0, RDMA transport (RCCL `Using network IB` on
+`usb4_rdma0`, RoCE 40 Gbps), MTP off (see §7 — MTP crashes gfx1151 until the
+indexer decode gets a triton path):
+
+| context | total (100-token generation) |
+|---|---|
+| 512 | ~6.7 tok/s |
+| 4.5k | ~2.4 tok/s |
+
+These are first-bring-up baselines with the per-step fp8→fnuz conversion on
+the sparse-MQA path (see PATCHES.md §1.3 — an in-kernel conversion is the
+next optimization). Treat higher figures quoted elsewhere as unverified.
