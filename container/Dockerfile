@@ -82,8 +82,9 @@ RUN git init -q /tmp/vllm-src && \
     git -C /tmp/vllm-src checkout -q FETCH_HEAD && \
     cd /tmp/vllm-src && \
     PYTORCH_ROCM_ARCH=gfx1151 VLLM_USE_PRECOMPILED=0 MAX_JOBS=8 \
+    ROCM_PATH=${ROCM_DEVEL_PATH} \
     SETUPTOOLS_SCM_PRETEND_VERSION="0.29.0.dev0+git.${VLLM_COMMIT}" \
-    CMAKE_ARGS="-DCMAKE_PREFIX_PATH=${ROCM_DEVEL_PATH} -DCMAKE_MODULE_PATH=${ROCM_DEVEL_PATH}/lib/cmake/hip" \
+    CMAKE_ARGS="-DCMAKE_PREFIX_PATH=${ROCM_DEVEL_PATH}/lib/cmake -DCMAKE_MODULE_PATH=${ROCM_DEVEL_PATH}/lib/cmake/hip" \
     python -m pip install --no-build-isolation --no-deps . && \
     rm -rf /tmp/vllm-src
 
