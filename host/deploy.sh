@@ -7,6 +7,8 @@ R="$HOME/vllm-strix-halo"
 WORKER="${1:-10.0.2.2}"
 
 echo "== box1: deploy host scripts + site config =="
+install -m 0755 "$R/vllm-strix-halo.sh"                    "$HOME/vllm-strix-halo.sh"
+install -m 0755 "$R/scripts/download-models.sh"            "$HOME/download-models-vllm.sh"
 install -m 0755 "$R/host/vsh-config"                       "$HOME/vsh-config"
 install -m 0755 "$R/host/vsh-cluster-restart.sh"           "$HOME/vsh-cluster-restart.sh"
 install -m 0755 "$R/host/vsh-cluster-down.sh"              "$HOME/vsh-cluster-down.sh"
