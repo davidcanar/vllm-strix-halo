@@ -124,13 +124,14 @@ RUN /opt/venv/bin/hipcc -O2 --offload-arch=gfx1151 -shared -fPIC \
 # Reviewed in PATCHES.md.
 COPY container/patches/vsh-rdma-allreduce.patch \
      container/patches/vsh-mhc-no-tilelang-gfx1151.patch \
-     container/patches/vsh-aiter-gfx1151-gate.patch /tmp/
+     container/patches/vsh-aiter-gfx1151-gate.patch \
+     container/patches/vsh-fp8-fnuz-mqa.patch /tmp/
 RUN cd /opt/venv/lib/python3.12/site-packages && \
     git apply -p1 --whitespace=nowarn \
       /tmp/vsh-rdma-allreduce.patch /tmp/vsh-mhc-no-tilelang-gfx1151.patch \
-      /tmp/vsh-aiter-gfx1151-gate.patch && \
+      /tmp/vsh-aiter-gfx1151-gate.patch /tmp/vsh-fp8-fnuz-mqa.patch && \
     rm /tmp/vsh-rdma-allreduce.patch /tmp/vsh-mhc-no-tilelang-gfx1151.patch \
-      /tmp/vsh-aiter-gfx1151-gate.patch
+      /tmp/vsh-aiter-gfx1151-gate.patch /tmp/vsh-fp8-fnuz-mqa.patch
 
 # Drop stale bytecode for the touched package so the first import recompiles
 # from the patched sources.

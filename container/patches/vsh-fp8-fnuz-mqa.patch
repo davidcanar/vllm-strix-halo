@@ -1,0 +1,18 @@
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -796,5 +796,14 @@
+     if aiter_mqa_logits_module is not None:
+         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
++        # vllm-strix-halo: callers hand us NVIDIA-style fp8 (fp8e4nv); the
++        # aiter triton/flydsl kernels are built for the ROCm-native fp8
++        # (fp8e4m3fnuz) and reject fp8e4nv at JIT time
++        # ("Unsupported lhs dtype fp8e4nv").
++        if current_platform.is_rocm():
++            if q.dtype == torch.float8_e4m3fn:
++                q = q.to(current_platform.fp8_dtype())
++            if k_fp8.dtype == torch.float8_e4m3fn:
++                k_fp8 = k_fp8.to(current_platform.fp8_dtype())
+         return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+     else:
+         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
