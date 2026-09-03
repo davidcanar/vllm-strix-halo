@@ -122,6 +122,12 @@ COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core/build/lib/libusb4_rdma-rdmav*.so /usr/lib/x86_64-linux-gnu/libibverbs/
 COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core-lv/build/lib/libibverbs.so.1.* /usr/lib/x86_64-linux-gnu/
+# The base's rdma-core tools (ibv_devices/ibv_devinfo) need the private
+# symbols of the libibverbs they shipped with (IBVERBS_PRIVATE_59); replace
+# them with the matching v58-era builds.
+COPY --from=provider-build --chown=root:root \
+  /tmp/rdma-core-lv/build/bin/ibv_devices \
+  /tmp/rdma-core-lv/build/bin/ibv_devinfo /usr/bin/
 RUN printf 'driver usb4_rdma\n' > /etc/libibverbs.d/usb4_rdma.driver && \
     ln -sfn /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.58.0 \
       /usr/lib/x86_64-linux-gnu/libibverbs.so.1
