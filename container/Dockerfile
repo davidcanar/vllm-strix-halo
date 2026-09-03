@@ -19,10 +19,15 @@ ARG VSH_BASE="docker.io/kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.
 # vLLM source pin. Must be >= 98ed0856 (GLM-5.3-Flash support).
 ARG VLLM_REPO="https://github.com/vllm-project/vllm"
 ARG VLLM_COMMIT="8bf39632b86df21fa9bfbb470ce8305bf67a5838"
-# rdma-core branch the usb4_rdma provider is built against. The base ships
-# libibverbs 1.16.62.0 (provider ABI rdmav59, copied in by the image author),
-# so the provider must be the rdmav59 flavour or libibverbs never loads it.
-ARG RDMA_CORE_TAG="v59.0"
+# rdma-core branches for the usb4_rdma pieces. The thunderbolt kernel
+# driver's uverbs dispatch expects the OLDER command marshalling: the
+# rdmav59-era libibverbs in the base image gets EINVAL on query_device
+# (verified against the DS4 stack, which ships libibverbs 1.14.58 +
+# provider rdmav57 and queries fine). Provider ABI rdmav57 must match the
+# libibverbs we install (1.14.58), and vLLM's RCCL links libibverbs.so.1
+# (ABI-stable across these versions).
+ARG RDMA_CORE_TAG="v57.0"
+ARG LIBVERBS_CORE_TAG="v58.0"
 # hellas-ai/thunderbolt-ibverbs pin (same pin as tbv/build-modules.sh).
 ARG TBV_IBVERBS_COMMIT="76ba39b630a70accb72f19388eefe48844b50eb8"
 
@@ -33,6 +38,7 @@ ARG TBV_IBVERBS_COMMIT="76ba39b630a70accb72f19388eefe48844b50eb8"
 # back to TCP over the Thunderbolt IP link.
 FROM ${VSH_BASE} AS provider-build
 ARG RDMA_CORE_TAG
+ARG LIBVERBS_CORE_TAG
 ARG TBV_IBVERBS_COMMIT
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -49,6 +55,14 @@ RUN set -eux; \
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 && \
     cmake --build build --parallel 8 && \
     ls build/lib/libusb4_rdma-rdmav*.so
+# Also build the plain libibverbs from the kernel-driver-compatible era and
+# ship it in the final image (see ARG comments above).
+RUN set -eux; \
+    git clone --depth 1 -b ${LIBVERBS_CORE_TAG} https://github.com/linux-rdma/rdma-core /tmp/rdma-core-lv && \
+    cd /tmp/rdma-core-lv && \
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNO_PYVERBS=1 -DNO_MAN_PAGES=1 && \
+    cmake --build build --parallel 8 && \
+    ls build/lib/libibverbs.so.1.*
 
 # ---------- final stage: rebuild vLLM + RDMA pieces on the base ----------
 FROM ${VSH_BASE}
@@ -99,10 +113,18 @@ RUN python -m pip install --no-cache-dir \
         "tilelang==0.1.10" "apache-tvm-ffi==0.1.10" \
         "fastsafetensors>=0.3.3" "transformers>=5.10.4"
 
-# usb4_rdma userspace provider (rdmav59 ABI, matching the base's libibverbs).
+# usb4_rdma userspace provider (rdmav57) + the kernel-driver-compatible
+# libibverbs 1.14.58. libibverbs matches a provider to a device BY NAME.
+# Without these files `ibv_devices` is EMPTY inside the container and RCCL
+# silently falls back to TCP; with the base image's rdmav59 libibverbs the
+# query_device command is rejected by the thunderbolt kernel driver.
 COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core/build/lib/libusb4_rdma-rdmav*.so /usr/lib/x86_64-linux-gnu/libibverbs/
-RUN printf 'driver usb4_rdma\n' > /etc/libibverbs.d/usb4_rdma.driver
+COPY --from=provider-build --chown=root:root \
+  /tmp/rdma-core-lv/build/lib/libibverbs.so.1.* /usr/lib/x86_64-linux-gnu/
+RUN printf 'driver usb4_rdma\n' > /etc/libibverbs.d/usb4_rdma.driver && \
+    ln -sfn /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.58.0 \
+      /usr/lib/x86_64-linux-gnu/libibverbs.so.1
 
 # tbv_ar2 python wrappers (ctypes-load the natives built below). rootfs/
 # mirrors "/" — the files live under opt/venv/lib/python3.12/site-packages/.
