@@ -60,7 +60,11 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 export HSA_ENABLE_INTERRUPT=${VSH_HSA_INTERRUPT:-1}
 
 # --- TB4-RDMA all-reduce (VSH_TBV_AR2 hook, patched cuda_communicator) ------
-export VSH_TBV_AR2=${VSH_TBV_AR2:-1}
+# Default OFF on the ROCm 10 stack: the v2 native crashes silently during the
+# first collective (see PATCHES.md §5). All collectives still run over the
+# usb4_rdma rail via RCCL-over-IB. Flip via glm53_tbv_ar2 in vsh-config.yaml
+# once the native is fixed.
+export VSH_TBV_AR2=${VSH_TBV_AR2:-${VSH_GLM53_TBV_AR2:-0}}
 export VSH_TBV2_PEER_IP=${VSH_TBV2_PEER_IP:-${VSH_HEAD_IP:-10.0.2.1}}
 export VSH_TBV_AR_GPU=${VSH_TBV_AR_GPU:-1}
 # Propagate VSH_* to box2 ray workers (not in ray's default copy prefixes).

@@ -14,7 +14,8 @@ glm53_kv_bytes: 4294967296           # 4 GiB pinned GPU KV
 glm53_max_batched: 512               # batched tokens/step (indexer workspace scales with this)
 glm53_mtp_tokens: 3                  # MTP draft tokens (0 = speculative decoding off)
 glm53_gpu_util: 0.83
-glm53_aiter: 0                       # 1 = allow aiter kernels (DS4 ran aiter-less on gfx1151)
+glm53_aiter: 1                       # 1 = aiter ON (required by the sparse MLA indexer)
+glm53_tbv_ar2: 0                     # 1 = tbv_ar2 decode fast-path (crashes on ROCm 10 stack - PATCHES.md)
 
 # ---------------- DeepSeek-V4-Flash profile --------------------------------
 # Delegates to the deployed ds4-vllm stack (AlexKGwyn/ds4-vllm image + units).
