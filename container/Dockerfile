@@ -18,7 +18,7 @@
 ARG VSH_BASE="docker.io/kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.28.0"
 # vLLM source pin. Must be >= 98ed0856 (GLM-5.3-Flash support).
 ARG VLLM_REPO="https://github.com/vllm-project/vllm"
-ARG VLLM_COMMIT="8bf3963"
+ARG VLLM_COMMIT="8bf39632b86df21fa9bfbb470ce8305bf67a5838"
 # rdma-core branch the usb4_rdma provider is built against. The base ships
 # libibverbs 1.16.62.0 (provider ABI rdmav59, copied in by the image author),
 # so the provider must be the rdmav59 flavour or libibverbs never loads it.

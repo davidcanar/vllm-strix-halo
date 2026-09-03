@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."          # repo root = build context
 
 IMAGE=${VSH_IMAGE:-vllm-strix-halo:local}
-VLLM_COMMIT=${VLLM_COMMIT:-8bf3963}
+VLLM_COMMIT=${VLLM_COMMIT:-8bf39632b86df21fa9bfbb470ce8305bf67a5838}
 
 log() { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 
