@@ -37,9 +37,22 @@ files, layered on `kyuz0/vllm-therock-gfx1151` (ROCm 7.14).
 | `breakable_cudagraph.py` stream-sync fix | ❌ **No (for now)** | We serve `--enforce-eager` (same as DS4). If cudagraphs are enabled later, revisit. |
 | Scheduler / KV / MTP tweaks (`kv_cache_utils.py`, `llm_base_proposer.py`, …) | ❌ **No** | DS4-specific layouts and DSpark drafter. GLM-5.3's KV grouping and its MTP (`glm5_next_mtp`) are upstream. |
 
-**Net:** this repo patches **one** vLLM file (the all-reduce hook) and builds
-two RDMA pieces into the image (provider + natives). Everything else is
-upstream vLLM + configuration.
+**Net:** this repo patches **two** vLLM files (the all-reduce hook + the
+TileLang-MHC gate) and builds two RDMA pieces into the image (provider +
+natives). Everything else is upstream vLLM + configuration.
+
+The second patch (`vsh-mhc-no-tilelang-gfx1151.patch`) was found during the
+reference-rig bring-up, not inherited from ds4-vllm: upstream vLLM enables
+TileLang `mhc` fused kernels on ROCm for everything except gfx942, but the
+compiled kernels crash natively on gfx1151 (both TP ranks die without a
+traceback on the first forward, right after `TileLang begins to compile
+mhc_pre_big_fuse_with_norm_tilelang`). The patch routes gfx1151 to the same
+torch/triton fallbacks upstream already maintains for gfx942.
+
+Also from the bring-up (config-only, no patch): the vision-encoder cache
+profiling (`Encoder cache will be initialized...`) kills the worker on
+gfx1151, so the serve script passes `--skip-mm-profiling` — text-only serving
+does not need the multimodal encoder cache.
 
 ## 2. Why the image rebuilds vLLM at all
 

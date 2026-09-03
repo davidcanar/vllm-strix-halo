@@ -144,6 +144,8 @@ compiles on first boot. RDMA verification greps the serve journal for
 | RDMA not ready | `rdma link show`, GID index 1, `ibv_devices` in container |
 | RCCL init "internal error" | two ACTIVE rails on one netdev → pin `rdma_hca` |
 | OOM during weight load | raise `glm53_kv_bytes` downward / stop the other model |
+| worker dies after `TileLang ... mhc_pre_big_fuse_with_norm` | stale image without the gfx1151 TileLang-MHC gate — rebuild with `container/build.sh` (PATCHES.md) |
+| worker dies after `Encoder cache will be initialized` | missing `--skip-mm-profiling` (PATCHES.md) |
 | EngineCore SIGSEGV on load | RCCL CQ ENOMEM — PATCHES.md §5 candidate patch |
 
 ## 9. Performance
