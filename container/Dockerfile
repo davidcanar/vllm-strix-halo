@@ -129,6 +129,8 @@ COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core-lv/build/bin/ibv_devices \
   /tmp/rdma-core-lv/build/bin/ibv_devinfo /usr/bin/
 RUN printf 'driver usb4_rdma\n' > /etc/libibverbs.d/usb4_rdma.driver && \
+    mkdir -p /usr/local/etc/libibverbs.d && \
+    printf 'driver usb4_rdma\n' > /usr/local/etc/libibverbs.d/usb4_rdma.driver && \
     ln -sfn /usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.58.0 \
       /usr/lib/x86_64-linux-gnu/libibverbs.so.1
 
