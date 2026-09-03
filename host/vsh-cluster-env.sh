@@ -43,6 +43,10 @@ export TRITON_CACHE_DIR="$HOME/.triton/cache"
 
 # --- GPU / ROCm -------------------------------------------------------------
 export HIP_VISIBLE_DEVICES=0
+# Native crash diagnosis: print the Python stack on SIGSEGV/SIGABRT inside
+# kernels (the signal handler is a no-op unless the fault is on a Python
+# frame, but it is what we have without a debugger).
+export PYTHONFAULTHANDLER=1
 # DS4 ran aiter-less on gfx1151; flip via glm53_aiter in vsh-config.yaml.
 export VLLM_ROCM_USE_AITER=${VSH_GLM53_AITER:-0}
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
