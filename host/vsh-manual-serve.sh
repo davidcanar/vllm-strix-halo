@@ -38,6 +38,7 @@ exec vllm serve "$MODEL_DIR" \
   --quantization compressed-tensors \
   --kv-cache-dtype fp8 \
   --enforce-eager \
+  --disable-mm-preprocessor-cache \
   --gpu-memory-utilization ${VSH_GLM53_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${VSH_GLM53_KV_BYTES:-4294967296} \
   --max-model-len "${VSH_GLM53_MAX_CTX:-32768}" \
