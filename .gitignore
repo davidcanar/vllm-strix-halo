@@ -1,0 +1,5 @@
+# build artifacts
+*.log
+*.tar
+# working material, not part of the shipped repo
+/vendor/

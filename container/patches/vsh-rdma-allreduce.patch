@@ -1,0 +1,42 @@
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -305,9 +305,38 @@ def all_reduce(self, input_):
+     def all_reduce(self, input_):
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+             and not fi_ar_comm.disabled
+             and fi_ar_comm.should_use_fi_ar(input_)
+         )
+ 
++        # VSH_TBV_AR2=1: 2-rank RDMA-write all-reduce over the usb4_rdma rail
++        # (libtbv_ar2, stream-async GPU-poll + progress thread). Carries the
++        # decode-sized collective; larger prefill tensors fall through to the
++        # normal chain (RCCL-over-IB on the same rail). Env-gated and
++        # fail-open: ineligible inputs, non-2-rank groups, or a failed init
++        # never block the stock path.
++        import os as _os_vsh
++        if _os_vsh.environ.get("VSH_TBV_AR2") == "1" and not getattr(
++            self, "_vsh_tbv2_failed", False
++        ):
++            _vsh_t2 = getattr(self, "_vsh_tbv_ar2", None)
++            if _vsh_t2 is None:
++                try:
++                    import torch.distributed as _vsh_d2
++                    if _vsh_d2.get_world_size(group=self.device_group) == 2:
++                        from tbv_ar2 import TbvAllReduce2
++                        self._vsh_tbv_ar2 = _vsh_t2 = TbvAllReduce2(
++                            _vsh_d2.get_rank(group=self.device_group))
++                    else:
++                        self._vsh_tbv2_failed = True
++                except Exception as _vsh_e2:
++                    import logging
++                    logging.getLogger(__name__).warning(
++                        "tbv_ar2 init failed: %s", _vsh_e2)
++                    self._vsh_tbv2_failed = True
++            if _vsh_t2 is not None and _vsh_t2.eligible(input_):
++                _vsh_o2 = torch.empty_like(input_)
++                return _vsh_t2.all_reduce_out(input_, _vsh_o2)
++
+         # since currently we perform copy input -> symm_input -> out-of-place AR

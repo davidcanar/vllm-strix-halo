@@ -1,0 +1,22 @@
+[Unit]
+Description=vllm-strix-halo GLM-5.3-Flash vLLM TP=2 cluster — bringup on both boxes
+
+# The systemd handle on the whole 2-box stack. start runs the validated bringup
+# (teardown -> ray head box1 + worker box2 -> vllm serve as the transient
+# vsh-glm-manual unit -> API/RDMA verify); stop tears everything down on both
+# boxes. The top-level vllm-strix-halo.sh launcher drives this unit.
+#
+# No [Install]: the model takes minutes to load and claims both GPUs, so the
+# stack comes up only on an explicit start, never at boot.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=45min
+TimeoutStopSec=5min
+ExecStart=%h/vsh-cluster-restart.sh
+ExecStop=%h/vsh-cluster-down.sh
+# ExecStop does not run when ExecStart itself fails; StopPost does, so a
+# failed bringup still tears the cluster down instead of leaving the serve
+# unit and ray daemons running behind a "failed" wrapper. Idempotent.
+ExecStopPost=%h/vsh-cluster-down.sh

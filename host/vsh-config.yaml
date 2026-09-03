@@ -1,0 +1,28 @@
+# Site configuration for the vllm-strix-halo cluster (deployed by host/deploy.sh).
+# Flat key: value — every key is exported as VSH_<KEY> by host/vsh-config.
+
+# Which model the launcher drives by default: glm53 | ds4
+model: glm53
+
+# ---------------- GLM-5.3-Flash profile (vllm-strix-halo image) ---------------
+glm53_container: vllm-glm            # toolbox/podman container name (both boxes)
+glm53_image: vllm-strix-halo:local   # image the container is created from
+glm53_model_dir: /home/davidcanar/models/GLM-5.3-Flash-AWQ-W4A16
+glm53_api_port: 1235
+glm53_max_ctx: 32768                 # context; the AWQ weights fit ~32K with the KV pin below
+glm53_kv_bytes: 4294967296           # 4 GiB pinned GPU KV
+glm53_max_batched: 512               # batched tokens/step (indexer workspace scales with this)
+glm53_mtp_tokens: 3                  # MTP draft tokens (0 = speculative decoding off)
+glm53_gpu_util: 0.83
+glm53_aiter: 0                       # 1 = allow aiter kernels (DS4 ran aiter-less on gfx1151)
+
+# ---------------- DeepSeek-V4-Flash profile --------------------------------
+# Delegates to the deployed ds4-vllm stack (AlexKGwyn/ds4-vllm image + units).
+ds4_unit: ds4-vllm
+ds4_api_port: 1234
+
+# ---------------- site ------------------------------------------------------
+head_ip: 10.0.2.1                    # thunderbolt IP of this box (ray head)
+worker_ip: 10.0.2.2                  # thunderbolt IP of box2 (ray worker)
+rdma_hca: usb4_rdma0                 # RoCE device on the Thunderbolt rail
+transport: rdma                      # rdma | tcp

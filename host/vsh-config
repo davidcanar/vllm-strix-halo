@@ -1,0 +1,27 @@
+#!/usr/bin/python3
+"""Emit shell exports from the flat vsh-config.yaml.
+
+Usage: eval "$("$HOME/vsh-config")"   [config path as optional argv[1]]
+Each `key: value` line becomes `export VSH_<KEY>=<value>`. Comments and blank
+lines are ignored. Stdlib only so it runs on a bare host python3.
+"""
+import os
+import shlex
+import sys
+
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/vsh-config.yaml")
+try:
+    lines = open(path).read().splitlines()
+except OSError as e:
+    print(f"echo 'vsh-config: {e}' >&2; false")
+    sys.exit(1)
+
+for raw in lines:
+    line = raw.split("#", 1)[0].strip()
+    if not line or ":" not in line:
+        continue
+    key, value = line.split(":", 1)
+    key = key.strip().upper()
+    value = value.strip()
+    if key and value:
+        print(f"export VSH_{key}={shlex.quote(value)}")
