@@ -8,7 +8,7 @@ stack exposes as `usb4_rdma*`.
 
 > ⚠️ **This is the deepest, most fragile part of the whole setup and it is
 > hardware- and kernel-version-specific.** It is not "install and go". Budget
-> real time, and read [`../AGENTS.md`](../AGENTS.md) §RDMA before touching a
+> real time, and read [`../AGENTS.md`](../AGENTS.md) §1 (RDMA) before touching a
 > serving box. Several failure modes here require a **coordinated reboot of both
 > boxes** to recover.
 
