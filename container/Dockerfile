@@ -32,6 +32,8 @@ ARG TBV_IBVERBS_COMMIT="76ba39b630a70accb72f19388eefe48844b50eb8"
 # RCCL (NCCL_IB) cannot see the rail, so the TP all-reduce silently falls
 # back to TCP over the Thunderbolt IP link.
 FROM ${VSH_BASE} AS provider-build
+ARG RDMA_CORE_TAG
+ARG TBV_IBVERBS_COMMIT
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake gcc libnl-3-dev libnl-route-3-dev pkg-config && \
