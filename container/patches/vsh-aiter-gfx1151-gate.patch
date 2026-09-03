@@ -1,7 +1,7 @@
 diff --git a/vllm/_aiter_ops.py b/vllm/_aiter_ops.py
 --- a/vllm/_aiter_ops.py
 +++ b/vllm/_aiter_ops.py
-@@ -154,5 +154,10 @@
+@@ -154,5 +154,12 @@
      if current_platform.is_rocm() and IS_AITER_FOUND:
          from vllm.platforms.rocm import get_cdna_version
  
