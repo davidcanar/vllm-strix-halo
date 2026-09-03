@@ -33,7 +33,7 @@ UNIT=vsh-glm-manual
 # Model dir doubles as the reap-pattern discriminator.
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
 # Exports that must reach the env files on BOTH boxes (sourced at ray start).
-ENVPASS="export VSH_RDMA_HCA=${VSH_RDMA_HCA:-} VLLM_HOST_IP=${HEAD_IP:?};"
+ENVPASS="export VSH_RDMA_HCA=${VSH_RDMA_HCA:-} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0};"
 
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 
