@@ -120,6 +120,10 @@ RUN python -m pip install --no-cache-dir \
 # query_device command is rejected by the thunderbolt kernel driver.
 COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core/build/lib/libusb4_rdma-rdmav*.so /usr/lib/x86_64-linux-gnu/libibverbs/
+# The v58-era libibverbs we install looks for providers under
+# /usr/local/lib/libibverbs (its build-time prefix); keep both paths.
+COPY --from=provider-build --chown=root:root \
+  /tmp/rdma-core/build/lib/libusb4_rdma-rdmav*.so /usr/local/lib/libibverbs/
 COPY --from=provider-build --chown=root:root \
   /tmp/rdma-core-lv/build/lib/libibverbs.so.1.* /usr/lib/x86_64-linux-gnu/
 # The base's rdma-core tools (ibv_devices/ibv_devinfo) need the private
