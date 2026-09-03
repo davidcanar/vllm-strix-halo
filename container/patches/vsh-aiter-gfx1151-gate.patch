@@ -1,0 +1,17 @@
+diff --git a/vllm/_aiter_ops.py b/vllm/_aiter_ops.py
+--- a/vllm/_aiter_ops.py
++++ b/vllm/_aiter_ops.py
+@@ -154,5 +154,10 @@
+     if current_platform.is_rocm() and IS_AITER_FOUND:
+         from vllm.platforms.rocm import get_cdna_version
+ 
+-        return get_cdna_version() > 2
++        if get_cdna_version() > 2:
++            return True
++        # vllm-strix-halo: kyuz0's gfx1151 (Strix Halo) aiter build ships the
++        # sparse-indexer / MLA ops (JIT-compiled at import); vLLM's CDNA-only
++        # gate hides them from Strix Halo.
++        from vllm.platforms.rocm import on_gfx1151
++
++        return on_gfx1151()
+     return False
