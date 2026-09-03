@@ -49,6 +49,10 @@ export HIP_VISIBLE_DEVICES=0
 export PYTHONFAULTHANDLER=1
 # DS4 ran aiter-less on gfx1151; flip via glm53_aiter in vsh-config.yaml.
 export VLLM_ROCM_USE_AITER=${VSH_GLM53_AITER:-0}
+# The sparse MLA indexer REQUIRES aiter (sparse_attn_indexer_kpool.forward_hip),
+# but aiter's MoE kernels do not support gfx1151 ("kernel does not support
+# current device") — keep MoE on the triton path even when aiter is on.
+export VLLM_ROCM_USE_AITER_MOE=${VSH_GLM53_AITER_MOE:-0}
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 # Blocking (interrupt-based) GPU waits instead of busy-poll. ROCm 10 supports
 # this natively (HSA_ENABLE_INTERRUPT) — no ROCr rebuild needed, unlike the
