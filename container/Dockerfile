@@ -63,15 +63,27 @@ RUN python -m pip install -U --no-cache-dir \
 RUN python -m pip uninstall -y vllm || true
 
 # Build vLLM at the pinned post-merge commit for gfx1151 only.
-# PYTORCH_ROCM_ARCH pins the HIP target so the build never needs a GPU probe
-# (podman build has no /dev/kfd). MAX_JOBS=8 keeps the multi-GB clang
-# processes within budget on a 128 GB box that may be co-serving another model.
+# - PYTORCH_ROCM_ARCH pins the HIP target so the build never needs a GPU probe
+#   (podman build has no /dev/kfd). MAX_JOBS=8 keeps the multi-GB clang
+#   processes within budget on a 128 GB box that may be co-serving another model.
+# - CMAKE_ARGS points CMake at the pip-installed ROCm SDK's cmake package dir
+#   (the TheRock venv layout has no /opt/rocm, so torch's LoadHIP.cmake cannot
+#   find FindHIP.cmake without this and vLLM fails with "Can't find CUDA or
+#   HIP installation").
+# - SETUPTOOLS_SCM_PRETEND_VERSION: the shallow single-commit fetch has no
+#   tags, so setuptools-scm needs an explicit version string.
+# - Shallow fetch of the exact SHA (GitHub allows it) instead of a full-history
+#   clone: same result, minutes instead of ~an hour on slow links.
 ARG VLLM_REPO
 ARG VLLM_COMMIT
-RUN git clone --filter=blob:none --no-checkout ${VLLM_REPO} /tmp/vllm-src && \
-    git -C /tmp/vllm-src checkout ${VLLM_COMMIT} && \
+RUN git init -q /tmp/vllm-src && \
+    git -C /tmp/vllm-src remote add origin ${VLLM_REPO} && \
+    git -C /tmp/vllm-src fetch -q --depth 1 origin ${VLLM_COMMIT} && \
+    git -C /tmp/vllm-src checkout -q FETCH_HEAD && \
     cd /tmp/vllm-src && \
     PYTORCH_ROCM_ARCH=gfx1151 VLLM_USE_PRECOMPILED=0 MAX_JOBS=8 \
+    SETUPTOOLS_SCM_PRETEND_VERSION="0.29.0.dev0+git.${VLLM_COMMIT}" \
+    CMAKE_ARGS="-DCMAKE_PREFIX_PATH=${ROCM_DEVEL_PATH} -DCMAKE_MODULE_PATH=${ROCM_DEVEL_PATH}/lib/cmake/hip" \
     python -m pip install --no-build-isolation --no-deps . && \
     rm -rf /tmp/vllm-src
 
