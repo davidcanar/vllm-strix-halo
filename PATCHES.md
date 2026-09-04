@@ -423,7 +423,68 @@ are ~29 MB, over even the 16 MiB the doorbell can encode (`nbytes` occupies
 `tbv2_wait_add_kernel`, which is launched `dim3(1), dim3(1024)` — a single
 workgroup. Re-profile before spending that effort.
 
-## 10. Attribution
+## 10. RCCL transport: sockets beat the RoCE rail at every size
+
+This one cuts against the premise of the repo, so here is the measurement.
+
+The netdev negotiates **20 Gbps**, not the 40 Gbps quoted elsewhere in these
+docs (`ethtool thunderbolt0` → `Speed: 20000Mb/s`), so the ceiling is ~2.5
+GB/s. Raw `ib_write_bw -d usb4_rdma0 -x 1 -q 4` over the rail managed
+**3.85 Gb/s = 0.48 GB/s**, i.e. the RoCE driver delivers under a fifth of the
+link.
+
+A standalone 2-rank RCCL all-reduce over the same rail, run inside the serving
+containers with the real cluster env (`ar_bench`, bf16, algbw = busbw at
+n = 2):
+
+| message | IB (`usb4_rdma0`) | sockets (`thunderbolt0`) |
+|---:|---:|---:|
+| 16 KB | 0.40 ms | **0.11 ms** |
+| 64 KB | 0.42 ms | **0.18 ms** |
+| 256 KB | 0.51 ms | **0.29 ms** |
+| 1 MB | 0.83 GB/s | **1.28 GB/s** |
+| 8 MB | 0.93 GB/s | **1.46 GB/s** |
+| 32 MB | 0.97 GB/s | **1.48 GB/s** |
+| 64 MB | 0.47 GB/s | **1.48 GB/s** |
+
+Sockets win at **every** size — 3.6x on 16 KB latency, ~1.5x on bandwidth —
+and stay flat at 64 MB where the IB path collapses. There is no crossover to
+trade off.
+
+End to end, three server configurations (single stream, tuned MoE, 4096 chunk,
+`NCCL_PROTO` auto). Prefill is the mean of five uncacheable warm prompts;
+decode is ms/step, which is the acceptance-independent figure:
+
+| transport | prefill tok/s | decode @512 | decode @4k | TTFT @4k |
+|---|---:|---:|---:|---:|
+| `rdma` — IB + tbv_ar2 | 271 | 216.4 | 238.8 | 9.18 s |
+| `hybrid` — sockets + tbv_ar2 | 305 | 213.1 | 227.7 | **8.37 s** |
+| `tcp` — sockets only | **314** | 218.7 | 227.3 | **8.37 s** |
+
+Two conclusions:
+
+1. **Disabling IB for RCCL is a clear win** (+13% prefill, −0.8 s TTFT at 4 K,
+   decode a touch better). `NCCL_IB_DISABLE=1` is the whole change.
+2. **tbv_ar2 is neutral once RCCL is on sockets.** `hybrid` and `tcp` are
+   inside run-to-run noise of each other on both axes. tbv_ar2 was worth ~150
+   µs/op against *RCCL-over-IB* (§5.0); against RCCL-over-sockets, which does
+   16 KB in 0.11 ms, it no longer has an edge to add.
+
+`transport: hybrid` is the shipped default: it takes the socket win while
+keeping the RDMA rail in the decode path, so the tbv stack is not wasted and
+§5.0 stays exercised. `transport: tcp` measures the same within noise, which
+means **a fresh rig can skip the tbv kernel-module build entirely** — no
+Secure Boot changes, no coordinated reboots, no matched module sets — and give
+up nothing measurable. That is a large reduction in bring-up risk.
+
+Caveats worth respecting before ripping anything out: all of this is
+**single-stream**; RDMA may still matter at concurrency, where many small
+collectives overlap and CPU-side socket handling could become the limit. The
+decode differences between the three are within noise, so only the prefill
+number is firmly established. And `ib_write_bw` measures the driver, not the
+fabric — a better RoCE driver could still change the picture.
+
+## 11. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for

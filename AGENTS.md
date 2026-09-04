@@ -138,7 +138,7 @@ lines (the decode all-reduce fast-path, `glm53_tbv_ar2: 1` — PATCHES.md §5.0)
 | `glm53_tool_parsing` | 1 | `--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47`. Needed by coding harnesses; 0 serves raw text. Note the response field is `reasoning`, not `reasoning_content` — see PATCHES.md §7 |
 | `glm53_aiter` | 1 | aiter must be ON — the sparse-attention indexer's ROCm path requires it |
 | `glm53_tbv_ar2` | 1 | tbv_ar2 decode all-reduce over the usb4 rail (~150 µs/op at decode sizes; prefill-sized collectives stay on RCCL-over-IB; validated — PATCHES.md §5.0) |
-| `transport` | rdma | rdma \| tcp fallback |
+| `transport` | hybrid | `rdma` \| `hybrid` \| `tcp`. **hybrid** (RCCL on sockets + tbv_ar2 RDMA for decode) and **tcp** (no RDMA at all) both beat full `rdma` — sockets win at every message size on this rail. tcp measures the same as hybrid, so a fresh rig can skip the tbv build — PATCHES.md §10 |
 | `rdma_hca` | usb4_rdma0 | pin one unambiguous HCA |
 
 ## 8. Troubleshooting quick map

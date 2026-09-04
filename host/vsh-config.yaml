@@ -27,4 +27,4 @@ ds4_api_port: 1234
 head_ip: 10.0.2.1                    # thunderbolt IP of this box (ray head)
 worker_ip: 10.0.2.2                  # thunderbolt IP of box2 (ray worker)
 rdma_hca: usb4_rdma0                 # RoCE device on the Thunderbolt rail
-transport: rdma                      # rdma | tcp
+transport: hybrid                    # rdma | hybrid | tcp — hybrid/tcp measure fastest (PATCHES.md §10)
