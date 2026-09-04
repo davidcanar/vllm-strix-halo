@@ -86,16 +86,18 @@ Validated on the reference rig (2× Ryzen AI Max+ 395 / 128 GB each), single
 stream, temperature 0, TP all-reduce over the Thunderbolt RoCE rail (RCCL
 `Using network IB` on `usb4_rdma0`, 40 Gbps), MTP = 3 draft tokens:
 
-| context | MTP off | MTP on |
-|---|---|---|
-| 512 | ~6.7 tok/s | ~7.6 tok/s |
-| 4.5k | ~2.4 tok/s | ~5.5 tok/s |
+| context | MTP off | MTP on | MTP + tbv_ar2 |
+|---|---|---|---|
+| 512 | ~6.7 tok/s | ~7.6 tok/s | ~7.9 tok/s |
+| 4.5k | ~2.4 tok/s | ~5.5 tok/s | ~5.6 tok/s |
 
 MTP needed a gfx1151 patch (aiter's asm sparse-decode kernel aborts on GLM's
-rope-free MLA; PATCHES.md §1.5) and accepts ~92% of draft tokens. The
-per-step fp8→fnuz conversion on the sparse-MQA path is the known next
-optimization (PATCHES.md §1.3). Treat any figure quoted elsewhere as
-unverified.
+rope-free MLA; PATCHES.md §1.5) and accepts ~90% of draft tokens. tbv_ar2 —
+the custom decode all-reduce over the Thunderbolt rail — turned out to work
+fine on the ROCm 10 stack once MTP was fixed (the "crash" was a
+misattribution; PATCHES.md §5.0) and is on by default. The per-step fp8→fnuz
+conversion on the sparse-MQA path is the known next optimization
+(PATCHES.md §1.3). Treat any figure quoted elsewhere as unverified.
 
 ## License & attribution
 

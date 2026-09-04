@@ -113,8 +113,8 @@ host/deploy.sh                                # installs scripts + unit; syncs b
 Bring-up gates: containers exec-able on both boxes → Ray 2.0 GPU → API 200 on
 `:1235` → warmup dispatched. A cold kernel cache adds ~25 min of Triton/LLVM
 compiles on first boot. RDMA verification greps the serve journal for RCCL's
-`Using network IB` (with `NCCL_DEBUG=INFO`; the tbv_ar2 fast-path is off by
-default — PATCHES.md §5.0).
+`Using network IB` (with `NCCL_DEBUG=INFO`) and for the tbv_ar2 rank-ready
+lines (the decode all-reduce fast-path, `glm53_tbv_ar2: 1` — PATCHES.md §5.0).
 
 ## 6. Model switching / coexistence
 
@@ -135,7 +135,7 @@ default — PATCHES.md §5.0).
 | `glm53_kv_bytes` | 4294967296 | pinned GPU KV pool |
 | `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off (needs `vsh-mtp-ropefree-triton-sparse.patch` in the image — PATCHES.md §1.5; validated: ~92% acceptance, ~2.3× at long ctx) |
 | `glm53_aiter` | 1 | aiter must be ON — the sparse-attention indexer's ROCm path requires it |
-| `glm53_tbv_ar2` | 0 | tbv_ar2 decode fast-path (crashes the ROCm 10 stack — PATCHES.md §5.0) |
+| `glm53_tbv_ar2` | 1 | tbv_ar2 decode all-reduce over the usb4 rail (~150 µs/op at decode sizes; prefill-sized collectives stay on RCCL-over-IB; validated — PATCHES.md §5.0) |
 | `transport` | rdma | rdma \| tcp fallback |
 | `rdma_hca` | usb4_rdma0 | pin one unambiguous HCA |
 
@@ -160,12 +160,12 @@ stream, temperature 0, RDMA transport (RCCL `Using network IB` on
 (`vsh-mtp-ropefree-triton-sparse.patch`, PATCHES.md §1.5 — without it the
 worker SIGABRTs on the first speculative batch):
 
-| context | MTP off | MTP on (3 tokens) |
-|---|---|---|
-| 512 | ~6.7 tok/s | ~7.6 tok/s |
-| 4.5k | ~2.4 tok/s | ~5.5 tok/s |
+| context | MTP off | MTP on (3 tokens) | MTP + tbv_ar2 |
+|---|---|---|---|
+| 512 | ~6.7 tok/s | ~7.6 tok/s | ~7.9 tok/s |
+| 4.5k | ~2.4 tok/s | ~5.5 tok/s | ~5.6 tok/s |
 
-MTP acceptance on these runs: ~92% of draft tokens accepted (197/213), mean
+MTP acceptance on these runs: ~90% of draft tokens accepted, mean
 acceptance length up to 4.0, per-position rates 1.000/1.000/1.000 on greedy
 repetitive text — from `/metrics` (`vllm:spec_decode_*`) or the periodic
 `SpecDecoding metrics` journal lines.

@@ -33,7 +33,7 @@ UNIT=vsh-glm-manual
 # Model dir doubles as the reap-pattern discriminator.
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
 # Exports that must reach the env files on BOTH boxes (sourced at ray start).
-ENVPASS="export VSH_RDMA_HCA=${VSH_RDMA_HCA:-} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0};"
+ENVPASS="export VSH_RDMA_HCA=${VSH_RDMA_HCA:-} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0} VSH_GLM53_TBV_AR2=${VSH_GLM53_TBV_AR2:-0};"
 
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 
@@ -98,7 +98,7 @@ echo "== serve =="
 systemd-run --user --unit="$UNIT" --description="vllm-strix-halo GLM-5.3-Flash TP=2" \
   --working-directory="$HOME" \
   /usr/bin/podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc \
-  "$ENVPASS export VSH_TRANSPORT=$TRANSPORT VSH_GLM53_MODEL_DIR=$MODEL_DIR VSH_GLM53_API_PORT=$PORT VSH_GLM53_MAX_CTX=${VSH_GLM53_MAX_CTX:-32768} VSH_GLM53_KV_BYTES=${VSH_GLM53_KV_BYTES:-4294967296} VSH_GLM53_GPU_UTIL=${VSH_GLM53_GPU_UTIL:-0.83} VSH_GLM53_MAX_BATCHED=${VSH_GLM53_MAX_BATCHED:-512} VSH_GLM53_MTP_TOKENS=${VSH_GLM53_MTP_TOKENS:-3} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0}; exec bash $SERVE" >/dev/null 2>&1
+  "$ENVPASS export VSH_TRANSPORT=$TRANSPORT VSH_GLM53_MODEL_DIR=$MODEL_DIR VSH_GLM53_API_PORT=$PORT VSH_GLM53_MAX_CTX=${VSH_GLM53_MAX_CTX:-32768} VSH_GLM53_KV_BYTES=${VSH_GLM53_KV_BYTES:-4294967296} VSH_GLM53_GPU_UTIL=${VSH_GLM53_GPU_UTIL:-0.83} VSH_GLM53_MAX_BATCHED=${VSH_GLM53_MAX_BATCHED:-512} VSH_GLM53_MTP_TOKENS=${VSH_GLM53_MTP_TOKENS:-3} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0} VSH_GLM53_TBV_AR2=${VSH_GLM53_TBV_AR2:-0}; exec bash $SERVE" >/dev/null 2>&1
 
 # Warm bringup answers in a few minutes; a cold kernel-cache bringup (first
 # after a cache wipe) spends ~25 min more in Triton/LLVM compiles.

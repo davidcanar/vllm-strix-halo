@@ -29,7 +29,7 @@ files, layered on `kyuz0/vllm-therock-gfx1151` (ROCm 7.14).
 | OpenAI reasoning/tool fixes (`deepseek_v4_encoding.py`, structured-output `</think>` boundary) | ❌ **No** | DS4 tokenizer/parser work. GLM-5.3 uses the standard chat path. |
 | **Thunderbolt RDMA kernel modules** (`tbv/`: patched `thunderbolt`, `thunderbolt_net`, `thunderbolt_ibverbs`, `nhi_throttle`) | ✅ **Yes — verbatim** | This is the fabric itself. It is model-agnostic. Already built & loaded on the reference rig; vendored here (`tbv/`) so a fresh pair of boxes can be rebuilt. GPL-2.0 (kernel side) — see THIRD_PARTY_NOTICES.md. |
 | **`usb4_rdma` libibverbs provider built into the image** | ✅ **Yes — adapted** | Without it `ibv_devices` is empty inside the container and RCCL silently falls back to TCP. ds4-vllm built it against rdma-core v57 (its base's ABI); this repo ships the same proven pair — provider rdmav57 + libibverbs 1.14.58 — because the ROCm 10 base's rdmav59-era libibverbs gets EINVAL from the thunderbolt kernel driver's uverbs dispatch (verified with RCCL falling back to `Using network Socket` until the swap, then `Using network IB`). |
-| **`DS4_TBV_AR2` custom all-reduce hook** (`cuda_communicator.py`) + `tbv_ar2.hip` native | ✅ **Yes — rebased, renamed `VSH_TBV_AR2`** | Model-agnostic, env-gated, fail-open. Carries the small decode all-reduce (~105 µs/op) while prefill-sized collectives go over RCCL-over-IB on the same rail. The hook lives in vLLM's *distributed* layer, not in any model file — the DS4 model patches (`deepseek_v4/amd/model.py`) are **not** part of it. Rebased against vLLM main and shipped as `container/patches/vsh-rdma-allreduce.patch`. |
+| **`DS4_TBV_AR2` custom all-reduce hook** (`cuda_communicator.py`) + `tbv_ar2.hip` native | ✅ **Yes — rebased, renamed `VSH_TBV_AR2`, enabled by default** | Model-agnostic, env-gated, fail-open. Carries the small decode all-reduce (~150 µs/op measured on this stack at 8 KiB) while prefill-sized collectives go over RCCL-over-IB on the same rail. The hook lives in vLLM's *distributed* layer, not in any model file — the DS4 model patches (`deepseek_v4/amd/model.py`) are **not** part of it. Rebased against vLLM main and shipped as `container/patches/vsh-rdma-allreduce.patch`. Validated serving end-to-end (PATCHES.md §5.0 — the earlier "crashes on ROCm 10" note was a misattribution). |
 | `tbv_ar` v1 native (`tbv_ar.c`) | ⚠️ Vendored, not wired | DS4's v1 path was superseded by v2 and its hook is not carried. The native builds for experimentation; only v2 is hooked. |
 | RCCL CQ warm-up (DS4 `deepseek_v4/amd/model.py` +67) | ⚠️ **Candidate, not applied** | DS4 pre-creates RCCL's RDMA completion queue before the ~80 GiB weight load to dodge an ENOMEM crash on ROCm 7.14. If the failure reproduces on the ROCm 10 stack we will port it (it's ~15 lines, model-local). Not applied preemptively — see §5. |
 | ROCr rebuild + `rocr-force-block-indefinite-active-wait.patch` | ❌ **No** | ROCm 7.14-era idle-CPU fix. ROCm 10 supports `HSA_ENABLE_INTERRUPT=1` natively (set in `vsh-cluster-env.sh`) — the rebuild is unnecessary here. |
@@ -143,15 +143,21 @@ together. See AGENTS.md §RDMA.
 
 ## 5. Known gaps / deliberate omissions (watch list)
 
-0. **tbv_ar2 decode fast-path crashes on the ROCm 10 stack.** With
-   `VSH_TBV_AR2=1` the worker dies natively (no traceback) during the first
-   collective of the profiling dummy run. The hook is fail-open for *Python*
-   errors, but this crash is inside the native/hip code, so it is not
-   catchable. Default is therefore `0` (`glm53_tbv_ar2: 0`): all TP
-   collectives still run over the usb4_rdma rail via RCCL-over-IB. The DS4
-   ROCm 7.14 stack ran the same native fine (~105 µs decode all-reduce), so
-   the regression is likely in the ROCm 10 HIP build of `tbv_ar2.hip` or its
-   dma-buf MR registration — fix later, re-enable, and re-verify.
+0. **tbv_ar2 decode fast-path — WORKS on ROCm 10; the "crash" was a
+   misattribution.** The bring-up-era note ("worker dies natively with
+   VSH_TBV_AR2=1 during the first collective") did not survive re-testing:
+   a full journal audit found `VSH_TBV_AR2=1` was **never actually enabled**
+   on this stack (the deployed `~/vsh-config.yaml` predated the
+   `glm53_tbv_ar2` key, and `vsh-cluster-restart.sh` never passed it through
+   ENVPASS/serve env either). Every warmup crash in the window — including
+   the one originally blamed on tbv_ar2 — carries the aiter abort signature
+   of §1.5 (MTP was on by default then). After the MTP fix, re-testing
+   showed: isolated 2-rank selftest over the real rail (both containers)
+   passes 25/25 exact-sum rounds at ~152 µs/op (8 KiB decode size); serving
+   with `glm53_tbv_ar2: 1` + MTP runs clean (API 200, greedy quality
+   correct, ~90% draft acceptance as the all-reduce correctness canary,
+   ~7.9 tok/s @512 / ~5.6 @4.5k). `glm53_tbv_ar2: 1` is now the default;
+   prefill-sized collectives still ride RCCL-over-IB on the same rail.
 1. **MLA attention backend on gfx1151.** Upstream `glm5next` rides the shared
    MLA infrastructure (DeepSeek-V3.2-era `MLAModules`, `deep_gemm` page-size
    tables). DS4 needed a heavy rewrite of `rocm_aiter_mla_sparse.py` for its

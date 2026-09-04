@@ -15,7 +15,7 @@ glm53_max_batched: 512               # batched tokens/step (indexer workspace sc
 glm53_mtp_tokens: 3                  # MTP draft tokens (0 = speculative decoding off)
 glm53_gpu_util: 0.83
 glm53_aiter: 1                       # 1 = aiter ON (required by the sparse MLA indexer)
-glm53_tbv_ar2: 0                     # 1 = tbv_ar2 decode fast-path (crashes on ROCm 10 stack - PATCHES.md)
+glm53_tbv_ar2: 1                     # 1 = tbv_ar2 decode all-reduce fast-path (validated on ROCm 10 — PATCHES.md §5.0)
 
 # ---------------- DeepSeek-V4-Flash profile --------------------------------
 # Delegates to the deployed ds4-vllm stack (AlexKGwyn/ds4-vllm image + units).
