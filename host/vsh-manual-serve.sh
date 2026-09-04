@@ -10,8 +10,12 @@
 #     AWQ weight cache and RDMA buffers are allocated AFTER the profiling pass.
 #     The pool is a fixed-size LRU: it does not grow with --max-model-len.
 #   --gpu-memory-utilization  INERT while the pin above is set.
-#   --max-num-batched-tokens 512  NOT larger: the sparse-attention indexer
-#     workspace scales with batch x context.
+#   --max-num-batched-tokens  The prefill chunk. 512 was over-cautious: the big
+#     indexer workspace is max_model_len * 40 * 132 bytes and does NOT depend
+#     on this knob, and what does (topk_indices_buffer) is a few MB. Measured
+#     at 128K ctx: 512 -> 4096 takes prefill 151 -> ~200 tok/s (+30%) for
+#     ~0.6 GiB, decode unchanged. vLLM warns while this is below the MTP draft
+#     budget. See PATCHES.md section 8.
 #
 # Do not add comments inside the backslash-continued `vllm serve` command
 # below: a '#' there silently comments out every remaining argument.

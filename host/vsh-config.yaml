@@ -11,7 +11,7 @@ glm53_model_dir: /home/davidcanar/models/GLM-5.3-Flash-AWQ-W4A16
 glm53_api_port: 1235
 glm53_max_ctx: 131072                # 128K context (native limit is 1M; TTFT is the real cap)
 glm53_kv_bytes: 8589934592           # 8 GiB pinned GPU KV = 526,083 tokens = 4.01x at 128K
-glm53_max_batched: 512               # batched tokens/step (indexer workspace scales with this)
+glm53_max_batched: 4096              # prefill chunk; 512 -> 4096 is +30% prefill (PATCHES.md §8)
 glm53_mtp_tokens: 3                  # MTP draft tokens (0 = speculative decoding off)
 glm53_tool_parsing: 1                # 1 = --enable-auto-tool-choice + glm47 tool/reasoning parsers
 glm53_gpu_util: 0.83

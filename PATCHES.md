@@ -330,7 +330,51 @@ prompt puts 1,579 chars in `reasoning` and a clean 604-char answer in
 `content` with no `<think>` leakage. Decode is unaffected (206.8 / 233.7
 ms/step at 512 / 4k, unchanged from §6).
 
-## 8. Attribution
+## 8. Prefill chunk size (`glm53_max_batched`)
+
+Once the MoE was fixed (§6), decode stopped being the user-visible cost.
+Prefill is a flat ~151 tok/s regardless of prompt length (linear, no quadratic
+term -- the DSA sparse attention works), so on a 20 K-context agent turn
+prefill is ~76% of the wall time and decode ~24%.
+
+`--max-num-batched-tokens` was pinned at 512 with the note "NOT larger: the
+sparse-attention indexer workspace scales with batch x context". That was
+over-cautious. The large indexer allocation is the *prefill* workspace,
+`get_max_prefill_buffer_size() = max_model_len * 40` entries x 132 bytes,
+which does not depend on this knob at all. What does scale with it is
+`topk_indices_buffer` (`max_num_batched_tokens x 2176 x 4` bytes = 4.5 MB at
+512, 36 MB at 4096) -- immaterial against ~19 GiB free. vLLM was in fact
+already asking for the opposite:
+
+```
+max_num_scheduled_tokens is set to 512 based on the speculative decoding
+settings. This may lead to suboptimal performance. Consider increasing
+max_num_batched_tokens to accommodate the additional draft token slots...
+```
+
+Measured at `max_ctx: 131072`, uncacheable prompts (nonce-prefixed so the
+2304-token prefix-cache blocks never hit), warm -- the first call at any new
+chunk shape pays Triton JIT and reads ~80-107 tok/s, which is not the
+steady-state number:
+
+| prompt | 512 | 2048 | 4096 |
+|---:|---:|---:|---:|
+| 1.8 K | 150 | 205 | 206 |
+| 7 K | 152 | 189 | 195 |
+| 14 K | 151 | 190 | 197 |
+| 21 K | 157 | 188 | 196 |
+| 34 K | - | - | 195 |
+
+TTFT for a 4 K prompt: **18.05 -> 14.79 -> 13.60 s**. Projected cold 128 K
+prefill: 13.9 -> 11.8 -> ~10 min. Decode is unaffected (225-240 ms/step
+across all three, inside run-to-run noise). Memory cost of 512 -> 4096 is
+0.6 GiB (19.6 -> 19.0 GiB free per box).
+
+Returns flatten hard after 2048 (+3-5% for 2048 -> 4096), so ~200 tok/s looks
+like the next wall; the remaining per-chunk cost is the ~87 latency-bound
+all-reduces, which is §5.0s territory rather than this knobs.
+
+## 9. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for
