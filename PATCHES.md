@@ -166,7 +166,18 @@ together. See AGENTS.md §RDMA.
    indexer's ROCm path requires aiter. AITER MoE kernels do not support
    gfx1151, so `VLLM_ROCM_USE_AITER_MOE=0` keeps MoE on Triton.
 2. **No disk KV tier.** DS4's `fs_lru` tier is DS4-specific and not carried.
-   `glm53_max_ctx` starts at 32 K for the ~4 GiB KV pin; raise as memory allows.
+   The reference rig runs `glm53_max_ctx: 131072` with an 8 GiB KV pin, which
+   measures 526,083 tokens = **4.01x concurrency at 128 K** and leaves ~20 GiB
+   free per box. Note the pool does *not* scale linearly with context: the KDA
+   recurrent state is a large per-*request* cost, so it amortises over far more
+   blocks at 128 K (57 attention blocks per request vs 15 at 32 K) — 8 GiB at
+   128 K buys better concurrency than 4 GiB did at 32 K. Sizing `max_ctx` past
+   this is bounded by **prefill time, not memory**: prefill is a flat
+   156 tok/s (measured, linear — the DSA sparse attention has no quadratic
+   term), so 128 K is ~14 min TTFT cold and 256 K would be ~28 min. Raising
+   `max_model_len` costs almost nothing at decode: the indexer buffers scale
+   with it, but the step only moved 208 -> 224 ms at 512 ctx and was unchanged
+   at 4 K/8 K.
 3. **No cudagraphs.** `--enforce-eager` (matches the validated DS4 profile).
 4. **MTP — FIXED** (`vsh-mtp-ropefree-triton-sparse.patch`, §1.5). The
    original crash: with `glm53_mtp_tokens > 0` the worker SIGABRTed on the
