@@ -69,3 +69,12 @@ export VSH_TBV2_PEER_IP=${VSH_TBV2_PEER_IP:-${VSH_HEAD_IP:-10.0.2.1}}
 export VSH_TBV_AR_GPU=${VSH_TBV_AR_GPU:-1}
 # Propagate VSH_* to box2 ray workers (not in ray's default copy prefixes).
 export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=VSH_
+
+# --- tuned Triton fused-MoE tile configs (gfx1151) --------------------------
+# Upstream ships no config for AMD_Radeon_8060S, and the int4_w4a16 path does
+# not use the normal tile heuristic: get_moe_wna16_block_config() hardcodes
+# BLOCK_SIZE_K=32, i.e. 16 bytes of packed int4 weight per K step, which runs
+# the GLM MoE at ~38 GB/s against a ~214 GB/s roofline. The tuned tiles in this
+# folder are ~2-3x faster at the decode shapes. Checked before vLLM's built-in
+# configs/, so nothing in site-packages is modified.
+export VLLM_TUNED_CONFIG_FOLDER=${VSH_MOE_CONFIG_DIR:-$HOME/vsh-moe-configs}

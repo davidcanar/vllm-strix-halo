@@ -91,6 +91,25 @@ stream, temperature 0, TP all-reduce over the Thunderbolt RoCE rail (RCCL
 | 512 | ~6.7 tok/s | ~7.6 tok/s | ~7.9 tok/s |
 | 4.5k | ~2.4 tok/s | ~5.5 tok/s | ~5.6 tok/s |
 
+### Tuned fused-MoE tile configs (PATCHES.md §7)
+
+Adding `host/moe-configs/` cuts the decode **step** by ~1.6x. These numbers are
+measured differently from the table above — streamed, so time-to-first-token is
+excluded and only decode is counted:
+
+| | before | after |
+|---|---:|---:|
+| decode step, 512 / 4k / 8k ctx | 359 / 359 / 360 ms | 213 / 225 / 230 ms |
+| decode tok/s @ 4k, matched at 47.4% acceptance | 7.02 | 11.18 |
+
+Step time is the stable figure: it is flat across 512-8192 context, which is
+what a context-independent MoE bottleneck looks like. Throughput at a given
+step time is set by MTP acceptance, which swings 30-60% depending on the
+prompt (observed 8.3-13.5 tok/s at 4k across repeats), so the two throughput
+figures above are quoted at the same acceptance rate to be comparable.
+Time-to-first-token is unchanged at ~18 s for a 4k prompt: prefill is only
+~20% MoE, and is dominated by the RCCL all-reduces (next target).
+
 MTP needed a gfx1151 patch (aiter's asm sparse-decode kernel aborts on GLM's
 rope-free MLA; PATCHES.md §1.5) and accepts ~90% of draft tokens. tbv_ar2 —
 the custom decode all-reduce over the Thunderbolt rail — turned out to work

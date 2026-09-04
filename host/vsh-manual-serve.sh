@@ -32,6 +32,13 @@ else
   echo "[vsh-serve] MTP speculative decoding OFF (glm53_mtp_tokens: 0)"
 fi
 
+PROF=()
+if [ -n "${VSH_GLM53_PROFILER_DIR:-}" ]; then
+  mkdir -p "$VSH_GLM53_PROFILER_DIR"
+  PROF=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VSH_GLM53_PROFILER_DIR}\",\"torch_profiler_with_stack\":false,\"delay_iterations\":${VSH_GLM53_PROFILER_DELAY:-0},\"active_iterations\":${VSH_GLM53_PROFILER_ACTIVE:-5},\"ignore_frontend\":true}")
+  echo "[vsh-serve] torch profiler ENABLED dir=$VSH_GLM53_PROFILER_DIR"
+fi
+
 exec vllm serve "$MODEL_DIR" \
   --served-model-name glm-5.3-flash \
   --tensor-parallel-size 2 \
@@ -45,4 +52,5 @@ exec vllm serve "$MODEL_DIR" \
   --max-num-batched-tokens ${VSH_GLM53_MAX_BATCHED:-512} \
   --trust-remote-code \
   "${SPEC[@]}" \
+  "${PROF[@]}" \
   --host 0.0.0.0 --port "$PORT"

@@ -186,6 +186,95 @@ together. See AGENTS.md §RDMA.
 6. **NVFP4/EXL3 4-bit formats** seen in the wild for GLM-5.3 are NVIDIA-only;
    AWQ/compressed-tensors is the ROCm-compatible format used here.
 
+## 7. Tuned fused-MoE tile configs (gfx1151) — the decode bottleneck
+
+`host/moe-configs/E=288,N=1024,device_name=AMD_Radeon_8060S,dtype=int4_w4a16.json`
+
+§1 classified ds4-vllm's "MoE/GEMM tuning" as **not needed**, on the grounds
+that its MXFP4 tuning was written for DS4's expert layout and GLM runs AWQ
+W4A16 — "different kernels entirely". That reasoning is right and the
+conclusion was wrong: the DS4 configs do not transfer, but GLM still needs its
+**own** MoE tuning, and not having it was costing ~1.6x on decode.
+
+**What the profiler showed.** Torch traces from both ranks of a live decode
+(short context, MTP=3, so a 4-token verify batch) put the step at ~360 ms with
+the GPU ~90% busy, and `fused_moe_kernel_gptq_awq` at ~230 ms of it — 64% of
+the step. Everything else (dense BF16 GEMVs ~22 ms, the tbv_ar2 all-reduces
+~26 ms, sparse MLA + kpool indexer ~15 ms, KDA, mHC) is small by comparison.
+Both ranks measured within 0.1 ms of each other, so this is not a TP imbalance.
+
+**Why it was slow.** For `int4_w4a16` vLLM never consults the normal tile
+heuristic for N/K: `get_moe_wna16_block_config()` hardcodes
+`BLOCK_SIZE_N=64, BLOCK_SIZE_K=32` (32/64 at batch 1). `BLOCK_SIZE_K=32`
+loads **16 bytes** of packed int4 weight per row per K-step, which cannot
+saturate the memory system. Measured on the GLM decode shape: **38 GB/s**.
+
+For calibration, the model's own dense BF16 projections (KDA + MLA, via
+`wvSplitK`) move ~4.7 GB in ~22 ms on the same GPU = **~214 GB/s**. So the
+hardware was delivering roofline; only the MoE kernel was not.
+
+This is also most of the GLM-vs-DS4 gap on this rig. DS4 is block-FP8, which
+takes the *other* branch of `get_default_config()` and gets
+`BLOCK_SIZE_N=128, BLOCK_SIZE_K=128` — 4x the K tile — for free.
+
+**Why a config file and not a code patch.** The alternatives are closed on
+gfx1151: Marlin MoE is `return False` for ROCm
+(`check_moe_marlin_supports_config`), the Humming backend is CUDA-only, and
+vLLM's small-M `moe_wna16` CUDA kernel cannot be ported because
+`csrc/moe/moe_wna16_utils.h` is inline PTX (`lop3.b32`, `prmt.b32`). Triton is
+the only MoE backend here, so the lever is its tile shape. vLLM already looks
+for a per-GPU config and logs the miss at startup:
+
+```
+Using default MoE config. Performance might be sub-optimal! Config file not found at
+  .../configs/E=288,N=1024,device_name=AMD_Radeon_8060S,dtype=int4_w4a16.json
+```
+
+`vsh-cluster-env.sh` sets `VLLM_TUNED_CONFIG_FOLDER=$HOME/vsh-moe-configs`,
+which vLLM checks *before* its built-in `configs/`, so nothing in
+site-packages is modified and the file survives container rebuilds.
+`host/deploy.sh` installs it on both boxes and verifies the checksums match —
+TP runs in lockstep, so an untuned rank would set the pace.
+
+**Measured, on the isolated kernel (E=288, K=4096, N=1024/rank, top-8, g128):**
+
+| tokens M | stock | tuned | speedup | tile |
+|---:|---:|---:|---:|---|
+| 1 | 1.18 ms | 0.70 ms | 1.69x | BM=32 BN=32 BK=128 w4 s2 |
+| 2 | 4.15 ms | 1.21 ms | 3.44x | BM=32 BN=32 BK=64 w2 s2 |
+| 4 (MTP verify) | 5.43 ms | 2.04 ms | 2.67x | BM=32 BN=32 BK=64 w2 s2 |
+| 8 | 6.84 ms | 3.43 ms | 2.00x | BM=16 BN=32 BK=64 w2 s2 |
+| 16-512 (prefill) | 9.5-27.5 ms | 5.9-20.3 ms | 1.35-1.66x | BM=16 BN=32 BK=64 w2 s2 |
+
+A narrow `BLOCK_SIZE_N=32` matters as much as the wider K: the BN=64/128 +
+BK=128 shapes that look natural for a GEMM are **3-6x slower** here.
+
+**Measured, end to end** (streamed, so TTFT is excluded from the decode
+figure; matched at the same 47.4% MTP acceptance / 2.52 tokens per step):
+
+| | before | after |
+|---|---:|---:|
+| decode step (512 / 4k / 8k ctx) | 359 / 359 / 360 ms | 213 / 225 / 230 ms |
+| decode throughput @ 4k ctx | 7.02 tok/s | 11.18 tok/s |
+
+Decode step time is flat across 512-8192 context, which is what you expect
+when the step is dominated by a context-independent MoE.
+
+**Numerics are unchanged**: the tuned tiles produce bit-identical output to
+the stock ones (max abs diff 0.0 at M=1/4/8), because `BLOCK_SIZE_K` only
+chunks a sequential fp32 accumulation. Greedy text does still vary run to run
+on this cluster, but that predates this change — the same server queried twice
+also diverges.
+
+### Re-tuning
+
+`host/moe-configs/` is specific to (num_experts, intermediate-per-rank, GPU,
+quant dtype). A different TP size, a different checkpoint, or a different GPU
+needs a fresh sweep of `BLOCK_SIZE_M/N/K`, `num_warps`, `num_stages` against
+`fused_experts_op(..., use_int4_w4a16=True)`, keeping every entry's `SPLIT_K`
+(the Triton kernel takes it as a required argument, so a config missing it
+raises `TypeError` at the first MoE call).
+
 ## 6. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
