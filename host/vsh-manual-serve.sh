@@ -39,6 +39,21 @@ if [ -n "${VSH_GLM53_PROFILER_DIR:-}" ]; then
   echo "[vsh-serve] torch profiler ENABLED dir=$VSH_GLM53_PROFILER_DIR"
 fi
 
+# OpenAI-style tool calling + reasoning separation. GLM-5.3 emits the
+# GLM-4.5/4.7 shapes -- <think>...</think> and <tool_call>fn<arg_key>k</arg_key>
+# <arg_value>v</arg_value></tool_call> -- which vllm/parser/glm47_moe.py parses
+# verbatim. "glm45" and "glm47" are aliases for the same classes; glm47 matches
+# the implementation name. With the reasoning parser on, the think block is
+# returned as `reasoning_content` instead of inline in `content`, which is what
+# coding harnesses expect; set glm53_tool_parsing: 0 to serve raw text instead.
+TOOLS=()
+if [ "${VSH_GLM53_TOOL_PARSING:-1}" = "1" ]; then
+  TOOLS=(--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47)
+  echo "[vsh-serve] tool-call + reasoning parsers ON (glm47)"
+else
+  echo "[vsh-serve] tool-call + reasoning parsers OFF (glm53_tool_parsing: 0)"
+fi
+
 exec vllm serve "$MODEL_DIR" \
   --served-model-name glm-5.3-flash \
   --tensor-parallel-size 2 \
@@ -52,5 +67,6 @@ exec vllm serve "$MODEL_DIR" \
   --max-num-batched-tokens ${VSH_GLM53_MAX_BATCHED:-512} \
   --trust-remote-code \
   "${SPEC[@]}" \
+  "${TOOLS[@]}" \
   "${PROF[@]}" \
   --host 0.0.0.0 --port "$PORT"

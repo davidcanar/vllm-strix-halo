@@ -13,6 +13,7 @@ glm53_max_ctx: 131072                # 128K context (native limit is 1M; TTFT is
 glm53_kv_bytes: 8589934592           # 8 GiB pinned GPU KV = 526,083 tokens = 4.01x at 128K
 glm53_max_batched: 512               # batched tokens/step (indexer workspace scales with this)
 glm53_mtp_tokens: 3                  # MTP draft tokens (0 = speculative decoding off)
+glm53_tool_parsing: 1                # 1 = --enable-auto-tool-choice + glm47 tool/reasoning parsers
 glm53_gpu_util: 0.83
 glm53_aiter: 1                       # 1 = aiter ON (required by the sparse MLA indexer)
 glm53_tbv_ar2: 1                     # 1 = tbv_ar2 decode all-reduce fast-path (validated on ROCm 10 — PATCHES.md §5.0)

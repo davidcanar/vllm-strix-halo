@@ -197,7 +197,7 @@ together. See AGENTS.md §RDMA.
 6. **NVFP4/EXL3 4-bit formats** seen in the wild for GLM-5.3 are NVIDIA-only;
    AWQ/compressed-tensors is the ROCm-compatible format used here.
 
-## 7. Tuned fused-MoE tile configs (gfx1151) — the decode bottleneck
+## 6. Tuned fused-MoE tile configs (gfx1151) — the decode bottleneck
 
 `host/moe-configs/E=288,N=1024,device_name=AMD_Radeon_8060S,dtype=int4_w4a16.json`
 
@@ -286,7 +286,51 @@ needs a fresh sweep of `BLOCK_SIZE_M/N/K`, `num_warps`, `num_stages` against
 (the Triton kernel takes it as a required argument, so a config missing it
 raises `TypeError` at the first MoE call).
 
-## 6. Attribution
+## 7. Tool calling and reasoning separation (`glm53_tool_parsing`)
+
+Coding harnesses need OpenAI-style `tool_calls` rather than raw text, which
+means three flags:
+
+```
+--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47
+```
+
+**Why `glm47` for a 5.3 model.** GLM-5.3's `chat_template.jinja` emits the
+GLM-4.5/4.7 shapes verbatim —
+
+```
+<think>...</think>
+<tool_call>fn<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+```
+
+— and `vllm/parser/glm47_moe.py` keys off exactly those markers
+(`TOOL_CALL_START`, `ARG_KEY_START`, `THINK_START`, …). vLLM registers the
+pair under **both** `glm45` and `glm47`, and they resolve to the same classes
+(`Glm47MoeModelToolParser` / `Glm47MoeParserReasoningAdapter`), so mixing the
+two names works but is pointless; this repo uses `glm47` for both because that
+is the implementation name and the parser's own
+`structural_tag_model = "glm_4_7"`. There is no `glm5*` parser in this build.
+
+**Thinking is always on.** The chat template opens the assistant turn with
+`<|assistant|><think>` (line 256) and defaults `Reasoning Effort: Max`, so
+generation starts *inside* a think block. The parser handles this: with no
+`thinking` / `enable_thinking` chat kwarg it defaults `thinking_enabled=True`
+and starts in `ParserState.REASONING`.
+
+**Gotcha — the field is `reasoning`, not `reasoning_content`.** On this build
+the chat response carries the think block in `message.reasoning`, with the
+token count under `usage.completion_tokens_details.reasoning_tokens`. A client
+that looks for `reasoning_content` will silently see nothing. Message keys are
+`annotations, audio, content, function_call, reasoning, refusal, role`.
+
+Validated end to end on the rig: non-streaming tool call returns
+`finish_reason: tool_calls` with valid-JSON arguments; the streaming path emits
+the name and argument deltas and reassembles to valid JSON; a reasoning-heavy
+prompt puts 1,579 chars in `reasoning` and a clean 604-char answer in
+`content` with no `<think>` leakage. Decode is unaffected (206.8 / 233.7
+ms/step at 512 / 4k, unchanged from §6).
+
+## 8. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for

@@ -134,6 +134,7 @@ lines (the decode all-reduce fast-path, `glm53_tbv_ar2: 1` — PATCHES.md §5.0)
 | `glm53_max_ctx` | 131072 | context cap. 128 K measures 4.01x concurrency with the pin below; the limit past this is TTFT (prefill is a flat 156 tok/s), not memory — PATCHES.md §5.2 |
 | `glm53_kv_bytes` | 8589934592 | pinned GPU KV pool (8 GiB = 526,083 tokens). Leave ~20 GiB/box free; `gpu_memory_utilization` is inert while this is set |
 | `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off (needs `vsh-mtp-ropefree-triton-sparse.patch` in the image — PATCHES.md §1.5; validated: ~92% acceptance, ~2.3× at long ctx) |
+| `glm53_tool_parsing` | 1 | `--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47`. Needed by coding harnesses; 0 serves raw text. Note the response field is `reasoning`, not `reasoning_content` — see PATCHES.md §7 |
 | `glm53_aiter` | 1 | aiter must be ON — the sparse-attention indexer's ROCm path requires it |
 | `glm53_tbv_ar2` | 1 | tbv_ar2 decode all-reduce over the usb4 rail (~150 µs/op at decode sizes; prefill-sized collectives stay on RCCL-over-IB; validated — PATCHES.md §5.0) |
 | `transport` | rdma | rdma \| tcp fallback |

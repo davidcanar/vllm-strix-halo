@@ -91,7 +91,7 @@ stream, temperature 0, TP all-reduce over the Thunderbolt RoCE rail (RCCL
 | 512 | ~6.7 tok/s | ~7.6 tok/s | ~7.9 tok/s |
 | 4.5k | ~2.4 tok/s | ~5.5 tok/s | ~5.6 tok/s |
 
-### Tuned fused-MoE tile configs (PATCHES.md §7)
+### Tuned fused-MoE tile configs (PATCHES.md §6)
 
 Adding `host/moe-configs/` cuts the decode **step** by ~1.6x. These numbers are
 measured differently from the table above — streamed, so time-to-first-token is
