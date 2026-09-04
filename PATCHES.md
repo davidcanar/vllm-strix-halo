@@ -277,6 +277,37 @@ chunks a sequential fp32 accumulation. Greedy text does still vary run to run
 on this cluster, but that predates this change — the same server queried twice
 also diverges.
 
+### Round 2: the knobs the first sweep missed — and where this stops
+
+Round 1 swept `BLOCK_SIZE_M/N/K`, `num_warps`, `num_stages`. It never touched
+`waves_per_eu` (a ROCm occupancy hint; vLLM's own shipped 8060S int4 config
+uses it) or `SPLIT_K` (splits the K = 4096 reduction across blocks). A second
+sweep over those, on top of each round-1 winner:
+
+| M | round 1 | round 2 | gain | added |
+|---:|---:|---:|---:|---|
+| 1 | 0.741 ms (70 GB/s) | 0.630 ms | **1.18x** | `waves_per_eu=1 SPLIT_K=4 GROUP_SIZE_M=4` |
+| 4 | 2.177 ms (95 GB/s) | 2.086 ms | 1.04x | `SPLIT_K=4` |
+| 8 | 3.457 ms (120 GB/s) | 3.309 ms | 1.04x | `waves_per_eu=1 SPLIT_K=2 GROUP_SIZE_M=4` |
+
+Still bit-identical to round 1 and still deterministic (max abs diff 0.0 at
+M = 1/4/8, repeated runs `torch.equal`), so these are free. Applied for
+M = 1/4/8 only; 16-512 keep the round-1 tiles because round 2 did not test the
+prefill shapes.
+
+**But it does not show up end to end.** M = 4 is the shape MTP decode actually
+uses, and 4% of an 84 ms/step MoE is ~3 ms of a ~225 ms step — under the
+±10 ms run-to-run spread. Measured after applying: 231.5 / 229.1 / 231.7
+ms/step at 4 K, against 225.5 before. That is noise, not a regression, and not
+a win either.
+
+The useful conclusion is the negative one: **tile and occupancy tuning is
+exhausted.** M = 4 sits at ~95 GB/s while the model's own dense BF16 GEMVs
+reach ~214 GB/s on this GPU, and no combination of the seven knobs Triton
+exposes closes that. The remaining ~2x needs a different kernel — a hand
+int4 grouped-GEMV for the `M*topk` rows-spread-over-experts shape — not
+different parameters for this one. Do not re-run the sweep.
+
 ### Re-tuning
 
 `host/moe-configs/` is specific to (num_experts, intermediate-per-rank, GPU,
