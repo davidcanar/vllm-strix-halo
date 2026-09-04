@@ -37,8 +37,9 @@ files, layered on `kyuz0/vllm-therock-gfx1151` (ROCm 7.14).
 | `breakable_cudagraph.py` stream-sync fix | ❌ **No (for now)** | We serve `--enforce-eager` (same as DS4). If cudagraphs are enabled later, revisit. |
 | Scheduler / KV / MTP tweaks (`kv_cache_utils.py`, `llm_base_proposer.py`, …) | ❌ **No** | DS4-specific layouts and DSpark drafter. GLM-5.3's KV grouping and its MTP (`glm5_next_mtp`) are upstream. |
 
-**Net:** this repo patches **three** vLLM files (the all-reduce hook, the
-TileLang-MHC gate, the aiter support gate + fp8 casts) and replaces three
+**Net:** this repo patches **five** vLLM files (the all-reduce hook, the
+TileLang-MHC gate, the aiter support gate, the fp8 fnuz casts, and the
+MTP rope-free Triton routing) and replaces three
 RDMA userspace pieces in the image (provider, libibverbs, tools). Everything
 else is upstream vLLM + configuration.
 
@@ -67,6 +68,23 @@ gfx1151-specific, all upstream-bug-class):
    RCCL silently fell back to TCP. The image now ships the DS4-proven pair:
    provider `rdmav57` + libibverbs `1.14.58` (+ matching `ibv_*` tools),
    and RCCL logs `Using network IB` (`usb4_rdma0`, RoCE, 40 Gbps).
+5. **MTP rope-free routing** (`vsh-mtp-ropefree-triton-sparse.patch`): GLM-5.3
+   is a *rope-free* MLA model (`qk_rope_head_dim = 0`, head 512 ==
+   `kv_lora_rank`), and aiter's asm sparse-decode kernel table has **no
+   heuristic kernel** for that layout — `aiter.mla.mla_decode_fwd` fails
+   `get_heuristic_kernel_mla()` and calls `abort()` (SIGABRT, no traceback).
+   Upstream vLLM knows aiter can't serve rope-free and routes prefill/plain
+   decode to its Triton ragged kernel — but its gate
+   (`_use_rocm_sparse_triton`: `plain_decode` / `max_query_len == 1`) sends
+   every **MTP-shaped batch** (draft steps flattened to next_n single-token
+   rows; the multi-token verify query) into the aiter path, killing the
+   worker on the first speculative batch. The patch keeps the upstream
+   conditions first and, on gfx1151, falls back to the Triton ragged kernel
+   for rope-free BF16 batches of any shape — safe because the backend's own
+   metadata builder already flattens *every* query token to its own ragged
+   row, which is exactly the input that kernel serves for prefill and plain
+   decode. Result: MTP runs end-to-end (~92% draft acceptance, ~2.3× at
+   4.5k ctx vs MTP-off; see §5.4).
 
 Config-only bring-up findings (no patch): the vision-encoder cache profiling
 kills the worker on gfx1151 → `--skip-mm-profiling`; the aiter env must be
@@ -144,16 +162,19 @@ together. See AGENTS.md §RDMA.
 2. **No disk KV tier.** DS4's `fs_lru` tier is DS4-specific and not carried.
    `glm53_max_ctx` starts at 32 K for the ~4 GiB KV pin; raise as memory allows.
 3. **No cudagraphs.** `--enforce-eager` (matches the validated DS4 profile).
-4. **MTP** is on by default in the repo (`glm5_next_mtp`, 3 draft tokens) but
-   **crashes the worker on gfx1151** in the reference deployment: the
-   drafter's multi-token decode exercises the aiter indexer's CDNA-only
-   decode path (SIGABRT, no traceback). The reference config therefore runs
-   `glm53_mtp_tokens: 0` until the indexer decode gets a gfx1151 triton path
-   (same work class as DS4's `ds4_topk.py`). Validated baseline without MTP:
-   **~6.7 tok/s** at 512 ctx, **~2.4 tok/s** at 4.5k ctx (100-token
-   generations, single stream, temperature 0; first-request JIT warm-up
-   excluded; RDMA transport confirmed via RCCL `Using network IB` on
-   `usb4_rdma0`).
+4. **MTP — FIXED** (`vsh-mtp-ropefree-triton-sparse.patch`, §1.5). The
+   original crash: with `glm53_mtp_tokens > 0` the worker SIGABRTed on the
+   first speculative batch (no traceback; last worker log was aiter's
+   `module_mla_metadata` import, then the JIT build of `module_mla_asm`,
+   whose `get_heuristic_kernel_mla` aborts for GLM's rope-free BF16 layout).
+   Isolated repro: calling `aiter.mla.mla_decode_fwd` with the rope-free
+   512-dim MQA shape aborts with `asm_mla.cu:193 cannot get heuristic
+   kernel!`. The patch routes MTP-shaped batches to the Triton ragged
+   kernel; validated end-to-end — engine warmup survives, greedy quality is
+   correct, ~92% draft-token acceptance (197/213), and single-stream
+   throughput at 4.5k ctx goes **~2.4 → ~5.5 tok/s (~2.3×)** (~6.7 → ~7.6
+   tok/s at 512 ctx). `glm53_mtp_tokens: 3` is now the validated default
+   everywhere.
 5. **RCCL CQ warm-up** not pre-applied (see §1). Symptom to watch: EngineCore
    SIGSEGV during weight load on a memory-tight box.
 6. **NVFP4/EXL3 4-bit formats** seen in the wild for GLM-5.3 are NVIDIA-only;

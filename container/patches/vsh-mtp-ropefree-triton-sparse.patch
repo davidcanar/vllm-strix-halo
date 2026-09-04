@@ -1,0 +1,34 @@
+diff --git a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+index ef707d6..7dd7061 100644
+--- a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+@@ -55,11 +55,28 @@ def _use_rocm_sparse_triton(
+ ) -> bool:
+     """Select the rope-free BF16 path not supported by AITER sparse MLA."""
+     plain_decode = num_decode_tokens == num_decodes
+-    return (
++    if (
+         not kv_cache_dtype.startswith("fp8")
+         and head_size == kv_lora_rank
+         and plain_decode
+         and (num_prefills > 0 or (num_decodes > 0 and max_query_len == 1))
++    ):
++        return True
++    # vllm-strix-halo: aiter's asm sparse-decode kernel table has no entry
++    # for the rope-free BF16 layout at all. When an MTP-shaped batch (draft
++    # steps flattened to next_n single-token rows, or the multi-token verify
++    # query) fails the plain-decode gate above, vLLM falls back to
++    # aiter.mla.mla_decode_fwd, whose get_heuristic_kernel_mla() lookup
++    # fails and abort()s the whole process (SIGABRT, no traceback -- the
++    # worker dies on the first speculative batch, killing MTP on gfx1151).
++    # The metadata builder flattens every query token to its own ragged row
++    # regardless of batch shape, which is exactly the input the Triton
++    # ragged kernel already serves for prefill and plain decode, so route
++    # MTP batches there too on gfx1151.
++    from vllm.platforms.rocm import on_gfx1151
++
++    return on_gfx1151() and not kv_cache_dtype.startswith("fp8") and (
++        head_size == kv_lora_rank
+     )
+ 
+ 

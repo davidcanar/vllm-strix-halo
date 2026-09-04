@@ -133,7 +133,7 @@ default — PATCHES.md §5.0).
 |---|---|---|
 | `glm53_max_ctx` | 32768 | context cap (KV pin / block size bound) |
 | `glm53_kv_bytes` | 4294967296 | pinned GPU KV pool |
-| `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off (MTP crashes gfx1151 — PATCHES.md §5.4; reference rig runs 0) |
+| `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off (needs `vsh-mtp-ropefree-triton-sparse.patch` in the image — PATCHES.md §1.5; validated: ~92% acceptance, ~2.3× at long ctx) |
 | `glm53_aiter` | 1 | aiter must be ON — the sparse-attention indexer's ROCm path requires it |
 | `glm53_tbv_ar2` | 0 | tbv_ar2 decode fast-path (crashes the ROCm 10 stack — PATCHES.md §5.0) |
 | `transport` | rdma | rdma \| tcp fallback |
@@ -150,18 +150,25 @@ default — PATCHES.md §5.0).
 | worker dies after `TileLang ... mhc_pre_big_fuse_with_norm` | stale image without the gfx1151 TileLang-MHC gate — rebuild with `container/build.sh` (PATCHES.md) |
 | worker dies after `Encoder cache will be initialized` | missing `--skip-mm-profiling` (PATCHES.md) |
 | EngineCore SIGSEGV on load | RCCL CQ ENOMEM — PATCHES.md §5 candidate patch |
+| worker SIGABRT on the first MTP batch (`module_mla_metadata` / `module_mla_asm` last in its log) | stale image without `vsh-mtp-ropefree-triton-sparse.patch` — rebuild with `container/build.sh` (PATCHES.md §1.5) |
 
 ## 9. Performance
 
 Validated on the reference rig (2× Ryzen AI Max+ 395 / 128 GB each), single
 stream, temperature 0, RDMA transport (RCCL `Using network IB` on
-`usb4_rdma0`, RoCE 40 Gbps), MTP off (see §7 — MTP crashes gfx1151 until the
-indexer decode gets a triton path):
+`usb4_rdma0`, RoCE 40 Gbps). MTP = `glm5_next_mtp`, 3 draft tokens
+(`vsh-mtp-ropefree-triton-sparse.patch`, PATCHES.md §1.5 — without it the
+worker SIGABRTs on the first speculative batch):
 
-| context | total (100-token generation) |
-|---|---|
-| 512 | ~6.7 tok/s |
-| 4.5k | ~2.4 tok/s |
+| context | MTP off | MTP on (3 tokens) |
+|---|---|---|
+| 512 | ~6.7 tok/s | ~7.6 tok/s |
+| 4.5k | ~2.4 tok/s | ~5.5 tok/s |
+
+MTP acceptance on these runs: ~92% of draft tokens accepted (197/213), mean
+acceptance length up to 4.0, per-position rates 1.000/1.000/1.000 on greedy
+repetitive text — from `/metrics` (`vllm:spec_decode_*`) or the periodic
+`SpecDecoding metrics` journal lines.
 
 These are first-bring-up baselines with the per-step fp8→fnuz conversion on
 the sparse-MQA path (see PATCHES.md §1.3 — an in-kernel conversion is the
