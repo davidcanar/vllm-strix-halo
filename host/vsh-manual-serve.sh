@@ -39,7 +39,7 @@ fi
 PROF=()
 if [ -n "${VSH_GLM53_PROFILER_DIR:-}" ]; then
   mkdir -p "$VSH_GLM53_PROFILER_DIR"
-  PROF=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VSH_GLM53_PROFILER_DIR}\",\"torch_profiler_with_stack\":false,\"delay_iterations\":${VSH_GLM53_PROFILER_DELAY:-0},\"active_iterations\":${VSH_GLM53_PROFILER_ACTIVE:-5},\"ignore_frontend\":true}")
+  PROF=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VSH_GLM53_PROFILER_DIR}\",\"torch_profiler_with_stack\":false,\"delay_iterations\":${VSH_GLM53_PROFILER_DELAY:-0},\"active_iterations\":${VSH_GLM53_PROFILER_ACTIVE:-5}}")
   echo "[vsh-serve] torch profiler ENABLED dir=$VSH_GLM53_PROFILER_DIR"
 fi
 

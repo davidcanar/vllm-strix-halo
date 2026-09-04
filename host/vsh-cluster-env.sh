@@ -25,7 +25,14 @@ export NCCL_IB_DISABLE=0
 # That is expected, not a fault.
 export NCCL_NET_GDR_LEVEL=0
 export NCCL_IB_TIMEOUT=23
-export NCCL_PROTO=LL
+# RCCL protocol: left to the RCCL per-size selection. This was pinned to LL,
+# which is right for tiny latency-bound collectives -- but since tbv_ar2 took
+# over everything <=1 MiB (PATCHES.md section 5.0), RCCL only ever sees the
+# big prefill-sized collectives, where the LL scheme of 8 bytes of flag per
+# 8 bytes of payload is exactly wrong. Profiled with LL pinned: 71.5 ms per
+# ~29 MB all-reduce = 0.41 GB/s on a 5 GB/s rail, and 51% of prefill time.
+# Set VSH_NCCL_PROTO=LL to restore the old behaviour.
+[ -n "${VSH_NCCL_PROTO:-}" ] && export NCCL_PROTO=$VSH_NCCL_PROTO
 export NCCL_ALGO=Ring
 export NCCL_IB_RETRY_CNT=7
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=2400

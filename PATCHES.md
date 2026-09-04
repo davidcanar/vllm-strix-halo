@@ -374,7 +374,56 @@ Returns flatten hard after 2048 (+3-5% for 2048 -> 4096), so ~200 tok/s looks
 like the next wall; the remaining per-chunk cost is the ~87 latency-bound
 all-reduces, which is §5.0s territory rather than this knobs.
 
-## 9. Attribution
+## 9. RCCL protocol: unpin NCCL_PROTO (prefill all-reduce)
+
+After §8 raised the chunk, a prefill profile showed the collectives had become
+the dominant cost, not the MoE:
+
+| prefill kernel (2 chunks, 2304 + 3599 tok) | self CUDA | share |
+|---|---:|---:|
+| `vllm::all_reduce` / `ncclDevKernel_Generic_4` | 16.09 s | **51%** |
+| `fused_moe_kernel_gptq_awq` | 6.54 s | 21% |
+| `_sparse_attn_prefill_ragged_kernel` | 1.97 s | 6% |
+| `aten::mm` | 1.59 s | 5% |
+
+224 collectives at **71.5 ms each**, moving ~29 MB per call: **0.41 GB/s on a
+40 Gbps (~5 GB/s) rail**, about 8% of link.
+
+The cause was `NCCL_PROTO=LL` in `vsh-cluster-env.sh`. LL spends 8 bytes of
+flag per 8 bytes of payload and exists for tiny latency-bound collectives.
+That pin was reasonable when RCCL carried the decode all-reduces — but since
+tbv_ar2 took over everything <= 1 MiB (§5.0), **RCCL only ever sees the big
+prefill-sized collectives**, which is precisely where LL is worst. The pin had
+outlived its reason.
+
+Fix: stop pinning it and let RCCL choose per message size (`NCCL_ALGO=Ring`
+stays; 2 ranks). Set `VSH_NCCL_PROTO=LL` to restore the old behaviour. Safe in
+all cases: if tbv_ar2 ever fails open, the RCCL selection picks LL for the
+small sizes anyway.
+
+Measured prefill (uncacheable nonce prompts, warm):
+
+| prompt | 512 chunk + LL | 4096 chunk + LL | 4096 chunk + auto |
+|---:|---:|---:|---:|
+| 1.8 K | 150 | 206 | **277** |
+| 7 K | 152 | 195 | **276** |
+| 14 K | 151 | 197 | 247 |
+| 21 K | 157 | 196 | **280** |
+| 34 K | – | 195 | **277** |
+
+TTFT for a 4 K prompt: 18.05 → 13.60 → **9.18 s**. For 512 tokens:
+2.11 → **1.34 s**. Projected cold 128 K prefill: 13.9 → 9.8 → **7.8 min**.
+Decode is unchanged (216–239 ms/step). §8 + §9 together take prefill from
+~151 to ~277 tok/s, **+83%**.
+
+The original plan here was to raise `TBV2_MAX_BYTES` (1 MiB) so tbv_ar2 could
+carry prefill collectives too. That is now much less attractive: the tensors
+are ~29 MB, over even the 16 MiB the doorbell can encode (`nbytes` occupies
+24 bits), so it would need chunking *and* a grid-stride rewrite of
+`tbv2_wait_add_kernel`, which is launched `dim3(1), dim3(1024)` — a single
+workgroup. Re-profile before spending that effort.
+
+## 10. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for
