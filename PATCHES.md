@@ -484,7 +484,99 @@ decode differences between the three are within noise, so only the prefill
 number is firmly established. And `ib_write_bw` measures the driver, not the
 fabric — a better RoCE driver could still change the picture.
 
-## 11. Attribution
+## 11. CUDA graphs — attempted, blocked (`glm53_enforce_eager`)
+
+`--enforce-eager` has been on since bring-up because it matched the validated
+DS4 profile (§5.3). With the MoE fixed the decode step is ~200 ms and a
+decode-only profile shows ~32 ms/step (≈16%) outside the model-execute marker
+— launch and CPU work that CUDA graphs would be expected to recover. So it was
+worth an attempt. It does not work yet, and the failure is specific enough to
+be worth recording.
+
+Three gates, in the order they appear:
+
+1. **`max_num_seqs`.** Capture refuses to start:
+   `ValueError: max_num_seqs (1024) exceeds available Mamba cache blocks (293).
+   Each decode sequence requires one Mamba cache block, so CUDA graph capture
+   cannot proceed.` The default 1024 was meaningless here anyway (§5.2 gives
+   4.01x concurrency at 128 K), so `glm53_max_seqs: 256` is now set
+   independently of this experiment — it is free (decode 201.6/225.5 ms at
+   512/4k, prefill 310-340 tok/s, i.e. unchanged or marginally better).
+
+2. **Not torch-compiled.** vLLM logs
+   `torch.compile is turned on, but the model ... does not support it`, and
+   then piecewise capture refuses:
+   `piecewise CUDA graphs (cudagraph_mode=FULL_AND_PIECEWISE) unavailable,
+   model is not torch-compiled and breakable CUDA graph is off. Set
+   VLLM_USE_BREAKABLE_CUDAGRAPH=1 or cudagraph_mode=NONE/FULL.`
+   `VLLM_USE_BREAKABLE_CUDAGRAPH=1` is the right answer — it is exactly what
+   the `@eager_break_during_capture` decorators on the kpool indexer and the
+   KDA `_forward` exist for.
+
+3. **Capture then breaks on rank 1.** With breakable capture on, rank 0
+   succeeds — `Graph capturing finished in 177 secs, took 11.43 GiB` — and
+   rank 1 dies inside a Triton launch hook:
+   `SystemError: <built-in method __reversed__ of list object> returned a
+   result with an exception set`, raised from `triton/knobs.py:432` under
+   `triton/backends/amd/driver.py`. Engine core init then fails. This is the
+   bug class §1 flagged when it listed DS4's `breakable_cudagraph.py`
+   stream-sync fix as a candidate we had not ported.
+
+Even if (3) were fixed, **11.43 GiB of graph memory per rank** is not
+affordable against the ~18.6 GiB free that the 8 GiB KV pin leaves — it would
+have to be traded against KV, i.e. against context.
+
+So: `glm53_enforce_eager: 1` stays the default, `glm53_max_seqs: 256` is kept
+on its own merits, and the knob is in place for whoever retries this after
+porting the DS4 stream-sync fix. Set `glm53_enforce_eager: 0` to reproduce.
+
+## 12. What is left: the unquantized BF16 weights
+
+The AWQ checkpoint quantizes the routed experts and nothing else. Its ignore
+list is `lm_head`, `embed_tokens`, `visual.*`, **`self_attn.*`**,
+`shared_experts.*`, `mlp.gate`, `_hc.*`, `eh_proj`, `layers.(0|1|2).mlp.*` and
+**`layers.45.*`**. Two of those are expensive at decode.
+
+**Attention + KDA projections (`self_attn.*`) — ~48 ms/step, 24% of decode.**
+Note `self_attn` covers the KDA layers too: `Glm5NextDecoderLayer` assigns
+`self.self_attn = Glm5NextLinearAttention(...)` for the 34 linear-attention
+layers, and `kda.py` forces `quant_config=None` for them anyway ("KDA
+projections remain BF16 because fp8 checkpoints omit their scales"). So per
+rank each step reads roughly:
+
+| | per layer | layers | total |
+|---|---:|---:|---:|
+| KDA `in_proj_qkvbfg_a` [12576, 4096] | 103 MB | 34 | 3.5 GB |
+| KDA `o_proj` [4096, 4096] | 34 MB | 34 | 1.1 GB |
+| MLA `q_b` / `kv_b` / `o_proj` / `fused_qkv_a` | ~126 MB | 11 | 1.4 GB |
+
+~6.1 GB/rank of BF16, every step. At the ~214 GB/s these `wvSplitK` skinny
+GEMMs actually achieve that is ~29 ms, and 48 ms is measured — so the kernels
+are within ~1.7x of roofline and there is little left in the *kernel*. The
+prize is in the *format*: at int4 the same weights would be ~1.5 GB and ~7 ms.
+**Potentially ~40 ms/step, ~20% of decode.** Needs a re-quantized checkpoint
+with `self_attn` included, and attention is the most quality-sensitive place to
+put 4 bits, so it needs real calibration and an eval — not a blind RTN pass.
+
+**MTP block (`layers.45.*`) — ~9 ms/step plus ~7 GB/rank.** Confirmed
+unquantized: the safetensors index has 889 tensors under `layers.45.` and
+**zero** `weight_packed`. Its 288 experts in BF16 are ~14.5 GB (~7 GB/rank),
+which is why the KV pin and `max_model_len` are as tight as they are. Freeing
+that is worth more as *memory* (a much larger KV pool, or headroom for §12's
+attention quantization) than as the 9 ms/step of drafter MoE.
+
+This one is lower risk than the attention weights: layer 45 only produces
+*draft* tokens, and the target model verifies every one. If a cheap RTN int4
+pass degrades the drafts, MTP acceptance drops and throughput regresses, but
+**output correctness is unaffected** — a safe thing to try and revert. The work
+is emitting `weight_packed`/`weight_scale` in compressed-tensors
+pack-quantized layout for those tensors and dropping `layers.45.*` from the
+ignore list.
+
+Either way this is checkpoint work, not serving work. The cheapest route is
+asking `wtdcode` for a variant that quantizes layer 45 (and optionally the MLA
+projections) rather than re-deriving one from the 643 GB BF16 original.
+## 13. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for

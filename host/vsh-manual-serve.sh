@@ -58,17 +58,35 @@ else
   echo "[vsh-serve] tool-call + reasoning parsers OFF (glm53_tool_parsing: 0)"
 fi
 
+# --enforce-eager has been on since bring-up (it matched the validated DS4
+# profile). Turning it off enables torch.compile + CUDA graphs, which costs a
+# long first-boot compile and is unproven on this hybrid (KDA + sparse-MLA)
+# model, so it stays the default. Set glm53_enforce_eager: 0 to experiment.
+EAGER=(--enforce-eager)
+if [ "${VSH_GLM53_ENFORCE_EAGER:-1}" != "1" ]; then
+  EAGER=()
+  # This model is not torch-compiled (vLLM: "does not support it"), so
+  # piecewise capture needs the breakable-cudagraph path -- which is what
+  # the @eager_break_during_capture decorators on the kpool indexer and the
+  # KDA _forward exist for. Without it vLLM raises:
+  #   piecewise CUDA graphs unavailable, model is not torch-compiled and
+  #   breakable CUDA graph is off.
+  export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+  echo "[vsh-serve] enforce-eager OFF (CUDA graphs, breakable capture)"
+fi
+
 exec vllm serve "$MODEL_DIR" \
   --served-model-name glm-5.3-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   --quantization compressed-tensors \
-  --enforce-eager \
+  "${EAGER[@]}" \
   --skip-mm-profiling \
   --gpu-memory-utilization ${VSH_GLM53_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${VSH_GLM53_KV_BYTES:-4294967296} \
   --max-model-len "${VSH_GLM53_MAX_CTX:-32768}" \
   --max-num-batched-tokens ${VSH_GLM53_MAX_BATCHED:-512} \
+  --max-num-seqs ${VSH_GLM53_MAX_SEQS:-256} \
   --trust-remote-code \
   "${SPEC[@]}" \
   "${TOOLS[@]}" \

@@ -135,6 +135,8 @@ lines (the decode all-reduce fast-path, `glm53_tbv_ar2: 1` — PATCHES.md §5.0)
 | `glm53_kv_bytes` | 8589934592 | pinned GPU KV pool (8 GiB = 526,083 tokens). Leave ~20 GiB/box free; `gpu_memory_utilization` is inert while this is set |
 | `glm53_max_batched` | 4096 | prefill chunk. 512 -> 4096 is +30% prefill for 0.6 GiB and no decode cost; the old "NOT larger" note was wrong — PATCHES.md §8 |
 | `glm53_mtp_tokens` | 3 | MTP draft tokens; 0 = off (needs `vsh-mtp-ropefree-triton-sparse.patch` in the image — PATCHES.md §1.5; validated: ~92% acceptance, ~2.3× at long ctx) |
+| `glm53_max_seqs` | 256 | concurrent sequences. The 1024 default is meaningless here (4.01x concurrency at 128 K) and blocks CUDA graph capture: each decode seq needs one Mamba cache block and there are ~293 — PATCHES.md §11 |
+| `glm53_enforce_eager` | 1 | 0 tries torch.compile + CUDA graphs. Currently blocked: rank 1 hits a Triton SystemError during breakable capture, and capture costs 11.4 GiB/rank — PATCHES.md §11 |
 | `glm53_tool_parsing` | 1 | `--enable-auto-tool-choice --tool-call-parser glm47 --reasoning-parser glm47`. Needed by coding harnesses; 0 serves raw text. Note the response field is `reasoning`, not `reasoning_content` — see PATCHES.md §7 |
 | `glm53_aiter` | 1 | aiter must be ON — the sparse-attention indexer's ROCm path requires it |
 | `glm53_tbv_ar2` | 1 | tbv_ar2 decode all-reduce over the usb4 rail (~150 µs/op at decode sizes; prefill-sized collectives stay on RCCL-over-IB; validated — PATCHES.md §5.0) |
