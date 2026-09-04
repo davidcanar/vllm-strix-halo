@@ -67,7 +67,8 @@ gfx1151-specific, all upstream-bug-class):
    `query_device` in a way the thunderbolt kernel driver rejects (EINVAL) —
    RCCL silently fell back to TCP. The image now ships the DS4-proven pair:
    provider `rdmav57` + libibverbs `1.14.58` (+ matching `ibv_*` tools),
-   and RCCL logs `Using network IB` (`usb4_rdma0`, RoCE, 40 Gbps).
+   and RCCL logs `Using network IB` (`usb4_rdma0`, RoCE, 20 Gbps negotiated
+   — §10; and RCCL no longer uses it by default).
 5. **MTP rope-free routing** (`vsh-mtp-ropefree-triton-sparse.patch`): GLM-5.3
    is a *rope-free* MLA model (`qk_rope_head_dim = 0`, head 512 ==
    `kv_lora_rank`), and aiter's asm sparse-decode kernel table has **no
@@ -265,11 +266,21 @@ figure; matched at the same 47.4% MTP acceptance / 2.52 tokens per step):
 
 | | before | after |
 |---|---:|---:|
-| decode step (512 / 4k / 8k ctx) | 359 / 359 / 360 ms | 213 / 225 / 230 ms |
-| decode throughput @ 4k ctx | 7.02 tok/s | 11.18 tok/s |
+| decode step (~155 / ~1.3 K / ~2.6 K tok prompts) | 359 / 359 / 360 ms | 213 / 225 / 230 ms |
+| decode throughput (~1.3 K tok prompt) | 7.02 tok/s | 11.18 tok/s |
 
-Decode step time is flat across 512-8192 context, which is what you expect
-when the step is dominated by a context-independent MoE.
+Decode step time is flat across context - 523 to 32 830 tokens in the
+re-measurement below - which is what you expect when the step is dominated by
+a context-independent MoE.
+
+> **Context labels.** The decode figures in this section came from a harness
+> that sized prompts as `round(target / 230)` paragraphs when a paragraph is
+> in fact 71 tokens, so its "512 / 4k / 8k" prompts were really ~155 / ~1.3 K /
+> ~2.6 K tokens. The before/after comparisons are unaffected (same prompts on
+> both sides) but the labels were. Re-measured at true token counts, decode
+> step time is flat over a much wider range than originally claimed:
+> **200.6 / 221.3 / 215.7 / 230.8 ms** at **523 / 2 084 / 8 190 / 32 830**
+> tokens, with prefill holding 284-334 tok/s across the same span.
 
 **Numerics are unchanged**: the tuned tiles produce bit-identical output to
 the stock ones (max abs diff 0.0 at M=1/4/8), because `BLOCK_SIZE_K` only
@@ -298,8 +309,8 @@ prefill shapes.
 **But it does not show up end to end.** M = 4 is the shape MTP decode actually
 uses, and 4% of an 84 ms/step MoE is ~3 ms of a ~225 ms step — under the
 ±10 ms run-to-run spread. Measured after applying: 231.5 / 229.1 / 231.7
-ms/step at 4 K, against 225.5 before. That is noise, not a regression, and not
-a win either.
+ms/step at ~1.3 K tok, against 225.5 before. That is noise, not a regression,
+and not a win either.
 
 The useful conclusion is the negative one: **tile and occupancy tuning is
 exhausted.** M = 4 sits at ~95 GB/s while the model's own dense BF16 GEMVs
@@ -359,7 +370,7 @@ Validated end to end on the rig: non-streaming tool call returns
 the name and argument deltas and reassembles to valid JSON; a reasoning-heavy
 prompt puts 1,579 chars in `reasoning` and a clean 604-char answer in
 `content` with no `<think>` leakage. Decode is unaffected (206.8 / 233.7
-ms/step at 512 / 4k, unchanged from §6).
+ms/step at ~155 / ~1.3 K tok prompts, unchanged from §6).
 
 ## 8. Prefill chunk size (`glm53_max_batched`)
 
@@ -396,7 +407,7 @@ steady-state number:
 | 21 K | 157 | 188 | 196 |
 | 34 K | - | - | 195 |
 
-TTFT for a 4 K prompt: **18.05 -> 14.79 -> 13.60 s**. Projected cold 128 K
+TTFT for a 2 841-token prompt: **18.05 -> 14.79 -> 13.60 s**. Projected cold 128 K
 prefill: 13.9 -> 11.8 -> ~10 min. Decode is unaffected (225-240 ms/step
 across all three, inside run-to-run noise). Memory cost of 512 -> 4096 is
 0.6 GiB (19.6 -> 19.0 GiB free per box).
@@ -418,7 +429,7 @@ the dominant cost, not the MoE:
 | `aten::mm` | 1.59 s | 5% |
 
 224 collectives at **71.5 ms each**, moving ~29 MB per call: **0.41 GB/s on a
-40 Gbps (~5 GB/s) rail**, about 8% of link.
+20 Gbps (~2.5 GB/s) rail**, about 16% of link.
 
 The cause was `NCCL_PROTO=LL` in `vsh-cluster-env.sh`. LL spends 8 bytes of
 flag per 8 bytes of payload and exists for tiny latency-bound collectives.
@@ -442,8 +453,9 @@ Measured prefill (uncacheable nonce prompts, warm):
 | 21 K | 157 | 196 | **280** |
 | 34 K | – | 195 | **277** |
 
-TTFT for a 4 K prompt: 18.05 → 13.60 → **9.18 s**. For 512 tokens:
-2.11 → **1.34 s**. Projected cold 128 K prefill: 13.9 → 9.8 → **7.8 min**.
+TTFT for a 2 841-token prompt: 18.05 → 13.60 → **9.18 s**. For a short
+(~150-token) prompt: 2.11 → **1.34 s** (a real 523-token prompt measures
+1.84 s cold). Projected cold 128 K prefill: 13.9 → 9.8 → **7.8 min**.
 Decode is unchanged (216–239 ms/step). §8 + §9 together take prefill from
 ~151 to ~277 tok/s, **+83%**.
 
@@ -458,8 +470,8 @@ workgroup. Re-profile before spending that effort.
 
 This one cuts against the premise of the repo, so here is the measurement.
 
-The netdev negotiates **20 Gbps**, not the 40 Gbps quoted elsewhere in these
-docs (`ethtool thunderbolt0` → `Speed: 20000Mb/s`), so the ceiling is ~2.5
+The netdev negotiates **20 Gbps**, not the 40 Gbps this repo originally
+assumed (`ethtool thunderbolt0` → `Speed: 20000Mb/s`), so the ceiling is ~2.5
 GB/s. Raw `ib_write_bw -d usb4_rdma0 -x 1 -q 4` over the rail managed
 **3.85 Gb/s = 0.48 GB/s**, i.e. the RoCE driver delivers under a fifth of the
 link.
@@ -486,7 +498,7 @@ End to end, three server configurations (single stream, tuned MoE, 4096 chunk,
 `NCCL_PROTO` auto). Prefill is the mean of five uncacheable warm prompts;
 decode is ms/step, which is the acceptance-independent figure:
 
-| transport | prefill tok/s | decode @512 | decode @4k | TTFT @4k |
+| transport | prefill tok/s | decode, ~155 tok | decode, ~1.3 K tok | TTFT, 2 841 tok |
 |---|---:|---:|---:|---:|
 | `rdma` — IB + tbv_ar2 | 271 | 216.4 | 238.8 | 9.18 s |
 | `hybrid` — sockets + tbv_ar2 | 305 | 213.1 | 227.7 | **8.37 s** |
@@ -494,8 +506,8 @@ decode is ms/step, which is the acceptance-independent figure:
 
 Two conclusions:
 
-1. **Disabling IB for RCCL is a clear win** (+13% prefill, −0.8 s TTFT at 4 K,
-   decode a touch better). `NCCL_IB_DISABLE=1` is the whole change.
+1. **Disabling IB for RCCL is a clear win** (+13% prefill, −0.8 s TTFT on a
+   2 841-token prompt, decode a touch better). `NCCL_IB_DISABLE=1` is the whole change.
 2. **tbv_ar2 is neutral once RCCL is on sockets.** `hybrid` and `tcp` are
    inside run-to-run noise of each other on both axes. tbv_ar2 was worth ~150
    µs/op against *RCCL-over-IB* (§5.0); against RCCL-over-sockets, which does
@@ -532,7 +544,7 @@ Three gates, in the order they appear:
    cannot proceed.` The default 1024 was meaningless here anyway (§5.2 gives
    4.01x concurrency at 128 K), so `glm53_max_seqs: 256` is now set
    independently of this experiment — it is free (decode 201.6/225.5 ms at
-   512/4k, prefill 310-340 tok/s, i.e. unchanged or marginally better).
+   ~155/~1.3 K tok, prefill 310-340 tok/s, i.e. unchanged or marginally better).
 
 2. **Not torch-compiled.** vLLM logs
    `torch.compile is turned on, but the model ... does not support it`, and

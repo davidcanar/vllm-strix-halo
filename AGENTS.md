@@ -160,7 +160,7 @@ lines (the decode all-reduce fast-path, `glm53_tbv_ar2: 1` — PATCHES.md §5.0)
 
 Validated on the reference rig (2× Ryzen AI Max+ 395 / 128 GB each), single
 stream, temperature 0, RDMA transport (RCCL `Using network IB` on
-`usb4_rdma0`, RoCE 40 Gbps). MTP = `glm5_next_mtp`, 3 draft tokens
+`usb4_rdma0`, RoCE, 20 Gbps negotiated). MTP = `glm5_next_mtp`, 3 draft tokens
 (`vsh-mtp-ropefree-triton-sparse.patch`, PATCHES.md §1.5 — without it the
 worker SIGABRTs on the first speculative batch):
 
