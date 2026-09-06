@@ -1,5 +1,24 @@
 # PATCHES.md — what this repo patches, and why (review of `AlexKGwyn/ds4-vllm`)
 
+> ## ⚠️ Correctness warnings (2026-09-04)
+>
+> Three defects were found after the performance work below was written, and
+> some of the claims in this file were wrong. Read
+> **[PENDINGWORK.md](PENDINGWORK.md)** before trusting any quality claim here.
+>
+> 1. **MTP corrupts structured output on gfx1151.** `glm53_mtp_tokens: 0` is
+>    now the recommended setting, not `3`. See §1 item 4.
+> 2. **Greedy decoding is not reproducible on this rig** at `temperature 0` —
+>    5 identical requests give 5 different completions, at every prompt length
+>    down to 244 tokens. Reported upstream:
+>    [vllm#54521](https://github.com/vllm-project/vllm/issues/54521)
+>    ([our data](https://github.com/vllm-project/vllm/issues/54521#issuecomment-5545047644)).
+> 3. **Tool calling collapses above ~10k prompt tokens** — the model stops
+>    emitting `</tool_call>`, so agent harnesses stall silently on HTTP 200.
+>
+> The *timing* results below (prefill tok/s, ms/step, TTFT) are unaffected —
+> they do not depend on which token is emitted. The *quality* claims are.
+
 This is the review you asked for: *which patches from the DeepSeek-V4-Flash
 Strix Halo build are required to run **GLM-5.3-Flash** on the same 2-box
 gfx1151 rig over RDMA?*
@@ -191,8 +210,26 @@ together. See AGENTS.md §RDMA.
    kernel; validated end-to-end — engine warmup survives, greedy quality is
    correct, ~92% draft-token acceptance (197/213), and single-stream
    throughput at 4.5k ctx goes **~2.4 → ~5.5 tok/s (~2.3×)** (~6.7 → ~7.6
-   tok/s at 512 ctx). `glm53_mtp_tokens: 3` is now the validated default
-   everywhere.
+   tok/s at 512 ctx).
+
+   > ⚠️ **RETRACTED: MTP is not a safe default.** "Greedy quality is correct"
+   > above was measured only as readable prose, which is exactly what this
+   > failure mode preserves. With MTP on, **structured** output corrupts:
+   > requests die at exactly 12 output tokens (3 MTP steps at k=3) emitting
+   > 13-character tool-call arguments, and prompts as small as ~4k tokens
+   > return empty responses. Disabling MTP removed that failure mode
+   > entirely — 10/10 valid tool calls where 8/10 had failed. The upstream
+   > recipe for this model states MTP is **not supported on ROCm**
+   > (<https://recipes.vllm.ai/zai-org/GLM-5.3-Flash>), and we run it via the
+   > gfx1151 patch above anyway.
+   >
+   > **Use `glm53_mtp_tokens: 0`** until this is fixed, and accept ~3x slower
+   > decode. Related upstream: spec decoding altering greedy output
+   > ([#54928](https://github.com/vllm-project/vllm/issues/54928),
+   > [#53436](https://github.com/vllm-project/vllm/issues/53436)) and MTP
+   > repetition collapse until `max_tokens`
+   > ([#55357](https://github.com/vllm-project/vllm/issues/55357)).
+   > Full detail in [PENDINGWORK.md](PENDINGWORK.md).
 5. **RCCL CQ warm-up** not pre-applied (see §1). Symptom to watch: EngineCore
    SIGSEGV during weight load on a memory-tight box.
 6. **NVFP4/EXL3 4-bit formats** seen in the wild for GLM-5.3 are NVIDIA-only;
@@ -284,9 +321,25 @@ a context-independent MoE.
 
 **Numerics are unchanged**: the tuned tiles produce bit-identical output to
 the stock ones (max abs diff 0.0 at M=1/4/8), because `BLOCK_SIZE_K` only
-chunks a sequential fp32 accumulation. Greedy text does still vary run to run
-on this cluster, but that predates this change — the same server queried twice
-also diverges.
+chunks a sequential fp32 accumulation.
+
+> ⚠️ **CORRECTION.** This section originally went on to say that greedy text
+> "does vary run to run on this cluster, but that predates this change", and
+> used that to wave the divergence away. The observation was right and the
+> conclusion was wrong: **it is a real correctness bug**, not ambient noise.
+> Five byte-identical `temperature 0` requests return five different
+> completions, at every prompt length tested down to 244 tokens, and some runs
+> degenerate into repetition loops. Reported upstream at
+> [vllm#54521](https://github.com/vllm-project/vllm/issues/54521); our
+> gfx1151 data is
+> [here](https://github.com/vllm-project/vllm/issues/54521#issuecomment-5545047644).
+>
+> The tuned tiles are **not** the cause, and that is now properly established
+> rather than assumed. The original check used `E=32` and two repeats; redone
+> at the real `E=288, K=4096, N=1024, topk=8` with **20 identical calls** per
+> config, every call is bitwise identical (1 distinct result, max drift 0.0)
+> for M=1/4/8 under both `SPLIT_K=1` and `SPLIT_K=4`. `SPLIT_K` partitions the
+> K reduction, so it was the obvious suspect; it is excluded.
 
 ### Round 2: the knobs the first sweep missed — and where this stops
 
@@ -619,7 +672,87 @@ ignore list.
 Either way this is checkpoint work, not serving work. The cheapest route is
 asking `wtdcode` for a variant that quantizes layer 45 (and optionally the MLA
 projections) rather than re-deriving one from the 643 GB BF16 original.
-## 13. Attribution
+## 14. Deterministic MoE-router top-k (`vsh-moe-router-deterministic-topk.patch`)
+
+The stock Python router selects experts with
+
+```python
+use_sorted = envs.VLLM_BATCH_INVARIANT          # False by default
+topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+```
+
+which is **not reproducible on this hardware**, in two separate ways. Measured
+on a real 740x288 fp32 score tensor dumped from a live layer-21 forward,
+20 identical calls:
+
+| arm | distinct raw / 20 | distinct selected sets / 20 |
+|---|---:|---:|
+| `sort(descending=True, stable=True)[:k]` | **1** | **1** |
+| `topk(sorted=False)` (stock default) | **20** | 2 |
+| `topk(sorted=True)` | 2 | 2 |
+
+1. `sorted=False` returns the correct top-k **set** in a **different order on
+   740/740 rows on every call**. The gathered routing weights are permuted to
+   match, so the downstream k-term summation order changes and the MoE output
+   differs run to run.
+2. `sorted=True` still flips the selected **set** on exact fp32 ties. The real
+   tensor has k-boundary ties at rows 40 and 549 (experts 12/202 and 243/250 —
+   *different* logits and *different* biases whose sums round to the same
+   float), and the varying row is exactly row 40.
+   `torch.use_deterministic_algorithms(True)` does **not** help: no raise, no
+   warning, still flips.
+
+The patch selects with a stable descending sort, giving a total order of
+**value descending, then expert index ascending**. That is not a new
+convention: it is what vLLM's own fused CUDA kernel already does
+(`moeTopKFuncs.cuh` packs `65535 - idx` into the comparison key; the
+multi-group path uses `WarpSelect<..., is_stable=true>`), and what
+`test_grouped_topk_single_group_stable_ties` asserts. Only the Python fallback
+— which is the path taken on ROCm — fails to match it.
+
+**Effect, measured end to end.** The determinism sweep goes from **5 distinct
+of 5 at every prompt length** to **1 of 5** for prompts below `index_topk`, and
+all 45 layers become bit-identical across forwards on both TP ranks at 740
+tokens. Quality and tool calling are unaffected; prefill stays inside the
+284-334 tok/s baseline (340/328/317 at 2K/8K/32K measured after the patch).
+
+**It is not a complete cure, and the boundary is sharp.** Above
+`index_topk = 2048` a *separate* defect remains: the DSA sparse-attention
+indexer's own top-k. Confirmed with a six-point tap inside layer 3, both ranks,
+in one boot — at 719 prompt tokens all six points are deterministic, at 2497
+the divergence enters at the attention output (`self.self_attn(...)`, 6 of 6
+distinct) with its input bit-identical, and everything downstream cascades.
+That one is upstream's [#54521](https://github.com/vllm-project/vllm/issues/54521),
+with a fix in flight at
+[#55122](https://github.com/vllm-project/vllm/pull/55122) — see
+[PENDINGWORK.md](PENDINGWORK.md) §12.
+
+**Cost:** none — slightly faster. 71.6 us vs 97.8 us for the selection on the
+real tensor, about 1.1 ms saved per 42-layer prefill, ~2.4 MiB transient. A
+full sort is O(E log E) against topk's O(E log k), so the trade could invert at
+much larger expert counts.
+
+**Behavioural delta:** confined to exact ties, 1 row in 740 on the real
+tensors. Ascending-index is always one of the outcomes `torch.topk` already
+produced, so no new selection is introduced — the patch only pins which one.
+
+**Known cross-path inconsistency, pre-existing.** AITER's
+`biased_grouped_topk` (reached when `VLLM_ROCM_USE_AITER_MOE=1`, which this
+repo sets to 0) is deterministic but its tie-break is opaque and demonstrably
+not ascending-index. This patch does not create that divergence, but it does
+not unify it either.
+
+`fused_topk_bias_router.py` carries the same `VLLM_BATCH_INVARIANT` gating and
+was patched identically in the validated build, but is **not** included in the
+shipped patch: it is unreachable for GLM-5.3 (a valid grouping config routes to
+`grouped_topk`), it has no behavioural coverage on this model, and it contains
+a further unanalysed `topk` site.
+
+Upstream submission is prepared in `upstream/` (`PR-BODY.md` and
+`test_grouped_topk_determinism.py`); the bug is not a duplicate of anything
+open as of 2026-09-05.
+
+## 15. Attribution
 
 RDMA natives and the `tbv/` kernel kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for

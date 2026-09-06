@@ -155,20 +155,24 @@ RUN /opt/venv/bin/hipcc -O2 --offload-arch=gfx1151 -shared -fPIC \
 
 # RDMA all-reduce hook (VSH_TBV_AR2) in the CUDA communicator, and the
 # gfx1151 TileLang-MHC gate fix. Model-agnostic, env-gated, fail-open.
+# Plus the deterministic MoE-router top-k (PATCHES.md §14): the stock
+# Python router selects experts with torch.topk(sorted=False), which is
+# not reproducible. Model-agnostic, unconditional.
 # Reviewed in PATCHES.md.
 COPY container/patches/vsh-rdma-allreduce.patch \
      container/patches/vsh-mhc-no-tilelang-gfx1151.patch \
      container/patches/vsh-aiter-gfx1151-gate.patch \
      container/patches/vsh-fp8-fnuz-mqa.patch \
-     container/patches/vsh-mtp-ropefree-triton-sparse.patch /tmp/
+     container/patches/vsh-mtp-ropefree-triton-sparse.patch \
+     container/patches/vsh-moe-router-deterministic-topk.patch /tmp/
 RUN cd /opt/venv/lib/python3.12/site-packages && \
     git apply -p1 --whitespace=nowarn \
       /tmp/vsh-rdma-allreduce.patch /tmp/vsh-mhc-no-tilelang-gfx1151.patch \
       /tmp/vsh-aiter-gfx1151-gate.patch /tmp/vsh-fp8-fnuz-mqa.patch \
-      /tmp/vsh-mtp-ropefree-triton-sparse.patch && \
+      /tmp/vsh-mtp-ropefree-triton-sparse.patch /tmp/vsh-moe-router-deterministic-topk.patch && \
     rm /tmp/vsh-rdma-allreduce.patch /tmp/vsh-mhc-no-tilelang-gfx1151.patch \
       /tmp/vsh-aiter-gfx1151-gate.patch /tmp/vsh-fp8-fnuz-mqa.patch \
-      /tmp/vsh-mtp-ropefree-triton-sparse.patch
+      /tmp/vsh-mtp-ropefree-triton-sparse.patch /tmp/vsh-moe-router-deterministic-topk.patch
 
 # Drop stale bytecode for the touched package so the first import recompiles
 # from the patched sources.

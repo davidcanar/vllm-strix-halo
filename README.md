@@ -74,20 +74,45 @@ Full ordered runbook with gates and gotchas: **[AGENTS.md](AGENTS.md)**.
 | `tbv/` | Thunderbolt RDMA kernel-module kit (vendored from ds4-vllm, GPL-2.0 side) |
 | `host/` | cluster env/config/restart/down/serve scripts, systemd unit, deploy.sh |
 | `PATCHES.md` | the ds4-vllm → GLM patch review |
+| `PENDINGWORK.md` | **open defects, what was ruled out, and where to resume** |
 | `AGENTS.md` | the ordered end-to-end runbook |
 
 ## Models
 
 | profile | model | weights | API port | quantization |
 |---|---|---|---|---|
-| `glm53` | GLM-5.3-Flash | `wtdcode/GLM-5.3-Flash-AWQ-W4A16` (~191 GB) | 1235 | compressed-tensors W4A16, bf16 KV; MTP speculative decoding enabled (2.2-4.0 tokens/step measured, 40-100% draft acceptance depending on the prompt — PATCHES.md §1.5) |
+| `glm53` | GLM-5.3-Flash | `wtdcode/GLM-5.3-Flash-AWQ-W4A16` (~191 GB) | 1235 | compressed-tensors W4A16, bf16 KV; MTP speculative decoding **should be disabled** (`glm53_mtp_tokens: 0`) — it corrupts structured output on gfx1151; see [Known correctness issues](#known-correctness-issues) |
 | `ds4` | DeepSeek-V4-Flash | `deepseek-ai/DeepSeek-V4-Flash-0731` (~156 GB) | 1234 | fp8 KV + DSpark MTP (ds4-vllm image) |
 
 > The official `zai-org/GLM-5.3-Flash` checkpoint is FP8 ≈ 335 GB — it cannot
 > fit 2×128 GB UMA or the reference worker's disk. AWQ W4A16 is the format that
 > fits; see PATCHES.md §3.
 
+## Known correctness issues
+
+**Read this before trusting any output from this stack.** Three defects were
+found on 2026-09-04, after the performance work below. Full investigation,
+measurements and reproducers: **[PENDINGWORK.md](PENDINGWORK.md)**.
+
+| # | defect | status | mitigation |
+|---|---|---|---|
+| 1 | **MTP corrupts structured output.** Requests die at exactly 12 output tokens (3 MTP steps at k=3) with 13-character tool-call arguments; ~4k-token prompts return empty responses. The upstream recipe says MTP is unsupported on ROCm. | ours to avoid | **`glm53_mtp_tokens: 0`** — costs ~3x decode throughput |
+| 2 | **Greedy decoding is not reproducible.** 5 identical `temperature 0` requests → 5 different completions, at every length down to 244 prompt tokens. Some runs degenerate into repetition loops; retrieval returns near-tie wrong tokens (`velvet-harbor` for `velvet-harpoon`). | upstream, open — [vllm#54521](https://github.com/vllm-project/vllm/issues/54521) ([our data](https://github.com/vllm-project/vllm/issues/54521#issuecomment-5545047644)) | none available; `VLLM_BATCH_INVARIANT` requires NVIDIA CC ≥ 9.0 |
+| 3 | **Tool calling collapses above ~10k prompt tokens.** The model stops emitting `</tool_call>`, so the parser buffers forever and the client sees HTTP 200 with nothing after the preamble. Coding harnesses stall silently. | likely a consequence of #2 | repeat the tool-call format at the *end* of the prompt (validated at 12k) |
+
+Defect 2 means **this rig should not be used for anything requiring
+reproducible output**, and evaluation numbers from it carry run-to-run variance
+that has nothing to do with sampling.
+
 ## Performance
+
+> ⚠️ The decode figures below were measured with **MTP enabled**, i.e. with
+> defect 1 active. The **timing** is still valid — ms/step and tok/s do not
+> depend on which token is emitted — but with MTP disabled for correctness you
+> lose the 2.2–4.0 tokens/step speculative gain, so real decode throughput is
+> roughly **3x lower** than the tok/s quoted here. The prefill and TTFT
+> figures are unaffected: those changes (chunk size, `NCCL_PROTO`, transport)
+> do not touch speculative decoding.
 
 Reference rig: 2× Ryzen AI Max+ 395 / 128 GB, single stream, temperature 0,
 MTP = 3 draft tokens, `max_ctx: 131072`, shipped `transport: hybrid`.
