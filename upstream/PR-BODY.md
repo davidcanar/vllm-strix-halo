@@ -58,6 +58,22 @@ def test_grouped_topk_single_group_stable_ties(num_experts: int):
     expected_ids = torch.arange(16, dtype=torch.int32, device="cuda")[None]
 ```
 
+Most tellingly, the **reference implementation in that same test file already
+uses precisely the ordering this PR installs** — a stable descending sort:
+
+```python
+def _single_group_reference(...):
+    ...
+    indices = torch.argsort(
+        scores + bias.float(), dim=-1, descending=True, stable=True
+    )[:, :topk]
+```
+
+So the fused kernel, the test suite's reference, and #55122's convention for
+the sparse indexer all agree on value-desc/index-asc. The Python fallback is
+the only piece that does not, and it is the piece that actually runs on ROCm.
+This PR makes it agree.
+
 This PR makes the Python fallback select under the same total order
 (value descending, index ascending on bitwise-equal scores), so the two
 implementations of `grouped_topk` finally agree on ties. It also matches the
