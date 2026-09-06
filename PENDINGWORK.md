@@ -1442,7 +1442,8 @@ robustness, not an intermittent defect.
 In `upstream/`: `PR-BODY.md` (end-to-end numbers filled in; only the DCO
 `Signed-off-by` remains) and `test_grouped_topk_determinism.py` — three tests
 with a *constructed* bitwise tie, deliberately **not** CUDA-gated because the
-Python fallback is the code under test. Not a duplicate of anything open as of
+Python fallback is the code under test (rewritten at 288 experts and verified
+to fail on stock - see §12.6). Not a duplicate of anything open as of
 2026-09-05; the bug is also **not ROCm-only** (CUDA takes the same Python path
 when `e_score_correction_bias is None` or the aiter flag is off).
 
@@ -1463,3 +1464,42 @@ for GLM-5.3, no behavioural coverage, and it holds a further unanalysed `topk`.
 4. Unchanged from before: MTP stays off (§1.2), and the long-context tool-call
    collapse (§1.3) is a *separate* problem with an unapplied chat-template
    mitigation — determinism work does not address it.
+
+### 12.6 Retraction: the first regression test did not test anything
+
+Recorded because it is the eighth retraction in this document and the same
+mistake as §10.2 in a new costume.
+
+`upstream/test_grouped_topk_determinism.py` as first written **passed 10/10
+against the stock, unpatched router**. It had never been executed; it was
+packaged and described as a regression test on the strength of reading it.
+Running the control arm - the same file in a throwaway container built from
+the pre-patch image - is what caught it.
+
+Why it was vacuous: it constructed its tie at **32 experts**, and
+`torch.topk`'s ordering only degrades **above 256 columns**. Below that the
+stock op returns sorted, stable output, so every assertion in the file held
+on unfixed code.
+
+The boundary is exact, measured on the bare op (20 calls of
+`torch.topk(x, k=8, sorted=False)` on `64 x E`):
+
+| E | distinct / 20 | sorted output |
+|---|---:|---|
+| 128, 250, 255, **256** | 1 | yes |
+| **257** ... 288, 512, 1024, 2048 | **20** | no |
+
+Same split for any `k >= 4`; `k <= 2` is order-trivial. This also answers a
+question §12 left open - *why has upstream not hit this?* **DeepSeek-V3/R1
+has exactly 256 routed experts and sits on the safe side of the boundary.**
+GLM-5.3's 288 is over it. The bug needs >256 experts to appear at all.
+
+Rewritten at 288 experts and re-verified both ways: **16 of 18 cases fail on
+stock, all 18 pass patched.** The 2 that pass on stock are the group-tie pair,
+whose top-k is over `num_expert_group` = 4 - below the threshold by
+construction - and they are kept as contract tests for the L135 site.
+
+The lesson is §10.2's, restated: *a test that has not been run against the
+broken code is not a regression test, it is a hypothesis.* Both times the
+error was the same shape - a check whose inputs could not reach the defect -
+and both times only the control arm exposed it.

@@ -710,6 +710,16 @@ multi-group path uses `WarpSelect<..., is_stable=true>`), and what
 `test_grouped_topk_single_group_stable_ties` asserts. Only the Python fallback
 — which is the path taken on ROCm — fails to match it.
 
+**The boundary is 256 experts, exactly.** `sorted=False` permits any order,
+and above 256 columns `torch.topk` switches to a multi-pass path whose order
+also varies per call. Measured on the bare op, 20 calls of
+`torch.topk(x, k=8, sorted=False)` on `64 x E`: E of 128/250/255/**256** give
+1 distinct result and sorted output; E of **257**/258/260/264/272/288/512/
+1024/2048 give **20** distinct and unsorted. Same split for any `k >= 4`. So
+this bites **models with more than 256 routed experts** - GLM-5.3 has 288,
+while DeepSeek-V3/R1's 256 sits just inside the safe side, which is why the
+upstream fallback has survived this long unnoticed.
+
 **Effect, measured end to end.** The determinism sweep goes from **5 distinct
 of 5 at every prompt length** to **1 of 5** for prompts below `index_topk`, and
 all 45 layers become bit-identical across forwards on both TP ranks at 740

@@ -99,6 +99,29 @@ Two independent defects:
    `warn_only` nor `strict` mode does it raise, warn, or change `topk`'s
    behaviour on these tensors.
 
+### Why this has stayed invisible: the boundary is at 256 experts
+
+`sorted=False` licenses *any* order, and above 256 columns `torch.topk` takes
+a multi-pass path whose output order is not merely unsorted but differs
+between calls. The boundary is exact. 20 identical
+`torch.topk(x, k=8, sorted=False)` calls on a `64 x E` tensor, same stack as
+above:
+
+| experts (E) | distinct results / 20 | output descending |
+|:--|---:|:--|
+| 128, 250, 255, **256** | 1 | yes |
+| **257**, 258, 260, 264, 272, 288, 512, 1024, 2048 | **20** | no |
+
+The same split holds for any `k >= 4` (`k <= 2` is order-trivial), and
+`sorted=True` at E=288 gives 1/20 - consistent with defect 2 needing a real
+tie rather than mere width.
+
+So the blast radius is **models with more than 256 routed experts**.
+DeepSeek-V3/R1 has exactly 256 and sits on the safe side of the boundary,
+which is presumably why this has gone unnoticed; GLM-5.3's 288 is over it. The
+boundary is an implementation detail of one `topk` on one backend, though -
+the fallback should not depend on unspecified ordering at any width.
+
 ## The change
 
 A module-level helper realising the kernel's total order, used at all three
@@ -208,22 +231,39 @@ stays minimal and reviewable.
   also run on ROCm and CPU CI):
 
   ```
-  pytest tests/kernels/moe/test_grouped_topk.py -k "deterministic or tie_free"
+  pytest tests/kernels/moe/test_grouped_topk.py -k "determinism or descending or tie_broken"
   ```
 
-  - `test_grouped_topk_single_group_deterministic_ties`: a deliberate,
+  - `test_grouped_topk_repeat_determinism`: 20 identical calls must return
+    bitwise-identical `topk_ids` and `topk_weights`. No tie required - this is
+    defect 1, the ordering one. Parametrized over sigmoid/softmax,
+    bias/no-bias, and 1-group/8-group.
+  - `test_grouped_topk_returns_value_descending_order`: the selected experts
+    come back in descending score order, and the selected *set* equals
+    `topk(..., sorted=True)`'s. This is a single-call assertion - no
+    repetition, so it cannot be flaky - and it is the one that pins the
+    fallback to the kernel's existing contract.
+  - `test_grouped_topk_tie_broken_by_lower_expert_index`: a deliberate,
     bitwise-exact tie at the k-boundary (two experts with identical logit
-    bits, so the tie survives any elementwise rounding, eager or compiled),
-    asserting (a) 20 identical calls give bitwise-identical `topk_ids` and
-    `topk_weights`, (b) the tie is won by the ascending expert index,
-    (c) the returned order is value-descending, parametrized over
-    sigmoid/softmax and bias/no-bias.
-  - `test_grouped_topk_single_group_tie_free_control`: with the tie broken,
-    the selection is exactly what `topk(..., sorted=True)` already returns —
-    the fix changes nothing on tie-free input.
-  - `test_grouped_topk_multi_group_deterministic_group_tie`: a bitwise-exact
-    tie at the *group* boundary (`topk_group > 1`) is broken by ascending
-    group index, covering the group-selection site.
+    bits, so the tie survives any elementwise rounding, eager or compiled) is
+    won by the ascending expert index.
+  - `test_grouped_topk_group_tie_broken_by_lower_group_index`: a
+    bitwise-exact tie at the *group* boundary (`topk_group > 1`) is broken by
+    ascending group index, covering the group-selection site at L135.
+
+  **These fail on `main` and pass with this PR**: 16 of 18 cases fail before
+  the change, all 18 pass after, same GPU and same command. The 2 that
+  already passed are the group-tie pair, whose top-k is over
+  `num_expert_group` = 4 values and therefore never crosses the 256-column
+  threshold; they are kept as contract tests for the L135 site.
+
+  The tests use **288 experts on purpose**. Per the table above, `topk`'s
+  ordering only degrades past 256 columns, so the same tests written at
+  DeepSeek-V3's 256 - or at the 32 experts the existing
+  `test_grouped_topk_single_group_stable_ties` uses - pass against the
+  unfixed code and demonstrate nothing. This was checked the wrong way round
+  first: an earlier draft at 32 experts passed on stock and had to be
+  rewritten.
 - End-to-end on the affected deployment (GLM-5.3, 2x TP, gfx1151, greedy,
   740-token prefill, repeated N times, comparing first-token and full
   completion bit-identity before/after):
@@ -281,7 +321,7 @@ stays minimal and reviewable.
 **DCO / attribution**
 
 ```
-Signed-off-by: <<REAL NAME>> <<email@example.com>>
+Signed-off-by: David Canar <davidcanar@gmail.com>
 ```
 
 This PR was prepared with AI assistance (analysis of the nondeterminism,
