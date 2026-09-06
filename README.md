@@ -1,3 +1,51 @@
+> # ⚠️ STATUS: NOT USABLE FOR REAL WORK — READ THIS FIRST
+>
+> **GLM-5.3-Flash on vLLM is broken for agentic use, and this repo cannot fix
+> it.** Do not adopt this stack for coding agents, tool use, or anything that
+> needs reproducible output. The remaining defects are in **vLLM itself** and
+> have to be fixed upstream. Until they are, use a different model for that
+> work.
+>
+> ### What is broken — measured on this rig, 2026-09-05
+>
+> | Symptom | Evidence |
+> |---|---|
+> | **Tool calling collapses at long context.** The model writes the answer as prose instead of calling the tool, or emits a one-line preamble and stops with `finish_reason: stop` and no tool call. | **3/3** valid tool calls at 229 prompt tokens; **0/3** at 12,288. Forcing `tool_choice` does not rescue it: **1/3** valid at 18,792 tokens, and 2 of 3 burned the **entire 16,000-token budget** emitting empty arguments. |
+> | **Greedy decoding is not reproducible above ~2,048 prompt tokens.** | 5 byte-identical requests → 5 different completions at 2,373 / 4,718 / 9,705 / 14,782 prompt tokens (`temperature=0`, fixed seed). |
+> | **MTP (speculative decoding) corrupts structured output.** | Must stay disabled — `glm53_mtp_tokens: 0`. See [PATCHES.md](PATCHES.md) §1. |
+>
+> **Why this matters in practice:** a coding-agent request — system prompt, tool
+> schemas, open files — is several thousand tokens. **Every realistic agentic
+> request therefore lands in the broken regime.** Short single-turn chat below
+> ~2,000 tokens works correctly and is reproducible.
+>
+> ### What we fixed, and what we did not
+>
+> We root-caused and fixed **one** of the defects: nondeterministic MoE expert
+> selection, where the router selected experts with
+> `torch.topk(..., sorted=False)`. Submitted upstream as
+> **[vllm-project/vllm#55514](https://github.com/vllm-project/vllm/pull/55514)**
+> and carried here as `container/patches/vsh-moe-router-deterministic-topk.patch`
+> ([PATCHES.md §14](PATCHES.md)). That makes greedy decoding reproducible
+> **below 2,048 prompt tokens only.**
+>
+> The rest is **not ours to fix**:
+>
+> - **The DSA sparse-attention indexer's top-k above `index_topk`** — tracked in
+>   [vllm-project/vllm#54521](https://github.com/vllm-project/vllm/issues/54521).
+>   Note that the in-flight fix
+>   [#55122](https://github.com/vllm-project/vllm/pull/55122) repairs the CUDA
+>   `persistent_topk` path, which **ROCm never calls**
+>   (`sparse_attn_indexer.py` gates it on `current_platform.is_cuda()`); on this
+>   stack the op in play is `top_k_per_row_prefill`. So #55122 landing will
+>   **not** fix ROCm.
+> - **The long-context tool-call collapse** — not yet root-caused. It is *not*
+>   caused by the nondeterminism: it persists unchanged with the router fix
+>   live, and its failures are budget runaways rather than output variation.
+>
+> Working notes, including every exclusion and the retractions:
+> **[PENDINGWORK.md](PENDINGWORK.md)**.
+
 # vllm-strix-halo — GLM-5.3-Flash (and DeepSeek-V4-Flash) on 2× AMD Strix Halo, TP=2 over Thunderbolt
 
 Serve **GLM-5.3-Flash** (and **DeepSeek-V4-Flash**) with vLLM across **two AMD

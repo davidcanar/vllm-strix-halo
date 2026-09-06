@@ -1503,3 +1503,51 @@ The lesson is §10.2's, restated: *a test that has not been run against the
 broken code is not a regression test, it is a hypothesis.* Both times the
 error was the same shape - a check whose inputs could not reach the defect -
 and both times only the control arm exposed it.
+
+### 12.7 The tool-call collapse is NOT the nondeterminism (measured)
+
+Settled by measurement after the router fix went live from the image on both
+ranks, so the determinism variable is removed.
+
+`/v1/chat/completions`, one `write` tool, `temperature=0`, GLM-5.3-Flash:
+
+| prompt tok | tool_choice | finish | tool calls | arguments |
+|---:|---|---|---:|---|
+| 229 | auto | `tool_calls` | 1 | valid, 3/3 |
+| 4,710 | auto | 2x `tool_calls`, 1x `length` | 1/1/0 | **invalid** where present |
+| 12,288 | auto | 2x `stop`, 1x `length` | **0/0/0** | none |
+| 229 | forced | `stop` | 1 | valid, 6.5 KB HTML, 3/3 |
+| 18,792 | forced | `length`/`stop`/`length` | 1/1/1 | **1 of 3 valid**; the other 2 ran to the full 16,000-token cap emitting `{}` and `{"path":...}` |
+
+Three conclusions:
+
+1. **Determinism was never the mechanism.** The failure persists with the fix
+   live, and the failures are *runaways and prose*, not output variation. A
+   perfectly reproducible server fails this identically every time.
+2. **Capability is intact at depth.** Forced rep1 at 18,792 tokens emitted a
+   complete, valid 3,180-char game in 1,058 tokens. The model *can*; at long
+   context it usually does not.
+3. **Forcing `tool_choice` is not a workaround** at 1-in-3, and it makes the
+   failure mode worse: constrained decoding fights the model's preference for
+   prose and burns the whole budget.
+
+The `12,288 / auto / stop / 0 tools` row reproduces the original user-reported
+symptom near-verbatim: a one-line preamble ("I'll create a complete Snake game
+in a single HTML file with canvas rendering, keyboard co...") and then nothing.
+
+Retracted along the way: the theory that harnesses reading `reasoning_content`
+instead of `reasoning` see an empty message. `content_len` is *large* at long
+context (2,387 / 3,232 / 8,456), so content is being returned - it is simply
+prose with no tool call.
+
+Unconfirmed observation worth its own test: at the 229-token forced control all
+three reps returned *different* file sizes (6,586 / 6,515 / 6,604 chars) while
+`reasoning` was byte-identical at 520 chars every time. That is *below* the
+2,048 boundary where `/v1/completions` is now 1-of-5. The chat+tools path may
+have a nondeterminism source the router fix does not cover, plausibly guided
+decoding for the tool schema - but that probe did not set `seed`, so re-run it
+seeded before believing it.
+
+Next lever, untested: `reasoning_effort: low`. `reasoning` grows from 520 chars
+at short context to 7,179 at long context, and the tool call disappears exactly
+where the thinking balloons.
