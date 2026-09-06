@@ -173,7 +173,32 @@ do_stop_glm53() {
         pkill -9 -f "bin/vllm serve .*GLM-5.3-Flash" 2>/dev/null || true
     fi
     remote "pkill -f 'bin/vllm serve .*GLM-5.3-Flash' 2>/dev/null" 20 2>/dev/null || true
-    log "GLM-5.3-Flash cluster stopped."
+
+    # Ray teardown. This used to be missing entirely: stopping the serve unit
+    # leaves ray running, gcs_server keeps holding port 6379, and the NEXT
+    # bring-up -- glm53 or ds4 -- dies with "box1 ray start failed" while this
+    # function has already reported success. vsh-cluster-down.sh runs
+    # `ray stop --force` in the container on both boxes; prefer it, and keep an
+    # inline fallback so a missing deploy still tears ray down.
+    if [[ -x "$HOME/vsh-cluster-down.sh" ]]; then
+        "$HOME/vsh-cluster-down.sh" >/dev/null 2>&1 \
+            || warn "vsh-cluster-down.sh reported an error - check ray by hand"
+    else
+        warn "vsh-cluster-down.sh not deployed - stopping ray inline"
+        timeout 90 podman exec -u 1000:1000 -w "$HOME" "$GLM_CTR" \
+            bash -lc 'ray stop --force >/dev/null 2>&1' 2>/dev/null || true
+        remote "podman exec -u 1000:1000 -w \$HOME $GLM_CTR bash -lc 'ray stop --force >/dev/null 2>&1'" 90 2>/dev/null || true
+    fi
+
+    # Verify rather than assume: a held 6379 is the symptom that breaks the
+    # next start, so surface it here where it is cheap to fix.
+    sleep 2
+    if ss -ltn 2>/dev/null | grep -q ":6379"; then
+        warn "ray GCS still holds port 6379 - the next bring-up will fail."
+        warn "  fix: podman exec $GLM_CTR bash -lc 'ray stop --force'"
+    else
+        log "GLM-5.3-Flash cluster stopped (ray down, :6379 free)."
+    fi
 }
 
 # ---- ds4 delegation: the existing AlexKGwyn/ds4-vllm stack -----------------
