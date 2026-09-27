@@ -136,7 +136,7 @@ Full ordered runbook with gates and gotchas: **[AGENTS.md](AGENTS.md)**.
 
 | profile | model | weights | API port | quantization |
 |---|---|---|---|---|
-| `glm53` | GLM-5.3-Flash | `wtdcode/GLM-5.3-Flash-AWQ-W4A16` (~191 GB) | 1235 | compressed-tensors W4A16, bf16 KV; MTP speculative decoding **should be disabled** (`glm53_mtp_tokens: 0`) — it corrupts structured output on gfx1151; see [Known correctness issues](#known-correctness-issues) |
+| `glm53` | GLM-5.3-Flash | `wtdcode/GLM-5.3-Flash-AWQ-W4A16` (~191 GB) | 1235 | compressed-tensors W4A16, bf16 KV; MTP speculative decoding defaults OFF (`glm53_mtp_tokens: 0`) — it corrupted structured output on the Sep-3 pin; upstream #58454 (kpool corruption with spec decode) is in the Sep-27 pin and MTP is being re-validated |
 | `ds4` | DeepSeek-V4-Flash | `deepseek-ai/DeepSeek-V4-Flash-0731` (~156 GB) | 1234 | fp8 KV + DSpark MTP (ds4-vllm image) |
 
 > The official `zai-org/GLM-5.3-Flash` checkpoint is FP8 ≈ 335 GB — it cannot
@@ -159,7 +159,7 @@ Defect 2 means **this rig should not be used for anything requiring
 reproducible output**, and evaluation numbers from it carry run-to-run variance
 that has nothing to do with sampling.
 
-## Performance
+## Performance (measured on the 2026-09-03 pin — re-measurement on the Sep-27 pin pending)
 
 > ⚠️ The decode figures below were measured with **MTP enabled**, i.e. with
 > defect 1 active. The **timing** is still valid — ms/step and tok/s do not

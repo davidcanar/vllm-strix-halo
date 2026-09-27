@@ -22,7 +22,7 @@ podman build -t "$IMAGE" \
 
 log "post-build checks"
 # GLM-5.3-Flash registration (import must not need a GPU).
-podman run --rm "$IMAGE" python - <<'EOF' || { echo "FAIL: glm5next not registered"; exit 1; }
+podman run --rm -i --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined "$IMAGE" python - <<'EOF' || { echo "FAIL: glm5next not registered"; exit 1; }
 from vllm.model_executor.models.registry import ModelRegistry
 archs = ModelRegistry.get_supported_archs()
 for a in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"):
@@ -33,7 +33,7 @@ EOF
 # OdinLink userspace presence (decode all-reduce + RCCL net plugin + stream
 # lib). The host driver (odl_tb5.ko) is built separately by
 # odinlink/build-odinlink.sh; the libs here must match its ABI pin.
-podman run --rm "$IMAGE" python - <<'EOF' || { echo "FAIL: odinlink userspace missing"; exit 1; }
+podman run --rm -i --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined "$IMAGE" python - <<'EOF' || { echo "FAIL: odinlink userspace missing"; exit 1; }
 import os
 paths = [
     "/opt/venv/lib/python3.12/site-packages/libodl_ar2.so",
