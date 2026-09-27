@@ -54,7 +54,7 @@ remote() { timeout "${2:-30}" ssh -o BatchMode=yes "$WORKER_HOST" "$1"; }
 # module is vermagic-locked, so it needs rebuilding after kernel updates
 # (odinlink/build-odinlink.sh).
 odl_up() {
-    [[ -e "$ODL_DEV" ]] && lsmod | grep -q '^odl_tb5'
+    [[ -e "$ODL_DEV" ]] && grep -q odl_tb5 /proc/modules
 }
 
 # Parse [model] [action]. First arg is a model name if it matches, otherwise
@@ -106,7 +106,7 @@ do_start_glm53() {
         || die "thunderbolt0 is down - check the USB4 cable / peer box."
     # OdinLink fabric (odl_tb5 driver + device) on both boxes
     odl_up || warn "OdinLink not up on head ($ODL_DEV) - bring-up continues on the TCP fallback transport."
-    remote "test -e $ODL_DEV && lsmod | grep -q '^odl_tb5'" >/dev/null 2>&1 \
+    remote "test -e $ODL_DEV && grep -q odl_tb5 /proc/modules" >/dev/null 2>&1 \
         || warn "OdinLink not up on ${WORKER_HOST} - bring-up continues on the TCP fallback transport."
 
     # serving containers alive on both boxes
