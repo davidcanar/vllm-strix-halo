@@ -5,8 +5,8 @@
 #   Machine A (this machine, 10.0.2.1): Ray head + vLLM OpenAI API server
 #   Machine B (10.0.2.2):              Ray worker, TP rank 1
 #
-#   Link : Thunderbolt/USB4 RoCE-RDMA (usb4_rdma0, GID index 1) — the TP
-#          all-reduce runs over RCCL-over-IB (prefill) and the tbv_ar2
+#   Link : Thunderbolt/USB4 with the OdinLink driver (odl_tb5) — the TP
+#          all-reduce runs over RCCL-on-odl (prefill) and the odl_ar2
 #          natives (decode) on this rail.
 #
 #   Models (both first-class):
@@ -34,7 +34,7 @@ set -uo pipefail
 WORKER_HOST="10.0.2.2"          # box2, driven over ssh (BatchMode)
 UNIT_FILE_VSH="$HOME/.config/systemd/user/vsh-glm.service"
 CONFIG_YAML="$HOME/vsh-config.yaml"
-RDMA_DEV="usb4_rdma0"
+ODL_DEV="/dev/odl_tb5_0"
 
 # systemd --user over a non-login ssh shell needs this
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -50,12 +50,11 @@ die()  { warn "$*"; exit 1; }
 
 remote() { timeout "${2:-30}" ssh -o BatchMode=yes "$WORKER_HOST" "$1"; }
 
-# A RoCEv2 IPv4 GID like 0000:...:ffff:0a00:0201 is "zero" only if nothing
-# besides colons and zeros remains.
-gid_nonzero() {
-    local g
-    g=$(cat "/sys/class/infiniband/${RDMA_DEV}/ports/1/gids/1" 2>/dev/null || true)
-    [[ -n "$(echo "$g" | tr -d ':0')" ]]
+# OdinLink fabric health: driver loaded + device node present. The odl_tb5
+# module is vermagic-locked, so it needs rebuilding after kernel updates
+# (odinlink/build-odinlink.sh).
+odl_up() {
+    [[ -e "$ODL_DEV" ]] && lsmod | grep -q '^odl_tb5'
 }
 
 # Parse [model] [action]. First arg is a model name if it matches, otherwise
@@ -95,20 +94,20 @@ do_start_glm53() {
     command -v systemctl >/dev/null 2>&1 || die "systemctl not found."
     [[ -f "$UNIT_FILE_VSH" ]] || die "systemd unit not installed at $UNIT_FILE_VSH (run host/deploy.sh)."
     [[ -f "$CONFIG_YAML" ]] || die "~/vsh-config.yaml missing (site config)."
-    [[ -f "$HOME/vsh-cluster-env.rdma.sh" ]] || die "~/vsh-cluster-env.rdma.sh missing on head."
+    [[ -f "$HOME/vsh-cluster-env.odl.sh" ]] || die "~/vsh-cluster-env.odl.sh missing on head."
     [[ -f "$GLM_MODEL_DIR/config.json" ]] || die "Model not found: $GLM_MODEL_DIR"
-    remote "test -f \$HOME/vsh-cluster-env.rdma.sh" >/dev/null 2>&1 \
-        || die "vsh-cluster-env.rdma.sh missing on ${WORKER_HOST} (env files must be byte-identical on both boxes)."
+    remote "test -f \$HOME/vsh-cluster-env.odl.sh" >/dev/null 2>&1 \
+        || die "vsh-cluster-env.odl.sh missing on ${WORKER_HOST} (env files must be byte-identical on both boxes)."
     remote "test -f $GLM_MODEL_DIR/config.json" >/dev/null 2>&1 \
         || die "Model weights not present on ${WORKER_HOST}."
 
-    # Thunderbolt IP link
+    # Thunderbolt IP link (control plane)
     ip -brief addr show thunderbolt0 2>/dev/null | grep -q UP \
         || die "thunderbolt0 is down - check the USB4 cable / peer box."
-    # RDMA rail + RoCEv2 GID (index 1 carries the 10.0.2.x IP)
-    rdma link show "${RDMA_DEV}/1" 2>/dev/null | grep -q "state ACTIVE" \
-        || warn "RDMA rail ${RDMA_DEV} not ACTIVE - bring-up continues on the TCP fallback path."
-    gid_nonzero || warn "RoCE GID index 1 is empty (no IP on the rail) - RDMA all-reduce may not engage."
+    # OdinLink fabric (odl_tb5 driver + device) on both boxes
+    odl_up || warn "OdinLink not up on head ($ODL_DEV) - bring-up continues on the TCP fallback transport."
+    remote "test -e $ODL_DEV && lsmod | grep -q '^odl_tb5'" >/dev/null 2>&1 \
+        || warn "OdinLink not up on ${WORKER_HOST} - bring-up continues on the TCP fallback transport."
 
     # serving containers alive on both boxes
     "$HOME/container-heal.sh" "$GLM_CTR" 2>&1 | sed 's/^/    /'
@@ -141,16 +140,16 @@ do_start_glm53() {
     (( rc == 0 )) || { journalctl --user -u "vsh-glm.service" --no-pager -n 30 2>/dev/null; die "Cluster bring-up failed (unit exit $rc)."; }
 
     if curl -sf "http://127.0.0.1:${GLM_PORT}/v1/models" >/dev/null 2>&1; then
-        local rdma
-        rdma=$(journalctl --user -u "vsh-glm-manual.service" --no-pager -o cat --since "-60min" 2>/dev/null \
-               | grep -aoE "tbv_ar2: rank[0-9] ready \(qpn=[0-9]+ peer_qpn=[0-9]+\)" | head -2 | paste -sd' ' -)
+        local odl
+        odl=$(journalctl --user -u "vsh-glm-manual.service" --no-pager -o cat --since "-60min" 2>/dev/null \
+               | grep -aoE "odl_ar2: rank[0-9] ready" | sort -u | paste -sd' ' -)
         log "==================================================================="
-        log " GLM-5.3-Flash (AWQ W4A16 + MTP) TP=2 is ready!"
+        log " GLM-5.3-Flash (AWQ W4A16) TP=2 is ready!"
         log "   API         : http://127.0.0.1:${GLM_PORT}  (OpenAI-compatible)"
         log "   Model name  : glm-5.3-flash"
         log "   Parallelism : TP=2 over Ray (head here, worker ${WORKER_HOST})"
-        log "   Transport   : TB4 RoCE-RDMA ${RDMA_DEV}"
-        log "   RDMA ranks  : ${rdma:-NOT READY - decode all-reduce NOT on RDMA}"
+        log "   Transport   : OdinLink (odl_tb5) + RCCL net plugin"
+        log "   odl_ar2     : ${odl:-NOT READY - decode all-reduce NOT on the fast path}"
         log "   Logs        : journalctl --user -u vsh-glm-manual -f"
         log " Stop with    : $0 stop"
         log "==================================================================="
@@ -232,19 +231,20 @@ do_stop_ds4() {
 
 # =============================================================================
 do_status() {
-    # link + RDMA rail
+    # link + OdinLink fabric
     if ip -brief addr show thunderbolt0 2>/dev/null | grep -q UP; then
         log "thunderbolt0 UP: $(ip -brief addr show thunderbolt0 | awk '{print $3}')"
     else
         warn "thunderbolt0 DOWN."
     fi
-    if rdma link show "${RDMA_DEV}/1" 2>/dev/null | grep -q "state ACTIVE"; then
-        log "RDMA rail: $RDMA_DEV ACTIVE"
+    if odl_up; then
+        log "OdinLink: driver loaded, $ODL_DEV present"
     else
-        warn "RDMA rail $RDMA_DEV not active."
+        warn "OdinLink not up ($ODL_DEV missing or odl_tb5 not loaded)."
     fi
-    gid_nonzero && log "RoCE GID idx1: $(cat /sys/class/infiniband/${RDMA_DEV}/ports/1/gids/1)" \
-                || warn "RoCE GID idx1 empty (no IP on rail)."
+    remote "test -e $ODL_DEV" >/dev/null 2>&1 \
+        && log "OdinLink worker: $ODL_DEV present" \
+        || warn "OdinLink not up on ${WORKER_HOST}."
 
     # glm53
     local st

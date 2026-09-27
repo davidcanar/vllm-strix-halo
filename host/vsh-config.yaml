@@ -13,12 +13,15 @@ glm53_max_ctx: 131072                # 128K context (native limit is 1M; TTFT is
 glm53_kv_bytes: 8589934592           # 8 GiB pinned GPU KV = 526,083 tokens = 4.01x at 128K
 glm53_max_batched: 4096              # prefill chunk; 512 -> 4096 is +30% prefill (PATCHES.md §8)
 glm53_max_seqs: 256                  # concurrent seqs. Must be <= Mamba cache blocks (~293) or CUDA graph capture refuses to start
-glm53_mtp_tokens: 3                  # MTP draft tokens (0 = speculative decoding off)
+glm53_mtp_tokens: 0                  # MTP draft tokens (0 = speculative decoding off). Was corrupting
+                                     # structured output on the Sep-3 pin; upstream #58454 (kpool
+                                     # corruption with spec decode) may have fixed it — re-enable and
+                                     # validate before relying on it.
 glm53_tool_parsing: 1                # 1 = --enable-auto-tool-choice + glm47 tool/reasoning parsers
 glm53_enforce_eager: 1               # 0 = try torch.compile + CUDA graphs
 glm53_gpu_util: 0.83
 glm53_aiter: 1                       # 1 = aiter ON (required by the sparse MLA indexer)
-glm53_tbv_ar2: 1                     # 1 = tbv_ar2 decode all-reduce fast-path (validated on ROCm 10 — PATCHES.md §5.0)
+glm53_odl_ar2: 1                     # 1 = odl_ar2 decode all-reduce over OdinLink (odl transport only)
 
 # ---------------- DeepSeek-V4-Flash profile --------------------------------
 # Delegates to the deployed ds4-vllm stack (AlexKGwyn/ds4-vllm image + units).
@@ -27,6 +30,6 @@ ds4_api_port: 1234
 
 # ---------------- site ------------------------------------------------------
 head_ip: 10.0.2.1                    # thunderbolt IP of this box (ray head)
-worker_ip: 10.0.2.2                  # thunderbolt IP of box2 (ray worker)
-rdma_hca: usb4_rdma0                 # RoCE device on the Thunderbolt rail
-transport: hybrid                    # rdma | hybrid | tcp — hybrid/tcp measure fastest (PATCHES.md §10)
+worker_ip: 10.0.2.2                  # thunderbolt IP of box2 (ray worker, odl rank 1)
+transport: odl                       # odl | tcp — odl = RCCL over the OdinLink net plugin
+                                     # + odl_ar2 decode all-reduce + odl_mq control plane

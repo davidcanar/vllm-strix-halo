@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Build the vllm-strix-halo serving image (vLLM main + GLM-5.3-Flash on
-# gfx1151, ROCm 10, with the usb4_rdma provider and tbv_ar2 RDMA natives).
+# Build the vllm-strix-halo serving image (vLLM main pin + GLM-5.3-Flash on
+# gfx1151, ROCm 10, with the OdinLink userspace: odl net plugin, odl_ar2
+# decode all-reduce, odl_mq control plane).
 #
 # Usage:
 #   container/build.sh                # build with the default vLLM pin
-#   VLLM_COMMIT=98ed0856 container/build.sh
+#   VLLM_COMMIT=<sha> container/build.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."          # repo root = build context
 
 IMAGE=${VSH_IMAGE:-vllm-strix-halo:local}
-VLLM_COMMIT=${VLLM_COMMIT:-8bf39632b86df21fa9bfbb470ce8305bf67a5838}
+VLLM_COMMIT=${VLLM_COMMIT:-73859fec5865700c5b2021b22890cb3b2005f66e}
 
 log() { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 
@@ -29,12 +30,21 @@ for a in ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"):
 print("OK: glm5next registered:", [a for a in archs if a.startswith("Glm5Next")])
 EOF
 
-# tbv_ar2 native + provider presence (needs /dev/infiniband on the host).
-podman run --rm --device /dev/kfd --device /dev/dri --device /dev/infiniband \
-  "$IMAGE" python - <<'EOF' || { echo "WARN: tbv_ar2 lib missing (serve still works on TCP fallback)"; exit 0; }
-import ctypes, os
-p = "/opt/venv/lib/python3.12/site-packages/libtbv_ar2.so"
-assert os.path.exists(p), p
-print("OK: libtbv_ar2.so present")
+# OdinLink userspace presence (decode all-reduce + RCCL net plugin + stream
+# lib). The host driver (odl_tb5.ko) is built separately by
+# odinlink/build-odinlink.sh; the libs here must match its ABI pin.
+podman run --rm "$IMAGE" python - <<'EOF' || { echo "FAIL: odinlink userspace missing"; exit 1; }
+import os
+paths = [
+    "/opt/venv/lib/python3.12/site-packages/libodl_ar2.so",
+    "/usr/local/lib/odinlink/librccl_net_odl_tb5.so",
+    "/usr/local/lib/odinlink/libodl_tb5.so.0",
+]
+for p in paths:
+    assert os.path.exists(p), p
+import sys
+sys.path.insert(0, "/opt/venv/lib/python3.12/site-packages")
+import odl_ar2, odl_mq   # wrappers importable (device not needed at import)
+print("OK: odinlink userspace present (libodl_ar2, rccl net plugin, libodl_tb5)")
 EOF
 log "image ready: $IMAGE"

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # vsh-cluster-env.sh — canonical env for the vllm-strix-halo TP=2 cluster.
 # Sourced by the ray head, the box2 ray worker, and vllm serve (both boxes keep
-# an identical copy in each box's home). NCCL/RDMA transport knobs plus the
-# gfx1151/RDNA memory settings inherited from the validated DS4 stack.
+# an identical copy in each box's home). General NCCL/memory/ray knobs; the
+# transport-specific pieces (odl plugin vs plain sockets) live in
+# vsh-cluster-env.odl.sh / vsh-cluster-env.tcp.sh.
 #
 # Why these values: see the comments in AlexKGwyn/ds4-vllm's
 # host/ds4-cluster-env.sh (this file is its model-agnostic derivative).
@@ -15,26 +16,17 @@ export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True,garbage_collection_thresh
 # Silence torch's per-step all_gather_into_tensor FutureWarning (journal spam).
 export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}ignore::FutureWarning"
 
-# --- fabric: Thunderbolt IP link + RoCE RDMA on top -------------------------
+# --- fabric: the control plane always rides the Thunderbolt IP link --------
+# (tbnet / thunderbolt0 coexists with the OdinLink driver). The RCCL data
+# transport is chosen by the transport profile: odl (the OdinLink net plugin)
+# or tcp (plain sockets over thunderbolt0).
 export NCCL_SOCKET_IFNAME=thunderbolt0
 export GLOO_SOCKET_IFNAME=thunderbolt0
-export NCCL_IB_HCA=usb4_rdma
-export NCCL_IB_GID_INDEX=1
-export NCCL_IB_DISABLE=0
 # gfx1151 has no GPUDirect: RCCL host-stages the big (prefill) all-reduces.
-# That is expected, not a fault.
+# That is expected, not a fault. (The odl net plugin is host-pointer based
+# for the same reason.)
 export NCCL_NET_GDR_LEVEL=0
-export NCCL_IB_TIMEOUT=23
-# RCCL protocol: left to the RCCL per-size selection. This was pinned to LL,
-# which is right for tiny latency-bound collectives -- but since tbv_ar2 took
-# over everything <=1 MiB (PATCHES.md section 5.0), RCCL only ever sees the
-# big prefill-sized collectives, where the LL scheme of 8 bytes of flag per
-# 8 bytes of payload is exactly wrong. Profiled with LL pinned: 71.5 ms per
-# ~29 MB all-reduce = 0.41 GB/s on a 5 GB/s rail, and 51% of prefill time.
-# Set VSH_NCCL_PROTO=LL to restore the old behaviour.
-[ -n "${VSH_NCCL_PROTO:-}" ] && export NCCL_PROTO=$VSH_NCCL_PROTO
 export NCCL_ALGO=Ring
-export NCCL_IB_RETRY_CNT=7
 export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=2400
 export TORCH_NCCL_ENABLE_MONITORING=0
 export NCCL_TIMEOUT_MS=2400000
@@ -54,11 +46,11 @@ export HIP_VISIBLE_DEVICES=0
 # kernels (the signal handler is a no-op unless the fault is on a Python
 # frame, but it is what we have without a debugger).
 export PYTHONFAULTHANDLER=1
-# DS4 ran aiter-less on gfx1151; flip via glm53_aiter in vsh-config.yaml.
-export VLLM_ROCM_USE_AITER=${VSH_GLM53_AITER:-0}
-# The sparse MLA indexer REQUIRES aiter (sparse_attn_indexer_kpool.forward_hip),
-# but aiter's MoE kernels do not support gfx1151 ("kernel does not support
-# current device") — keep MoE on the triton path even when aiter is on.
+# aiter ON: the glm5next sparse-attention indexer's ROCm path requires it
+# (VLLM_ROCM_USE_AITER). aiter's MoE kernels do not support gfx1151, so MoE
+# stays on the triton path (VLLM_ROCM_USE_AITER_MOE=0). Both are also baked
+# into the image ENV; they are re-exported here to stay tunable.
+export VLLM_ROCM_USE_AITER=${VSH_GLM53_AITER:-1}
 export VLLM_ROCM_USE_AITER_MOE=${VSH_GLM53_AITER_MOE:-0}
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 # Blocking (interrupt-based) GPU waits instead of busy-poll. ROCm 10 supports
@@ -66,16 +58,14 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
 # DS4 ROCm 7.14 stack.
 export HSA_ENABLE_INTERRUPT=${VSH_HSA_INTERRUPT:-1}
 
-# --- TB4-RDMA all-reduce (VSH_TBV_AR2 hook, patched cuda_communicator) ------
-# Default OFF on the ROCm 10 stack: the v2 native crashes silently during the
-# first collective (see PATCHES.md §5). All collectives still run over the
-# usb4_rdma rail via RCCL-over-IB. Flip via glm53_tbv_ar2 in vsh-config.yaml
-# once the native is fixed.
-export VSH_TBV_AR2=${VSH_TBV_AR2:-${VSH_GLM53_TBV_AR2:-0}}
-export VSH_TBV2_PEER_IP=${VSH_TBV2_PEER_IP:-${VSH_HEAD_IP:-10.0.2.1}}
-export VSH_TBV_AR_GPU=${VSH_TBV_AR_GPU:-1}
-# Propagate VSH_* to box2 ray workers (not in ray's default copy prefixes).
-export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=VSH_
+# --- decode all-reduce + control plane over OdinLink -------------------------
+# The odl_ar2 hook (patched cuda_communicator, env DS4_ODL_AR2) and the
+# odl_mq data plane (patched shm_broadcast, fail-open) are activated by the
+# odl transport profile; see vsh-cluster-env.odl.sh.
+#
+# Propagate VSH_* + DS4_* to box2 ray workers (not in ray's default copy
+# prefixes). DS4_ODL_AR2 and ODL2_* must reach the worker (rank 1) too.
+export VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY="VSH_ DS4_ ODL2_"
 
 # --- tuned Triton fused-MoE tile configs (gfx1151) --------------------------
 # Upstream ships no config for AMD_Radeon_8060S, and the int4_w4a16 path does

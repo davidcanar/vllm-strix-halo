@@ -24,7 +24,7 @@ HEAD_IP=${VSH_HEAD_IP:?vsh-config.yaml: head_ip missing}
 WORKER_IP=${VSH_WORKER_IP:?vsh-config.yaml: worker_ip missing}
 PORT=${VSH_GLM53_API_PORT:-1235}
 CTR=${VSH_GLM53_CONTAINER:-vllm-glm}
-TRANSPORT=${VSH_TRANSPORT:-rdma}
+TRANSPORT=${VSH_TRANSPORT:-odl}
 RAYTMP=$HOME/vsh-ray-tmp
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-4}
 CENV=$HOME/vsh-cluster-env.$TRANSPORT.sh
@@ -33,7 +33,8 @@ UNIT=vsh-glm-manual
 # Model dir doubles as the reap-pattern discriminator.
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
 # Exports that must reach the env files on BOTH boxes (sourced at ray start).
-ENVPASS="export VSH_RDMA_HCA=${VSH_RDMA_HCA:-} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0} VSH_GLM53_TBV_AR2=${VSH_GLM53_TBV_AR2:-0};"
+# VSH_ODL_RANK1_IP: the odl_ar2 rendezvous target — rank 1 is the box2 worker.
+ENVPASS="export VSH_ODL_RANK1_IP=${WORKER_IP:?} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-1} VSH_GLM53_ODL_AR2=${VSH_GLM53_ODL_AR2:-1};"
 
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 
@@ -98,7 +99,7 @@ echo "== serve =="
 systemd-run --user --unit="$UNIT" --description="vllm-strix-halo GLM-5.3-Flash TP=2" \
   --working-directory="$HOME" \
   /usr/bin/podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc \
-  "$ENVPASS export VSH_TRANSPORT=$TRANSPORT VSH_GLM53_MODEL_DIR=$MODEL_DIR VSH_GLM53_API_PORT=$PORT VSH_GLM53_MAX_CTX=${VSH_GLM53_MAX_CTX:-32768} VSH_GLM53_KV_BYTES=${VSH_GLM53_KV_BYTES:-4294967296} VSH_GLM53_GPU_UTIL=${VSH_GLM53_GPU_UTIL:-0.83} VSH_GLM53_MAX_BATCHED=${VSH_GLM53_MAX_BATCHED:-512} VSH_GLM53_MAX_SEQS=${VSH_GLM53_MAX_SEQS:-256} VSH_GLM53_MTP_TOKENS=${VSH_GLM53_MTP_TOKENS:-3} VSH_GLM53_AITER=${VSH_GLM53_AITER:-0} VSH_GLM53_TBV_AR2=${VSH_GLM53_TBV_AR2:-0} VSH_GLM53_TOOL_PARSING=${VSH_GLM53_TOOL_PARSING:-1} VSH_GLM53_ENFORCE_EAGER=${VSH_GLM53_ENFORCE_EAGER:-1} VSH_GLM53_PROFILER_DIR=${VSH_GLM53_PROFILER_DIR:-} VSH_GLM53_PROFILER_DELAY=${VSH_GLM53_PROFILER_DELAY:-0} VSH_GLM53_PROFILER_ACTIVE=${VSH_GLM53_PROFILER_ACTIVE:-5}; exec bash $SERVE" >/dev/null 2>&1
+  "$ENVPASS export VSH_TRANSPORT=$TRANSPORT VSH_GLM53_MODEL_DIR=$MODEL_DIR VSH_GLM53_API_PORT=$PORT VSH_GLM53_MAX_CTX=${VSH_GLM53_MAX_CTX:-32768} VSH_GLM53_KV_BYTES=${VSH_GLM53_KV_BYTES:-4294967296} VSH_GLM53_GPU_UTIL=${VSH_GLM53_GPU_UTIL:-0.83} VSH_GLM53_MAX_BATCHED=${VSH_GLM53_MAX_BATCHED:-512} VSH_GLM53_MAX_SEQS=${VSH_GLM53_MAX_SEQS:-256} VSH_GLM53_MTP_TOKENS=${VSH_GLM53_MTP_TOKENS:-0} VSH_GLM53_AITER=${VSH_GLM53_AITER:-1} VSH_GLM53_ODL_AR2=${VSH_GLM53_ODL_AR2:-1} VSH_GLM53_TOOL_PARSING=${VSH_GLM53_TOOL_PARSING:-1} VSH_GLM53_ENFORCE_EAGER=${VSH_GLM53_ENFORCE_EAGER:-1} VSH_GLM53_PROFILER_DIR=${VSH_GLM53_PROFILER_DIR:-} VSH_GLM53_PROFILER_DELAY=${VSH_GLM53_PROFILER_DELAY:-0} VSH_GLM53_PROFILER_ACTIVE=${VSH_GLM53_PROFILER_ACTIVE:-5}; exec bash $SERVE" >/dev/null 2>&1
 
 # Warm bringup answers in a few minutes; a cold kernel-cache bringup (first
 # after a cache wipe) spends ~25 min more in Triton/LLVM compiles.
@@ -123,7 +124,10 @@ echo "== verify =="
 journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
   | grep -aE "GPU KV cache size|Maximum concurrency" | tail -2 | sed 's/^/   /'
 rdma=$(journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
-  | grep -aoE "tbv_ar2: rank[0-9] ready \(qpn=[0-9]+ peer_qpn=[0-9]+\)" | head -1)
-echo "   RDMA: ${rdma:-!! tbv_ar2 NOT ready -- decode all-reduce is not on RDMA}"
+  | grep -aoE "odl_ar2: rank[0-9] ready" | sort -u | paste -sd' ' -)
+mq=$(journalctl --user -u "$UNIT.service" --no-pager -o cat --since "-20min" 2>/dev/null \
+  | grep -aoE "odl_mq: (writer up|reader up)" | sort -u | paste -sd' ' -)
+echo "   OdinLink decode AR: ${rdma:-!! odl_ar2 NOT ready -- decode all-reduce is not on the fast path}"
+echo "   OdinLink ctrl plane: ${mq:-zmq (odl_mq not engaged)}"
 echo "   vllm serve procs: $(ps -eo cmd --no-headers | grep 'bin/[v]llm serve' | grep -cF "$MODEL_DIR") (want 1)"
 echo "   MemAvailable: $(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo)MB"

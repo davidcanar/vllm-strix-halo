@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# TCP-transport env for the vllm-strix-halo cluster: plain TCP over the
-# Thunderbolt IP link (thunderbolt0), no RDMA at all. Originally the de-risk
-# fallback for a bring-up with the RDMA rail down -- but it is NOT slower.
-# Measured (PATCHES.md section 10): RCCL-over-sockets beats RCCL-over-IB at
-# every message size on this rail, and this profile matches or beats the full
-# RDMA one end to end. A fresh rig can skip the tbv kernel-module build.
+# TCP transport (fallback, no OdinLink dependencies): every collective rides
+# RCCL over IP sockets on the thunderbolt0 link. Measured single-stream this
+# is at parity with the RDMA rail for prefill (the odl plugin's win is at
+# concurrency); decode loses the odl_ar2 fast path and falls back to RCCL.
+# Use it to bisect fabric issues or when the odinlink driver is unavailable.
 source "$HOME/vsh-cluster-env.sh"
 export NCCL_IB_DISABLE=1
-export VSH_TBV_AR2=0
+unset NCCL_IB_HCA NCCL_IB_GID_INDEX NCCL_PROTO 2>/dev/null || true
+export NCCL_SOCKET_IFNAME=${VSH_CONTROL_IFACE:-thunderbolt0}
+export GLOO_SOCKET_IFNAME=${VSH_CONTROL_IFACE:-thunderbolt0}
+export DS4_ODL_AR2=0

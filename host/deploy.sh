@@ -15,9 +15,9 @@ install -m 0755 "$R/host/vsh-cluster-down.sh"              "$HOME/vsh-cluster-do
 install -m 0755 "$R/host/vsh-manual-serve.sh"              "$HOME/vsh-manual-serve.sh"
 install -m 0755 "$R/host/container-heal.sh"                "$HOME/container-heal.sh"
 install -m 0755 "$R/host/vsh-cluster-env.sh"               "$HOME/vsh-cluster-env.sh"
-install -m 0755 "$R/host/vsh-cluster-env.rdma.sh"          "$HOME/vsh-cluster-env.rdma.sh"
+install -m 0755 "$R/host/vsh-cluster-env.odl.sh"           "$HOME/vsh-cluster-env.odl.sh"
 install -m 0755 "$R/host/vsh-cluster-env.tcp.sh"           "$HOME/vsh-cluster-env.tcp.sh"
-install -m 0755 "$R/host/vsh-cluster-env.hybrid.sh"        "$HOME/vsh-cluster-env.hybrid.sh"
+rm -f "$HOME/vsh-cluster-env.rdma.sh" "$HOME/vsh-cluster-env.hybrid.sh"
 install -m 0644 "$R/host/vsh-warmup.py"                    "$HOME/vsh-warmup.py"
 
 # Tuned Triton fused-MoE tile configs (gfx1151). vLLM reads
@@ -36,15 +36,15 @@ install -m 0644 "$R/host/systemd/vsh-glm.service"          "$HOME/.config/system
 systemctl --user daemon-reload
 
 echo "== box2: deploy env files + container-heal (byte-identical) =="
-for f in vsh-cluster-env.sh vsh-cluster-env.rdma.sh vsh-cluster-env.tcp.sh vsh-cluster-env.hybrid.sh container-heal.sh; do
+for f in vsh-cluster-env.sh vsh-cluster-env.odl.sh vsh-cluster-env.tcp.sh container-heal.sh; do
     scp -q "$HOME/$f" "$WORKER:$HOME/$f"
 done
-ssh -o BatchMode=yes "$WORKER" "mkdir -p \$HOME/vsh-moe-configs"
+ssh -o BatchMode=yes "$WORKER" "mkdir -p \$HOME/vsh-moe-configs; rm -f \$HOME/vsh-cluster-env.rdma.sh \$HOME/vsh-cluster-env.hybrid.sh"
 scp -q "$HOME"/vsh-moe-configs/*.json "$WORKER:$HOME/vsh-moe-configs/"
 ssh -o BatchMode=yes "$WORKER" 'chmod 0755 ~/container-heal.sh ~/vsh-cluster-env*.sh'
 
 echo "== verify env files + MoE configs are byte-identical across boxes =="
-for f in vsh-cluster-env.sh vsh-cluster-env.rdma.sh vsh-cluster-env.tcp.sh vsh-cluster-env.hybrid.sh \
+for f in vsh-cluster-env.sh vsh-cluster-env.odl.sh vsh-cluster-env.tcp.sh \
          $(cd "$HOME" && ls vsh-moe-configs/*.json); do
     h1=$(md5sum "$HOME/$f" | cut -d" " -f1)
     h2=$(ssh -o BatchMode=yes "$WORKER" "md5sum \$HOME/$f" | cut -d" " -f1)
