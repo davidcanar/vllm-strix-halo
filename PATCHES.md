@@ -762,10 +762,109 @@ Upstream submission is prepared in `upstream/` (`PR-BODY.md` and
 `test_grouped_topk_determinism.py`); the bug is not a duplicate of anything
 open as of 2026-09-05.
 
-## 15. Attribution
+## 15. The 2026-09-27 merge: vLLM pin bump + OdinLink fabric
 
-RDMA natives and the `tbv/` kernel kit come from
+The vLLM pin moved `8bf39632` (2026-09-03) → `73859fec` (2026-09-27), and the
+fabric moved from the tbv/thunderbolt-ibverbs RoCE stack to **OdinLink**
+(`odl_tb5`), tracking [AlexKGwyn/ds4-vllm](https://github.com/AlexKGwyn/ds4-vllm)@`6c0550f`.
+Base image: `rocm10.0.0-torch2.11.0-vllm0.28.0` → `...-vllm0.30.0` (same ROCm 10
+/ torch 2.11 / triton 3.8 toolchain — only the vLLM-inside changed).
+
+### 15.1 Why the pin bump
+
+The 2026-09-05 correctness verdict (README banner) identified defects that are
+upstream's. Between 2026-09-18 and 2026-09-26 upstream landed exactly that
+class of fixes; the pin includes all of them:
+
+| upstream | what it fixes |
+|---|---|
+| #58594 | sparse indexer attn topk **backend selection** — the DSA top-k nondeterminism family (#54521) that broke greedy reproducibility above ~2K prompt tokens on ROCm |
+| #58454 | **kpool corruption with speculative decoding** (touches the AMD `glm5next/amd/ops/kpool_compress.py`) — the suspected cause of MTP corrupting structured output |
+| #58704 | SM90 sparse MLA index_kpool mismatch → corruption via unread query token (NVIDIA path, same family) |
+| #57546 | GLM kpool indexer top-k routed through the shared `SparseIndexerTopk` dispatcher |
+| #57464-era | ROCm: alias `SparseAttnIndexerKpool.forward_cuda` → `forward_native` (GLM-5.3-Flash boot crash) |
+| #58061 | GLM dense MLP layers on the sequence-parallel shard (TP correctness) |
+| #57327, #57701, #57162, #58450 | cooperative top-k for small decode batches; −3 GiB indexer workspace; FlashKDA chunked prefill (1.7–3.8×); metadata-op perf (1.6–4.8×) |
+
+Patch-set consequences:
+
+- **`vsh-mtp-ropefree-triton-sparse.patch` dropped — superseded upstream.**
+  `_use_rocm_sparse_triton` now returns True for every rope-free BF16 batch
+  (multi-token speculative verification rows included); the gfx1151 fallback
+  the patch forced is the default behaviour.
+- **`vsh-rdma-allreduce.patch` replaced** by `vsh-odl-ar2-allreduce.patch`
+  (the OdinLink decode all-reduce hook, `DS4_ODL_AR2=1`) and
+  `vsh-odl-mq-dataplane.patch` (the `odl_mq` control-plane data plane in
+  `shm_broadcast`, fail-open to zmq), both ported verbatim in intent from
+  ds4-vllm's `vllm-upstream.patch` and re-anchored on the new pin. ds4's
+  `communication_op.py` eager-break wrapper is deliberately NOT ported: it
+  exists to keep the custom AR out of CUDA-graph captures, this stack runs
+  `--enforce-eager`, and the wrapper depends on the fork's
+  `breakable_cudagraph` machinery which is not upstream.
+- **Carried unchanged** (apply clean on the new pin):
+  `vsh-moe-router-deterministic-topk` (#55514 is still open upstream),
+  `vsh-aiter-gfx1151-gate`, `vsh-fp8-fnuz-mqa` (+ the `pa_mqa_logits` aiter
+  overlay; vLLM now probes both aiter layouts, so the overlay only affects
+  the old-layout aiter the base ships — harmless either way),
+  `vsh-mhc-no-tilelang-gfx1151` (verify whether the upstream MHC TileLang
+  migration makes this gate unnecessary — kept for now, it is two lines).
+
+### 15.2 What the OdinLink fabric replaces
+
+The tbv stack was a *patched thunderbolt core* + `thunderbolt_ibverbs` RoCE
+driver with the stock `thunderbolt` blacklisted, RCCL speaking IB verbs over
+`usb4_rdma0`, and `DS4_TBV_AR2`/tbv_ar2 all-reduces over ibverbs QPs. OdinLink
+(`odl_tb5.ko`, from Geramy/OdinLink-Five at `4534f585` + the vendored
+`odinlink/odinlink-local.patch`) runs on the **stock kernel**: a
+`tb_protocol_handler` on the unmodified thunderbolt core exposing
+`/dev/odl_tb5_*` with a stream API. In-image userspace (built by the
+Dockerfile's `odinlink-build` stage, same pin + patch as the host driver):
+
+- `libodl_tb5.so.0` — the stream API library
+- `librccl_net_odl_tb5.so` — the RCCL net plugin (`NCCL_NET_PLUGIN`),
+  host-pointer based (no GPUDirect on gfx1151 anyway), one connection =
+  one stream multiplexed over the single TB link. `NCCL_MAX_NCHANNELS=4`
+  to keep the per-message syscall count sane.
+- `libodl_ar2.so` (from `odl_ar2.hip`, gfx1151) + `odl_ar2.py` — the 2-rank
+  decode all-reduce: D2H into a pinned slot → doorbell kernel → CPU progress
+  thread does one `STREAM_SEND` ioctl per round (≤64 KiB latency path) →
+  wait+add kernel spins on the pinned flag and adds the recv slot (zero-copy
+  on UMA). Rendezvous: rank0 → rank1 TCP listener (`ODL2_RANK1_IP`, default
+  the worker IP; tbnet stays up for it).
+- `odl_mq.py` + the `shm_broadcast` hook — MessageQueue remote data plane
+  over odl streams (EngineCore→worker broadcast + response queue), removing
+  the per-step zmq-over-TCP round trips. Ungated by design in ds4, fail-open
+  to zmq on any init failure; the odl transport profile engages it
+  implicitly by shipping the device + lib into the container.
+
+The old `provider-build` stage (rdma-core v57 + the hellas-ai usb4_rdma
+provider + v58 libibverbs) and the tbv natives are gone from the image; the
+host-side `tbv/` kit is replaced by the vendored `odinlink/` driver kit
+(including `uninstall-tbv.sh` for migrating a rig that ran the old stack).
+RCCL's libibverbs dependency is simply unused now (`NCCL_IB_DISABLE=1`).
+
+### 15.3 Transport profiles
+
+`vsh-cluster-env.odl.sh` (default, `transport: odl`) — RCCL over the net
+plugin, `DS4_ODL_AR2=1`, odl_mq data plane, control bootstrap still on
+`thunderbolt0`. `vsh-cluster-env.tcp.sh` — sockets fallback, `DS4_ODL_AR2=0`.
+The old `rdma`/`hybrid` profiles are deleted with the tbv stack they
+configured.
+
+**§10's "sockets beat the RoCE rail" measurement is hereby historic**: it
+compared RCCL-over-ibverbs vs sockets on the tbv stack. The odl net plugin is
+a different transport (no verbs marshalling, stream framing over DMA rings)
+and has not been A/B'd end-to-end on this rig yet — the odl_ar2 decode path
+and odl_mq control plane are the primary wins regardless of which way RCCL's
+prefill collectives go.
+
+## 16. Attribution
+
+OdinLink userspace integration (`odl_ar2`, `odl_mq`, the RCCL net plugin
+build, the vLLM hooks they hang on) and the `odinlink/` driver kit come from
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) (Apache-2.0 for
-the original work; kernel modules GPL-2.0 via hellas-ai/thunderbolt-ibverbs).
-The all-reduce hook is a rebased, renamed derivative of the same project's
-`DS4_TBV_AR2` hook. See THIRD_PARTY_NOTICES.md.
+the original work; the OdinLink-Five driver and kernel module are GPL via
+Geramy/OdinLink-Five). The all-reduce/MessageQueue hooks are re-anchored
+derivatives of that project's patch set. The previous tbv-era attribution
+(rdma-core provider work via hellas-ai/thunderbolt-ibverbs) remains accurate
+for the pre-2026-09-27 history of this repo. See THIRD_PARTY_NOTICES.md.

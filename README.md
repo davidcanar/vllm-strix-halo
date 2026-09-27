@@ -50,32 +50,37 @@
 
 Serve **GLM-5.3-Flash** (and **DeepSeek-V4-Flash**) with vLLM across **two AMD
 Strix Halo (gfx1151) boxes** — one 8060S iGPU per box, tensor-parallel (TP=2),
-with the inter-GPU all-reduce carried over a **Thunderbolt-4/USB4** cable
-between them. The shipped default (`transport: hybrid`) runs RCCL over IP
-sockets on the cable and keeps a custom RDMA fast-path (`tbv_ar2`,
-`usb4_rdma0`) for the small decode collectives; sockets measured faster than
-the RoCE path at every message size, so `transport: tcp` — no kernel modules
-at all — is equally valid ([PATCHES.md §10](PATCHES.md)).
+with the inter-GPU fabric carried over a **Thunderbolt-4/USB4** cable between
+them via the **OdinLink driver** (`odl_tb5`): RCCL rides the OdinLink net
+plugin for the big prefill-sized collectives, the `odl_ar2` native carries the
+small decode all-reduces over odl streams, and `odl_mq` (fail-open) moves the
+EngineCore↔worker control plane off the per-step TCP round trips. The default
+is `transport: odl`; `transport: tcp` (plain sockets, no kernel modules)
+remains the fallback.
 
 GLM-5.3-Flash support is **upstream vLLM** since 2026-09-03
-([#53906](https://github.com/vllm-project/vllm/pull/53906)). This repo rebuilds
-vLLM at a post-merge commit on kyuz0's proven **ROCm 10.0 gfx1151** base image
-(no prebuilt gfx1151 image contains the merge yet), adds the Thunderbolt RDMA
-fabric pieces, and ships the host orchestration that starts/stops/drives the
-2-box cluster. Which patches are carried from the DeepSeek build and why:
-**[PATCHES.md](PATCHES.md)**.
+([#53906](https://github.com/vllm-project/vllm/pull/53906)), and the
+**late-September correctness wave is in**: sparse-indexer topk backend
+selection ([#58594](https://github.com/vllm-project/vllm/pull/58594)), kpool
+corruption with speculative decoding ([#58454](https://github.com/vllm-project/vllm/pull/58454)
+— the AMD path), the SparseIndexerTopk dispatcher (#57546), and more. This
+repo rebuilds vLLM at a pinned **2026-09-27** commit on kyuz0's proven
+**ROCm 10.0 gfx1151** base image, adds the OdinLink fabric userspace, and
+ships the host orchestration that starts/stops/drives the 2-box cluster.
+Which patches are carried and why: **[PATCHES.md](PATCHES.md)**.
 
-This project builds on and reuses the RDMA work of
+This project builds on and reuses the fabric work of
 [`AlexKGwyn/ds4-vllm`](https://github.com/AlexKGwyn/ds4-vllm) — the model work
 is dropped (GLM is upstream), the fabric work is kept.
 
 ## Hardware & prerequisites
 
 - **2× AMD Strix Halo (gfx1151)** boxes, ~128 GB unified memory each.
-- A **Thunderbolt-4/USB4 cable** between them (the RDMA rail rides the cable).
-- Linux with kernel headers for the running kernel, `podman`, `toolbox`,
-  `rdma-core`, `git`, build toolchain; **Secure Boot disabled** (the tbv
-  modules are unsigned).
+- **Exactly one** Thunderbolt-4/USB4 cable between them (OdinLink demultiplexes
+  peers by route; a second cable breaks it).
+- Linux (stock kernel) with kernel headers, `podman`, `toolbox`, `git`, build
+  toolchain; **Secure Boot disabled** (the `odl_tb5` module is unsigned unless
+  a MOK is enrolled — the install path signs it when one exists).
 - The model weights on **both** boxes (see below).
 
 ## Quick start
@@ -86,11 +91,13 @@ git clone https://github.com/davidcanar/vllm-strix-halo ~/vllm-strix-halo
 # 0. weights, on BOTH boxes (~191 GB GLM / ~156 GB DS4, resumable)
 scripts/download-models.sh glm53     # or: ds4, all
 
-# 1. RDMA kernel modules, on BOTH boxes, then reboot both together
-#    OPTIONAL: skip this and set `transport: tcp` in ~/vsh-config.yaml -- it
-#    measures the same single-stream (PATCHES.md §10) and needs no Secure Boot
-#    change, no unsigned modules, no coordinated reboot.
-tbv/build-modules.sh && sudo tbv/install-modules.sh
+# 1. OdinLink driver, on BOTH boxes (stock kernel; one cable between them)
+#    OPTIONAL: skip this and set `transport: tcp` in ~/vsh-config.yaml -- no
+#    kernel modules at all, but you lose the odl_ar2 decode fast path and the
+#    net plugin.
+odinlink/build-odinlink.sh && sudo odinlink/install-odinlink.sh
+#    (migrating from the old tbv stack? sudo odinlink/uninstall-tbv.sh --apply
+#     first, then reboot both boxes together)
 
 # 2. build the serving image (box1), copy to box2 (podman save | podman load),
 #    create the toolbox "vllm-glm" on both boxes
@@ -118,11 +125,11 @@ Full ordered runbook with gates and gotchas: **[AGENTS.md](AGENTS.md)**.
 |---|---|
 | `vllm-strix-halo.sh` | the launcher: `[glm53\|ds4] [start\|stop\|status\|logs]` |
 | `scripts/download-models.sh` | weight downloads for both models, both boxes |
-| `container/` | Dockerfile + build.sh: vLLM ≥ GLM merge on the ROCm 10 gfx1151 base, usb4_rdma provider, tbv_ar2 natives, `vsh-rdma-allreduce.patch` |
-| `tbv/` | Thunderbolt RDMA kernel-module kit (vendored from ds4-vllm, GPL-2.0 side) |
+| `container/` | Dockerfile + build.sh: vLLM main pin on the ROCm 10 gfx1151 base, OdinLink userspace (net plugin + `odl_ar2`), the vLLM patch set |
+| `odinlink/` | OdinLink driver kit (vendored from ds4-vllm, GPL-2.0 side): `odl_tb5.ko` build/install, `odl_ar2` sources, uninstall-tbv migration |
 | `host/` | cluster env/config/restart/down/serve scripts, systemd unit, deploy.sh |
-| `PATCHES.md` | the ds4-vllm → GLM patch review |
-| `PENDINGWORK.md` | **open defects, what was ruled out, and where to resume** |
+| `PATCHES.md` | the patch review: what is carried, from where, and why |
+| `PENDINGWORK.md` | the 2026-09 correctness investigation record |
 | `AGENTS.md` | the ordered end-to-end runbook |
 
 ## Models
