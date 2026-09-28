@@ -1020,6 +1020,54 @@ payoff when landed: +10–19% decode (our §12: the bf16 KDA/MLA reads are ~24%
 of each decode step). Also worth an upstream issue: `is_fp8_fnuz` excluding
 RDNA 3.5 while aiter (the AMD library) only speaks fnuz.
 
+### 15.8 Long-context diagnostics: what actually breaks, and a correction (2026-09-28)
+
+**Correction to §15.5/§14.** The `vsh-indexer-persistent-topk-rocm.patch` never
+engaged: (a) `persistent_topk` is an `#ifndef USE_ROCM` stub that raises
+`persistent_topk is not supported on ROCm` (topk.cu:294) — no HIP build of the
+kernel exists in this image; and (b) the AMD/ROCm GLM model
+(`glm5next/amd/sparse_indexer.py`) bypasses the shared `SparseIndexerTopk`
+dispatcher entirely, so the unlock could not have been selected anyway. The
+observed determinism at short prompts is the **trivial select-all path**: when
+every row's visible pool count ≤ `select_k` (512 pools = 2,048 tokens), no
+selection happens at all. The patch has been dropped from the patch set.
+
+**Diagnostic results** (chunk 8192, `index_topk` 2048, kpool 4, MTP on and off):
+
+- Greedy divergence turns on at **> 2,048 prompt tokens** — i.e. the first row
+  that must actually *select* pools — not at the chunk boundary (diverges at
+  2,932 tokens = 1 chunk; MTP-independent).
+- Tool calling works 3/3 up to ~7K tokens (1 chunk, real selection active) and
+  fails 0/3 from ~9K (2 chunks) — a different threshold from the divergence.
+- **Forced `tool_choice` at 12K produces well-formed calls with the wrong
+  argument** — `{"location": "Harbor District"}` (an entity from the padding)
+  instead of "Paris" (the final line of the prompt). This is a *retrieval*
+  failure: the model cannot attend to the prompt's final tokens once prefill
+  spans multiple chunks. The `index_kpool_always_select_tail` guarantee (the
+  expand-pools-and-append-tail path) is the prime suspect.
+
+**Two fix attempts, both reverted.** A deterministic stable-sort replacement
+((value desc, index asc), the MoE-router convention) for the prefill pool
+top-k — verified engaging via debug probe (`rows=6528 W=1632 k=512
+det=True`, ray worker logs) — did **not** remove the divergence. Extending it
+to the decode-side `top_k_per_row_decode` *regressed* 2.5K-token tool calls
+0/3 (subtle tail-pool semantics in the decode path) and still did not fix
+divergence; both were reverted to the stock kernels and the 2.5K behavior
+re-verified at 3/3.
+
+**Net narrowing of both defects:**
+- *Greedy nondeterminism*: selection kernels are now exonerated as the primary
+  source; with deterministic selections the outputs still vary — the noise is
+  in the kernels' arithmetic itself (the Triton MQA-logits fp8 accumulation,
+  the aiter sparse-MLA attention, or the mHC/KDA reductions). That is upstream
+  kernel-level determinism work, not patchable from Python.
+- *Long-context tool calling*: retrieval of the prompt's final tokens breaks
+  at ≥2 prefill chunks. Next targets: `kpool_ops.expand_pools_and_append_tail`
+  chunk-boundary behavior, the decode `dec_pos`/`dec_slot` tail indexing, and
+  the ROCm sibling of upstream #58704 ("index_kpool mismatch → corruption via
+  unread query token", fixed for SM90 only). Both are open upstream issues
+  worth filing with this rig's reproducers.
+
 ## 16. Attribution
 
 OdinLink userspace integration (`odl_ar2`, `odl_mq`, the RCCL net plugin
