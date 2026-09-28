@@ -1,0 +1,21 @@
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+index 6eb2455..21266b7 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+@@ -403,6 +403,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+         )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # vllm-strix-halo: the TRITON WNA16 MoE weight conversion
++        # (transpose/contiguous per layer) leaves each layer's staging
++        # segments RESERVED-but-free in the caching allocator. On a
++        # unified-memory APU those reserved segments bill against GTT
++        # (= system RAM), so the whole 42-layer conversion accumulates
++        # ~35 GiB of dead reservation and the kernel OOM-killer shoots
++        # the worker mid-load. Returning the previous layer's freed
++        # blocks to the driver bounds reserved to allocated + one
++        # layer's transients. Load-time only; no effect on serving.
++        torch.cuda.empty_cache()
+         # Process weights using the shared oracle infrastructure
+         converted = convert_to_wna16_moe_kernel_format(
+             backend=self.wna16_backend,
