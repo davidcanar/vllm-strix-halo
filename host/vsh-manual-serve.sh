@@ -58,6 +58,20 @@ else
   echo "[vsh-serve] tool-call + reasoning parsers OFF (glm53_tool_parsing: 0)"
 fi
 
+# KV cache dtype knob. fp8 looked like a +50% capacity win (2,048,218 vs
+# 1,369,198 tokens at the same 16 GiB pin, allocation succeeds) — but on this
+# stack the ROCM_AITER_MLA_SPARSE fp8 decode path asserts on the FIRST request
+# (aiter static_per_tensor_quant: torch.float8_e4m3fn not in
+# _torch_to_aiter_dtype), killing the engine right after startup. Half-wired
+# upstream; keep auto (bf16) until the ROCm fp8 sparse path lands.
+# MiaAI's 2xDGX-Spark kit uses fp8 KV on SM12x where the packed fp8_ds_mla
+# kernel exists; gfx1151 has no equivalent today.
+KVD=()
+if [ -n "${VSH_GLM53_KV_DTYPE:-}" ] && [ "${VSH_GLM53_KV_DTYPE}" != "auto" ]; then
+  KVD=(--kv-cache-dtype "$VSH_GLM53_KV_DTYPE")
+  echo "[vsh-serve] KV cache dtype: $VSH_GLM53_KV_DTYPE"
+fi
+
 # --enforce-eager has been on since bring-up (it matched the validated DS4
 # profile). Turning it off enables torch.compile + CUDA graphs, which costs a
 # long first-boot compile and is unproven on this hybrid (KDA + sparse-MLA)
@@ -84,6 +98,7 @@ exec vllm serve "$MODEL_DIR" \
   --skip-mm-profiling \
   --gpu-memory-utilization ${VSH_GLM53_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${VSH_GLM53_KV_BYTES:-4294967296} \
+  "${KVD[@]}" \
   --max-model-len "${VSH_GLM53_MAX_CTX:-32768}" \
   --max-num-batched-tokens ${VSH_GLM53_MAX_BATCHED:-512} \
   --max-num-seqs ${VSH_GLM53_MAX_SEQS:-256} \
