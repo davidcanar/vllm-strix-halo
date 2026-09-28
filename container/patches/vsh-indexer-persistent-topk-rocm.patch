@@ -1,0 +1,35 @@
+diff --git a/vllm/model_executor/layers/indexer_topk.py b/vllm/model_executor/layers/indexer_topk.py
+index c342244..407ad8a 100644
+--- a/vllm/model_executor/layers/indexer_topk.py
++++ b/vllm/model_executor/layers/indexer_topk.py
+@@ -155,6 +155,12 @@ class SparseIndexerTopk(torch.nn.Module):
+             )
+         self._backend = backend
+         self._is_cuda = current_platform.is_cuda()
++        # _vsh_rocm_persistent: the persistent_topk kernel (#55122,
++        # deterministic select) IS compiled and registered in HIP builds
++        # (csrc/libtorch_stable/persistent_topk.cuh) — only this python
++        # dispatch gate kept it CUDA-only, leaving ROCm on the
++        # nondeterministic per_row fallback.
++        self._is_rocm = current_platform.is_rocm()
+         self._has_deep_select = self._is_cuda and (
+             current_platform.is_device_capability_family(100)
+         )
+@@ -177,7 +183,7 @@ class SparseIndexerTopk(torch.nn.Module):
+         if self._backend == "cooperative":
+             failures = self._cooperative_constraints(logits, topk_tokens, num_rows)
+         elif self._backend == "persistent":
+-            if not self._is_cuda:
++            if not (self._is_cuda or self._is_rocm):
+                 failures.append("requires a CUDA platform")
+             if topk_tokens not in (512, 1024, 2048):
+                 failures.append(
+@@ -224,7 +230,7 @@ class SparseIndexerTopk(torch.nn.Module):
+         """
+         if not self._cooperative_constraints(logits, topk_tokens, num_rows):
+             return "cooperative"
+-        if self._is_cuda and topk_tokens in (512, 1024, 2048):
++        if (self._is_cuda or self._is_rocm) and topk_tokens in (512, 1024, 2048):
+             return "persistent"
+         return "per_row"
+ 
