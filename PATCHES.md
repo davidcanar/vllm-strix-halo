@@ -954,6 +954,72 @@ Also this pass: `deploy-new-stack.sh` no longer clobbers the live
 `~/vsh-config.yaml`; `one-launch.sh` on box1 wraps the full
 teardown+fuser-k/kfd+single-launch dance that failed launches need.
 
+### 15.6 The DFlash2 drafter: fully ported, working, at parity (2026-09-28, second session)
+
+The remaining KV blocker from §15.5 is solved. `vsh-dflash-drafter-kv-group.patch`
+(6 anchored edits to `kv_cache_utils.py`, adapted from MiaAI's
+`patch_glm5_drafter_group.py` to this pin's rewritten layout code):
+
+1. `_get_kv_cache_groups_glm5_next` partitions the drafter's exact-type
+   `SlidingWindowSpec` layers out of the MLA-uniformity check and appends them
+   as one extra group (LAST, so existing group ids stay stable): exact-fit
+   blocks when the drafter's page divides the MLA page, else a padded
+   slot-share (`block_size=64, page_size_padded=mla_page`).
+2. `_glm5_next_tensor_layout` recognizes the drafter group (9th tuple element).
+3. The three consumers: bytes-per-block unchanged (the drafter adds no block
+   bytes), the config builder aliases drafter layer i onto MLA tensor i's
+   offset (the same disjoint-block-id mechanism the mamba groups use), and the
+   memory-usage estimator accounts the drafter's block demand.
+
+**Result: the DFlash2 drafter boots and serves.** Outputs are byte-identical
+to MTP on probes ("The capital of France is Paris", same usage; clean
+`get_weather({"location": "Paris"})` tool calls). KV pool cost of the drafter:
+1,105,488 tokens at k=3 (vs 1,183,680 with MTP) and 1,000,204 at k=7.
+
+**But it is parity, not the MiaAI 2.6×**: k=3 gives 10.6 tok/s vs MTP's 10.4
+(acceptance ~50%, mean accepted length 2.50); k=7 *drops* acceptance to ~24%
+(draft-depth collapse); replacing the `hc_contract` aux reconstruction with
+DS4's `.mean(dim=1)` convention halves throughput (5.3 tok/s) — the drafter's
+aux-state conditioning is convention-sensitive, and this checkpoint (trained
+by incoai against some specific GLM aux integration) matches `hc_contract`
+best but not perfectly. The remaining acceptance gap lives in exactly which
+hidden-state transform the drafter was trained against; candidates to try
+next: MiaAI's image's own GLM aux code (not public in their overlay), the
+un-reconstructed mHC stream, or layer-index off-by-one variants.
+
+Shipped state: `glm53_spec_method: glm5_next_mtp` (validated default) with
+`dflash` one knob away (`glm53_spec_method: dflash`, `glm53_mtp_tokens` = k).
+Both drafter paths exercise the same eagle3/KV machinery, so flipping between
+them is a restart-only change.
+
+### 15.7 Dense/KDA FP8 on gfx1151: a platform gap, precisely mapped (parked)
+
+The MiaAI trick does not transfer today — every fp8 GEMM route on gfx1151 is
+broken at a different layer, in order of discovery:
+
+1. `is_fp8_fnuz()` (platforms/rocm.py) is `\"gfx94\" in arch` — MI300-only.
+   gfx1151 therefore gets `fp8_dtype() = float8_e4m3fn` (the NVIDIA dtype),
+   which **aiter's pybind dtype map rejects outright** (this build's map has
+   no fp8 entries at all).
+2. hipBLASLt (via aiter `hipb_mm`/`hipbsolgemm`, which JIT-compiles fine on
+   gfx1151) has **zero fp8 GEMM algo solutions** on RDNA 3.5 — rowwise and
+   tensorwise both (`hipblasLtMatmulAlgoGetHeuristic` returns 0).
+3. vLLM's `ROCmFP8ScaledMMLinearKernel` gates on CDNA3+/RDNA4 honestly.
+4. The **aiter Triton `gemm_a8w8_blockscale` RUNS** with fnuz tensors (no
+   pybind wall) — the one viable route — but its scale semantics need
+   reconciliation (a quick fnuz emulation gave rel≈658) and per-shape tuning
+   for the KDA/MLA projection shapes (13 GB/s untuned at M=4 — the old rig's
+   tuned A8W8-blockscale configs cover different (N,K)).
+
+The online-quantization framework itself (`OnlineQuantizationConfig`,
+`--quantization fp8_per_block`, meta-device load + quantize-during-load) is
+fully wired at this pin and is the right attachment point once a GEMM exists:
+pass it as the per-layer `quant_config` for the KDA/MLA projections instead of
+the `quant_config = None` nulling in `kda.py:191` / `model.py`. Expected
+payoff when landed: +10–19% decode (our §12: the bf16 KDA/MLA reads are ~24%
+of each decode step). Also worth an upstream issue: `is_fp8_fnuz` excluding
+RDNA 3.5 while aiter (the AMD library) only speaks fnuz.
+
 ## 16. Attribution
 
 OdinLink userspace integration (`odl_ar2`, `odl_mq`, the RCCL net plugin

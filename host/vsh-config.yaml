@@ -20,7 +20,7 @@ glm53_kv_dtype: auto                  # bf16. fp8 KV ALLOCATES fine (2.05M token
 glm53_max_batched: 4096              # prefill chunk; 512 -> 4096 is +30% prefill (PATCHES.md §8)
 glm53_max_seqs: 32                   # single-user profile (2026-09-28): 32 is plenty, frees Mamba blocks
 glm53_mtp_tokens: 3                  # MTP k=3 (validated 2026-09-27: ~1.9x decode, clean tool calls)
-glm53_spec_method: glm5_next_mtp      # dflash is 80% ported (PATCHES.md 15.5); MTP is the default
+glm53_spec_method: glm5_next_mtp      # dflash fully ported + working (PATCHES 15.6) but parity; MTP default
 glm53_draft_model: /home/davidcanar/models/GLM-5.3-Flash-DFlash2
                                      # structured output on the Sep-3 pin; upstream #58454 (kpool
                                      # corruption with spec decode) may have fixed it — re-enable and

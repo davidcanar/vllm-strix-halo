@@ -154,14 +154,14 @@ COPY container/patches/vsh-odl-ar2-allreduce.patch \
      container/patches/vsh-fp8-fnuz-mqa.patch \
      container/patches/vsh-moe-router-deterministic-topk.patch \
      container/patches/vsh-wna16-layerwise-empty-cache.patch \
-     container/patches/vsh-indexer-persistent-topk-rocm.patch \n     container/patches/vsh-glm-eagle3-aux-states.patch /tmp/
+     container/patches/vsh-indexer-persistent-topk-rocm.patch \n     container/patches/vsh-glm-eagle3-aux-states.patch \n     container/patches/vsh-dflash-drafter-kv-group.patch /tmp/
 RUN cd /opt/venv/lib/python3.12/site-packages && \
     git apply -p1 --whitespace=nowarn \
       /tmp/vsh-odl-ar2-allreduce.patch /tmp/vsh-odl-mq-dataplane.patch \
       /tmp/vsh-mhc-no-tilelang-gfx1151.patch /tmp/vsh-aiter-gfx1151-gate.patch \
       /tmp/vsh-fp8-fnuz-mqa.patch /tmp/vsh-moe-router-deterministic-topk.patch \
       /tmp/vsh-wna16-layerwise-empty-cache.patch \
-      /tmp/vsh-indexer-persistent-topk-rocm.patch \n      /tmp/vsh-glm-eagle3-aux-states.patch && \
+      /tmp/vsh-indexer-persistent-topk-rocm.patch \n      /tmp/vsh-glm-eagle3-aux-states.patch \n      /tmp/vsh-dflash-drafter-kv-group.patch && \
     rm -f /tmp/vsh-*.patch
 
 # Drop stale bytecode for the touched package so the first import recompiles
