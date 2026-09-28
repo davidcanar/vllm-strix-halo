@@ -906,6 +906,54 @@ actually ran (`podman run python -` without `-i` reads EOF; the import also
 needs `--device /dev/kfd --device /dev/dri` for the ROCm platform probe) —
 both fixed.
 
+### 15.5 The 2026-09-28 efficiency pass (MiaAI 2xDGX-Spark ideas, applied to this rig)
+
+Four items from [MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks):
+
+1. **Single-user serving profile — APPLIED.** `glm53_max_batched: 8192` (was 4096),
+   `glm53_max_seqs: 32` (was 256; also frees Mamba cache blocks and would permit
+   CUDA-graph capture). Measured: prefill is at parity (~270-290 tok/s @8K) —
+   this GPU is compute-bound at prefill, the chunk size was not the limiter.
+2. **CUDA graphs — TESTED, PARKED with evidence.** The old rank-1 Triton
+   capture bug is GONE on this pin: both ranks capture 7/7 decode graphs +
+   the MTP speculator (61 s, 13.6 GiB/rank) with `glm53_enforce_eager: 0`.
+   But the first real request wedges the worker (EngineCore dies on the
+   shm-broadcast dequeue timeout; no worker-side traceback) — full-graph
+   replay is incompatible with the drafter's between-draft-steps attention
+   metadata rebuild on this hybrid backend. And the trade loses anyway:
+   graphs-without-MTP (~+10%) < MTP-without-graphs (+90%). Revisit only if
+   piecewise capture composes with the speculator upstream.
+3. **DFlash2 drafter — 80% PORTED, blocked at KV-group aliasing.** The
+   upstream `method: dflash` + `incoai/GLM-5.3-Flash-DFlash2` (5-layer
+   Qwen3-based drafter, declares target aux layers [5,14,24,33,42]) now
+   reaches: EAGLE3-interface port (`vsh-glm-eagle3-aux-states.patch`:
+   `EagleModelMixin` on `Glm5NextModel` with mHC-aware aux stashing via
+   `hc_post`+`hc_contract`, `SupportsEagle3` on both wrapper classes),
+   drafter loads, aux layers engage (`Using Eagle3 auxiliary layers from
+   config: (6,15,25,34,43)`). BLOCKER: the drafter's SlidingWindow KV
+   layers cannot join GLM's MLA/Mamba/kpool pool —
+   `NotImplementedError: ... page size is not divisible ... cannot be
+   padded` in `unify_kv_cache_spec_page_size`. MiaAI solves this with an
+   872-line `patch_glm5_drafter_group.py` (partition the drafter specs into
+   their own group + alias them onto MLA tensors at disjoint block ids in
+   `_glm5_next_tensor_layout`); our pin's layout code has diverged, so that
+   patch does not apply as-is. The aux-states patch is inert on the MTP
+   path (aux layers are only set by dflash/dspark/eagle3 speculators), so
+   it ships enabled. Knob: `glm53_spec_method: dflash|glm5_next_mtp`.
+4. **Dense/KDA FP8 — SCOPED, NOT STARTED.** MiaAI's patch is 5 lines of
+   "stop nulling quant_config for KDA/MLA constructors" — because their EXL3
+   method then quantizes those projections (Marlin, CUDA-only). Our AWQ
+   checkpoint carries those projections in BF16, so the equivalent needs a
+   small model patch (keep quant config / attach an fp8 method at those
+   linears) and ROCm fp8 GEMM plumbing for them. Expected payoff mirrors
+   theirs (+10-19% decode) since our own §12 measured the bf16 attention+
+   KDA reads at ~24% of every decode step. This is the next concrete
+   efficiency project.
+
+Also this pass: `deploy-new-stack.sh` no longer clobbers the live
+`~/vsh-config.yaml`; `one-launch.sh` on box1 wraps the full
+teardown+fuser-k/kfd+single-launch dance that failed launches need.
+
 ## 16. Attribution
 
 OdinLink userspace integration (`odl_ar2`, `odl_mq`, the RCCL net plugin

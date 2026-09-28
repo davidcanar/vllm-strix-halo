@@ -26,14 +26,22 @@ echo "[vsh-serve] HOME=$HOME VLLM_ROCM_USE_AITER=$VLLM_ROCM_USE_AITER VLLM_ROCM_
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
 PORT=${VSH_GLM53_API_PORT:-1235}
 
-# MTP speculative decoding (glm5_next_mtp = GLM-5.3's own NextN drafter,
-# weights embedded in the checkpoint — no separate draft download).
+# Speculative decoding. glm53_spec_method: glm5_next_mtp (default; the
+# checkpoint's own NextN drafter) | dflash (the incoai/GLM-5.3-Flash-DFlash2
+# external drafter, 7-token drafts — the MiaAI 2xDGX-Spark kit's winner,
+# ~2.6x over MTP on structured text on their rig; upstream vLLM method).
 SPEC=()
-if [ "${VSH_GLM53_MTP_TOKENS:-0}" -gt 0 ]; then
+if [ "${VSH_GLM53_SPEC_METHOD:-glm5_next_mtp}" = "dflash" ]; then
+  DRAFT=${VSH_GLM53_DRAFT_MODEL:-/home/davidcanar/models/GLM-5.3-Flash-DFlash2}
+  KTOK=${VSH_GLM53_MTP_TOKENS:-7}
+  [ "$KTOK" -gt 0 ] || KTOK=7
+  SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$KTOK}")
+  echo "[vsh-serve] DFlash2 speculative decoding ON (k=$KTOK, draft=$DRAFT)"
+elif [ "${VSH_GLM53_MTP_TOKENS:-0}" -gt 0 ]; then
   SPEC=(--speculative-config "{\"method\":\"glm5_next_mtp\",\"num_speculative_tokens\":${VSH_GLM53_MTP_TOKENS}}")
   echo "[vsh-serve] MTP speculative decoding ON (${VSH_GLM53_MTP_TOKENS} draft tokens)"
 else
-  echo "[vsh-serve] MTP speculative decoding OFF (glm53_mtp_tokens: 0)"
+  echo "[vsh-serve] speculative decoding OFF"
 fi
 
 PROF=()

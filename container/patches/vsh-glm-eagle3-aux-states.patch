@@ -1,0 +1,92 @@
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index 1c826f5..c87531d 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -34,6 +34,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateDtypeCalculator,
+     MambaStateShapeCalculator,
+ )
++from vllm.model_executor.models.interfaces import (  # _vsh_eagle3
++    EagleModelMixin,
++    SupportsEagle3,
++)
+ from vllm.model_executor.layers.mhc import (
+     MHCFusedPostPreOp,
+     MHCPostOp,
+@@ -620,7 +624,7 @@ class Glm5NextDecoderLayer(nn.Module):
+         )
+ 
+ 
+-class Glm5NextModel(nn.Module):
++class Glm5NextModel(nn.Module, EagleModelMixin):  # _vsh_eagle3
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -727,10 +731,26 @@ class Glm5NextModel(nn.Module):
+         if self.is_sequence_parallel:
+             hidden_states = sp_shard(hidden_states)
+ 
+-        for layer in self._active_layers:
++        # _vsh_eagle3: aux hidden states for dflash/dspark/eagle3 drafters.
++        # Post-layer (1-based) convention, matching DeepseekV4Model.
++        aux_hidden_states: list[torch.Tensor] = []
++        for idx, layer in enumerate(self._active_layers, start=self.start_layer):
+             hidden_states, residual, post, comb = layer(
+                 positions, hidden_states, residual, post, comb
+             )
++            if (idx + 1) in self.aux_hidden_state_layers:
++                # mHC layers defer reconstruction: reconstruct a clean
++                # [T, hidden] stream for the drafter (hc_post + contract),
++                # without consuming the deferred state the next layer fuses.
++                # Non-mHC layers already return the residual-summed stream.
++                if getattr(layer, "mhc", False) and not getattr(
++                    layer, "is_mtp_layer", False
++                ):
++                    aux_recon = layer.hc_post(hidden_states, residual, post, comb)
++                    aux_recon = hc_contract(aux_recon, layer.n)
++                    aux_hidden_states.append(aux_recon)
++                else:
++                    aux_hidden_states.append(hidden_states)
+ 
+         if not get_pp_group().is_last_rank:
+             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
+@@ -746,8 +766,14 @@ class Glm5NextModel(nn.Module):
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+ 
+         hidden_states = self.norm(hidden_states)
++        if aux_hidden_states:  # _vsh_eagle3
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
++    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:  # _vsh_eagle3
++        n = self.config.num_hidden_layers
++        return (n // 9, n // 3, (2 * n) // 3, n - 1)
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+@@ -932,8 +958,8 @@ class Glm5NextModel(nn.Module):
+ 
+ 
+ class Glm5NextForCausalLM(
+-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+-):
++    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
++):  # _vsh_eagle3
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.model_config = vllm_config.model_config
+@@ -1028,8 +1054,11 @@ class Glm5NextForCausalLM(
+     dummy_inputs=Glm4vDummyInputsBuilder,
+ )
+ class Glm5NextForConditionalGeneration(
+-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
+-):
++    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts,
++    SupportsEagle3,
++):  # _vsh_eagle3_cond: the drafter consumes the inner text model's aux
++    # hidden states; set_aux_hidden_state_layers walks get_language_model()
++    # -> .model (Glm5NextModel, an EagleModelMixin) via the protocol default.
+     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
+     # multimodal wrapper must declare the same interfaces so vLLM treats it as
+     # hybrid (auto-aligns mamba/attention block sizes, sizes the mamba state
