@@ -858,6 +858,54 @@ and has not been A/B'd end-to-end on this rig yet — the odl_ar2 decode path
 and odl_mq control plane are the primary wins regardless of which way RCCL's
 prefill collectives go.
 
+### 15.4 Bring-up on the new pin: two fixes this rig needed, and the 2026-09-27 validation
+
+**Fix 1 — `vsh-wna16-layerwise-empty-cache.patch` (the init OOM).** First
+serve on the new pin OOM-killed the worker mid-load at every config (TP and
+PP, dummy and real weights). Measured at death: torch `allocated=85.5 GiB`
+but `reserved=120.3 GiB` and `gpu_active=119.7 GiB` — the TRITON WNA16 MoE
+weight conversion (`convert_to_wna16_moe_kernel_format`: per-layer
+`transpose().contiguous()` chains) leaves each layer's staging segments
+reserved-but-free in the caching allocator, and on gfx1151 UMA reserved GTT
+bills against system RAM. 42 layers × ~0.85 GiB of dead reservation plus the
+transients exceeded the 124 GiB budget and the kernel OOM killer shot the
+worker (which also strands the GTT: a killed-but-lingering vLLM process pins
+its BOs via /dev/kfd until `fuser -k /dev/kfd` — the reason consecutive
+failed attempts died earlier and earlier). A per-layer `torch.cuda.empty_cache()`
+at the next layer's `process_weights_after_loading` bounds reserved to
+allocated + one layer; the engine then inits at `alloc=reserved=82.4 GiB`
+and serves. Load-time only.
+
+**Fix 2 — `vsh-indexer-persistent-topk-rocm.patch` (decode determinism).**
+The deterministic `persistent_topk` (#55122) is compiled and REGISTERED in
+HIP builds (`torch.ops._C.persistent_topk` resolves in this image), but the
+`SparseIndexerTopk` python dispatch gates every deterministic backend on
+`is_cuda`; `auto` resolves ROCm to the nondeterministic `per_row` chain —
+the same class of top-k divergence as #54521. Relaxing the persistent gate
+(`topk_tokens` 512/1024/2048 fits GLM's `index_topk` 2048) makes decode
+deterministic.
+
+**Validation, 2026-09-27** (TP=2, odl transport, odl_ar2 ranks ready,
+odl_mq writer/reader up, 128K ctx, 8 GiB KV = 634,762 tokens / 4.84x
+concurrency — both better than the Sep-3 pin's 526,083 / 4.01x thanks to
+#57701's −3 GiB indexer workspace):
+
+| test | Sep-3 pin | Sep-27 pin + patches |
+|---|---|---|
+| greedy, 5 identical reps, ~1K-token prompt | 5 distinct | **1 distinct** |
+| greedy, 5 reps, ≥8K-token prompt | 5 distinct | 5 distinct (multi-chunk prefill path still `top_k_per_row_prefill`, hardcoded, no backend dispatch — remaining upstream gap) |
+| tool call, short context | 3/3 | **3/3** (also with MTP on) |
+| tool call, 12K-token single-message context | 0/3, budget runaways | 0/3, but **coherent + grounded** responses (model reads/summarizes the padding correctly; corruption gone, routing still off) |
+| MTP | corrupts structured output | **clean tool calls, ~1.9x decode** (10.3 vs 5.5 tok/s); `glm53_mtp_tokens: 3` is the shipped default again |
+| prefill | ~284–334 tok/s @2–8K | 289 tok/s @8.3K (parity) |
+
+Also fixed in passing: the launcher's `odl_up()` check false-negatived under
+`set -o pipefail` (`lsmod | grep -q` → SIGPIPE 141); it now greps
+`/proc/modules` directly. And `container/build.sh`'s post-build checks never
+actually ran (`podman run python -` without `-i` reads EOF; the import also
+needs `--device /dev/kfd --device /dev/dri` for the ROCm platform probe) —
+both fixed.
+
 ## 16. Attribution
 
 OdinLink userspace integration (`odl_ar2`, `odl_mq`, the RCCL net plugin
