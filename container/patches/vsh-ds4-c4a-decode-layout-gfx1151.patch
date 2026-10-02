@@ -1,0 +1,2 @@
+# applied inline to vllm/v1/attention/ops/rocm_aiter_mla_sparse.py (gfx1151 added to the C4A block-flat decode gate)
+# regenerate with git diff if needed

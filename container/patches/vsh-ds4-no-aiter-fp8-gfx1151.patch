@@ -1,0 +1,24 @@
+--- a/vllm/model_executor/kernels/linear/scaled_mm/aiter.py	2026-09-29 14:06:21.644540318 -0600
++++ b/vllm/model_executor/kernels/linear/scaled_mm/aiter.py	2026-09-29 14:06:21.644698913 -0600
+@@ -412,6 +412,21 @@
+ 
+     @classmethod
+     def is_supported(cls, compute_capability=None):
++        # vllm-strix-halo (ds4): gfx1151 has no fp8 matrix path and this
++        # aiter build's blockscale GEMM dies at Triton compile time
++        # ("Unsupported rhs dtype fp8e4nv"). The stock
++        # TritonFp8BlockScaledMMKernel upcasts fp8 operands in-kernel and
++        # runs correctly on gfx1151 (validated relerr ~3e-3), so refuse the
++        # aiter fp8 kernel here and let kernel selection fall through to it.
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1151
++
++            if on_gfx1151():
++                return (
++                    False,
++                    "gfx1151: aiter fp8 blockscale GEMM unsupported; "
++                    "fall through to the Triton kernel.",
++                )
+         if (
+             rocm_aiter_ops.is_linear_enabled()
+             or rocm_aiter_ops.is_rdna_linear_enabled()

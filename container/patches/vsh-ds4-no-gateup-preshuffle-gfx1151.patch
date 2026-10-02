@@ -1,0 +1,18 @@
+--- a/vllm/models/deepseek_v4/amd/model.py	2026-09-29 14:43:02.077643462 -0600
++++ b/vllm/models/deepseek_v4/amd/model.py	2026-09-29 14:43:02.077811627 -0600
+@@ -127,6 +127,15 @@
+ 
+         # gate_up_proj B-preshuffle (ColumnParallel -> no all-reduce); set at load.
+         self._gateup = rocm_aiter_ops.is_enabled()
++        # vllm-strix-halo (ds4): the B-preshuffle gate_up path is aiter-linear
++        # only (fp8 group-quant + bpreshuffle GEMM); gfx1151 runs the stock
++        # Triton fp8 kernel, which needs the plain weight layout. Keep the
++        # standard linear path when the aiter linear path is off.
++        if self._gateup and current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1151
++
++            if on_gfx1151() or not rocm_aiter_ops.is_linear_enabled():
++                self._gateup = False
+         # Block scale for the preshuffled gate_up weight; None = not preshuffled.
+         self._gateup_scale: torch.Tensor | None = None
+ 

@@ -1,0 +1,117 @@
+--- a/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_indexer_q.py
+@@ -15,6 +15,54 @@
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.import_utils import has_cutedsl
++
++# --- DS4 indexer QAT (vllm-strix-halo port) -----------------------------------
++# The reference DeepSeek-V4 indexer graph (official inference model.py
++# Compressor(rotate=True) + ds4.c dsv4_indexer_qat_row) rotates the
++# compressed indexer K/Q with a normalized Hadamard matrix and simulates the
++# FP4 QAT grid BEFORE the fp8 quantization, so quantization happens in the
++# trained basis. vLLM omits this (self.rotate was dead code). Gated by
++# DS4_IDX_OFFICIAL; the Q side (fused_indexer_q.py) and K side must be
++# enabled TOGETHER for the dot product to be computed in the rotated basis.
++import os as _ds4_os
++
++_DS4_IDX_OFFICIAL = _ds4_os.environ.get("DS4_IDX_OFFICIAL", "0") == "1"
++_DS4_QAT_DBG = False
++
++_QAT_H_CACHE = {}
++
++
++def _qat_hadamard(D, device):
++    key = (D, str(device))
++    h = _QAT_H_CACHE.get(key)
++    if h is None:
++        m = torch.ones(1, 1, dtype=torch.float32)
++        base = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float32)
++        n = 1
++        while n < D:
++            m = torch.kron(base, m)
++            n *= 2
++        h = (m * (D ** -0.5)).to(device).contiguous()
++        _QAT_H_CACHE[key] = h
++    return h
++
++
++@triton.jit
++def _apply_hadamard128(x, H_ptr, D: tl.constexpr):
++    r = tl.arange(0, D)
++    Hm = tl.load(H_ptr + r[:, None] * D + r[None, :])  # [D,D] row-major H[j,i]
++    rot = tl.sum(Hm * x[None, :], axis=1)
++    _B: tl.constexpr = 32
++    r2 = tl.reshape(rot, (D // _B, _B))
++    amax = tl.max(tl.abs(r2), axis=1)
++    amax = tl.maximum(amax, 7.0529664e-38)
++    s = tl.exp2(tl.ceil(tl.log2(amax * (1.0 / 6.0))))
++    y = r2 / s[:, None]
++    y = tl.minimum(tl.maximum(y, -6.0), 6.0)
++    a = tl.abs(y)
++    sg = tl.where(y < 0.0, -1.0, 1.0)
++    qv = tl.where(a < 0.25, 0.0, tl.where(a < 0.75, 0.5, tl.where(a < 1.25, 1.0, tl.where(a < 1.75, 1.5, tl.where(a < 2.5, 2.0, tl.where(a < 3.5, 3.0, tl.where(a < 5.0, 4.0, 6.0)))))))
++    return tl.reshape(qv * sg * s[:, None], (D,))
+ 
+ # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
+ MXFP4_BLOCK_SIZE = 32
+@@ -115,6 +163,9 @@
+         FP8_MAX: tl.constexpr = 448.0,
+         USE_FNUZ: tl.constexpr = False,
+         USE_EXPLICIT_FMA: tl.constexpr = False,
++        # DS4 indexer QAT rotation matrix (only read when APPLY_QAT)
++        qat_h_ptr=None,
++        APPLY_QAT: tl.constexpr = False,
+     ):
+         # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
+         # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
+@@ -136,6 +187,40 @@
+         )
+         half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+         base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
++        if APPLY_QAT:
++            # DS4 indexer QAT: rope the FULL head, then Hadamard-rotate,
++            # then fp8-quantize in the rotated basis (official reference;
++            # must pair with the K-side rotation in
++            # fused_compress_quant_cache.py).
++            INDEX_Q_NOPE_PAIRS: tl.constexpr = INDEX_Q_NOPE_DIM // 2
++            full = tl.load(base_ptr + tl.arange(0, INDEX_Q_HEAD_DIM)).to(tl.float32)
++            pairs = tl.reshape(full, (INDEX_Q_HEAD_DIM // 2, 2))
++            q_even, q_odd = tl.split(pairs)
++            pidx = tl.arange(0, INDEX_Q_HEAD_DIM // 2)
++            rlocal = pidx - INDEX_Q_NOPE_PAIRS
++            is_rope = rlocal >= 0
++            csidx = tl.maximum(rlocal, 0)
++            cbase = index_q_cos_sin_ptr + pos * index_q_cos_sin_stride
++            cosv = tl.load(cbase + csidx, mask=is_rope, other=1.0).to(tl.float32)
++            sinv = tl.load(cbase + INDEX_Q_HALF_ROT_DIM + csidx, mask=is_rope, other=0.0).to(tl.float32)
++            ne = q_even * cosv - q_odd * sinv
++            no = q_odd * cosv + q_even * sinv
++            ne = ne.to(tl.bfloat16).to(tl.float32)
++            no = no.to(tl.bfloat16).to(tl.float32)
++            roped = tl.interleave(ne, no)
++            rotated = _apply_hadamard128(roped, qat_h_ptr, INDEX_Q_HEAD_DIM)
++            q_amax = tl.max(tl.abs(rotated))
++            q_scale = tl.div_rn(tl.maximum(q_amax, 1e-4), 448.0)
++            q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(q_scale)))
++            fp8b = (
++                index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
++            )
++            tl.store(fp8b + tl.arange(0, INDEX_Q_HEAD_DIM),
++                     tl.div_rn(rotated, q_scale).to(tl.float8e4nv))
++            w = tl.load(index_weights_ptr + tok_idx * index_weights_stride + head_idx).to(tl.float32)
++            w = w * q_scale * index_weights_softmax_scale * index_weights_head_scale
++            tl.store(index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx, w)
++            return
+ 
+         # Interleaved (GPT-J) RoPE on dims [NOPE_DIM, HEAD_DIM):
+         #   even = q[NOPE_DIM + 2*i],  odd = q[NOPE_DIM + 2*i + 1]
+@@ -305,6 +390,8 @@
+             FP8_MAX=fp8_max,
+             USE_FNUZ=use_fnuz,
+             USE_EXPLICIT_FMA=current_platform.is_rocm(),
++            qat_h_ptr=_qat_hadamard(index_q.shape[2], getattr(index_q, "device", None) or torch.device("cuda")),
++            APPLY_QAT=_DS4_IDX_OFFICIAL,
+             num_warps=1,
+         )
+ 

@@ -11,7 +11,7 @@
 #
 #   Models (both first-class):
 #     glm53  GLM-5.3-Flash (AWQ W4A16, MTP)  — image vllm-strix-halo:local,
-#            container "vllm-glm", API :1235, systemd unit vsh-glm
+#            container "vllm-glm", API :1234, systemd unit vsh-glm
 #     ds4    DeepSeek-V4-Flash (DSpark MTP)  — delegates to the deployed
 #            AlexKGwyn/ds4-vllm stack (image ds4-vllm-patched:local,
 #            container "vllm", API :1234, systemd unit ds4-vllm)
@@ -202,6 +202,33 @@ do_stop_glm53() {
 
 # ---- ds4 delegation: the existing AlexKGwyn/ds4-vllm stack -----------------
 do_start_ds4() {
+    if [ "${VSH_DS4_ENGINE:-native}" = "delegate" ]; then
+        ds4_start_delegate
+        return
+    fi
+    local ds4dir="${VSH_DS4_MODEL_DIR:-/home/davidcanar/models/DeepSeek-V4-Flash-Vision-Exp}"
+    [[ -f "$HOME/.config/systemd/user/vsh-ds4.service" ]] \
+        || die "vsh-ds4 systemd unit not installed. Deploy the vllm-strix-halo kit's vsh-ds4.service first."
+    [[ -f "$ds4dir/config.json" ]] || die "Model not found: $ds4dir"
+    remote "test -f $ds4dir/config.json" >/dev/null 2>&1 \
+        || die "Model weights not present on ${WORKER_HOST}."
+    log "Starting DeepSeek-V4-Flash on the vllm-strix-halo image (unit vsh-ds4)..."
+    systemctl --user restart vsh-ds4.service &
+    local sc=$!
+    local t0=$SECONDS
+    while (( SECONDS - t0 < LOAD_TIMEOUT )); do
+        kill -0 "$sc" 2>/dev/null || break
+        curl -sf -m 5 "http://127.0.0.1:${DS4_PORT}/v1/models" >/dev/null 2>&1 && break
+        sleep 10
+    done
+    wait "$sc"; local rc=$?
+    (( rc == 0 )) || { journalctl --user -u vsh-ds4.service --no-pager -n 40 2>/dev/null; die "ds4 bring-up failed (unit exit $rc)."; }
+    curl -sf -m 5 "http://127.0.0.1:${DS4_PORT}/v1/models" >/dev/null 2>&1 \
+        && log "DeepSeek-V4-Flash ready on http://127.0.0.1:${DS4_PORT} (unit vsh-ds4, engine native)." \
+        || die "ds4 unit reports success but the API is not answering on :${DS4_PORT}."
+}
+
+ds4_start_delegate() {
     [[ -f "$HOME/.config/systemd/user/${DS4_UNIT}.service" ]] \
         || die "ds4-vllm systemd unit not installed (${DS4_UNIT}). Clone AlexKGwyn/ds4-vllm and deploy its host kit first."
     log "Starting DeepSeek-V4-Flash cluster via the ds4-vllm stack (unit $DS4_UNIT)..."
@@ -221,8 +248,13 @@ do_start_ds4() {
 }
 
 do_stop_ds4() {
-    log "Stopping DeepSeek-V4-Flash cluster (unit $DS4_UNIT)..."
-    systemctl --user stop "$DS4_UNIT.service" 2>/dev/null
+    if [ "${VSH_DS4_ENGINE:-native}" = "delegate" ]; then
+        log "Stopping DeepSeek-V4-Flash cluster (unit $DS4_UNIT)..."
+        systemctl --user stop "$DS4_UNIT.service" 2>/dev/null
+    else
+        log "Stopping DeepSeek-V4-Flash cluster (unit vsh-ds4)..."
+        systemctl --user stop vsh-ds4.service 2>/dev/null
+    fi
     sleep 3
     pkill -f "bin/vllm serve .*DeepSeek-V4-Flash" 2>/dev/null || true
     remote "pkill -f 'bin/vllm serve' 2>/dev/null" 20 2>/dev/null || true
@@ -256,9 +288,11 @@ do_status() {
         warn "GLM API not answering on :${GLM_PORT}."
     fi
 
-    # ds4
-    st=$(systemctl --user is-active "${DS4_UNIT}.service" 2>/dev/null || echo unknown)
-    [[ "$st" = "active" ]] && log "unit $DS4_UNIT: $st" || warn "unit $DS4_UNIT: $st"
+    # ds4 (native on the vllm-strix-halo image, or delegated to ds4-vllm)
+    local ds4u="$DS4_UNIT"
+    [ "${VSH_DS4_ENGINE:-native}" != "delegate" ] && ds4u=vsh-ds4
+    st=$(systemctl --user is-active "${ds4u}.service" 2>/dev/null || echo unknown)
+    [[ "$st" = "active" ]] && log "unit $ds4u: $st (engine ${VSH_DS4_ENGINE:-native})" || warn "unit $ds4u: $st (engine ${VSH_DS4_ENGINE:-native})"
     if curl -sf -m 5 "http://127.0.0.1:${DS4_PORT}/v1/models" 2>/dev/null | grep -q deepseek; then
         log "DS4 API healthy: http://127.0.0.1:${DS4_PORT}"
     else

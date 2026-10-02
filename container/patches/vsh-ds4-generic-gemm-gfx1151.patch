@@ -1,0 +1,30 @@
+--- a/vllm/models/deepseek_v4/amd/rocm.py	2026-09-29 13:10:17.953651137 -0600
++++ b/vllm/models/deepseek_v4/amd/rocm.py	2026-09-29 13:10:17.953898380 -0600
+@@ -1041,6 +1041,15 @@
+         return out
+ 
+     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        # vllm-strix-halo (ds4): the aiter blockscale GEMM path is MI300-only
++        # (fp8 weights; this gfx1151 aiter build is int8-only and Triton has
++        # no fp8 tl.dot — "Unsupported rhs dtype fp8e4nv"). Use the generic
++        # quantized-linear path here.
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1151
++
++            if on_gfx1151():
++                return super()._fused_wqa_wkv_gemm(hidden_states)
+         if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:
+             return self._bpre_attn_gemm(
+                 self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
+@@ -1059,6 +1068,11 @@
+         split_sizes = self._fused_compressor_split_sizes
+         if fused_weight is None or split_sizes is None:
+             return super()._run_parallel_input_projections(hidden_states)
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1151
++
++            if on_gfx1151():
++                return super()._run_parallel_input_projections(hidden_states)
+ 
+         indexer = self.indexer
+         if indexer is None:

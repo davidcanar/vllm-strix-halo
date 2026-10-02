@@ -1,0 +1,226 @@
+--- a/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
++++ b/opt/venv/lib/python3.12/site-packages/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+@@ -26,6 +26,51 @@
+ from vllm.triton_utils import tl, triton
+ 
+ from .fused_indexer_q import _fp32x2_to_fp4x2
++import os as _os
++
++# DS4: latched at import. These fire on every layer of every decode step
++# (46/step and 21/step respectively) for a value that cannot change while
++# the process lives, and os._Environ.get routes through Mapping.get ->
++# __getitem__ -> decodevalue each time.
++_DS4_IDX_OFFICIAL = __import__("os").environ.get("DS4_IDX_OFFICIAL", "0") == "1"
++_DS4_QAT_DBGK=False
++
++# DS4 indexer QAT: the reference DeepSeek-V4 indexer graph (official inference
++# model.py Compressor(rotate=True) + ds4.c dsv4_indexer_qat_row) rotates the
++# compressed indexer-K with a normalized Hadamard-128 BEFORE quantization, so the
++# fp8 quant happens in the trained basis. vLLM omitted this (self.rotate was dead
++# code). Gated by DS4_IDX_OFFICIAL; must match the Q-side rotation in
++# fused_indexer_q.py and be paired (both q and k rotated) for the dot product.
++_QAT_H_CACHE = {}
++def _qat_hadamard(D, device):
++    key = (D, str(device))
++    h = _QAT_H_CACHE.get(key)
++    if h is None:
++        m = torch.ones(1, 1, dtype=torch.float32)
++        base = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=torch.float32)
++        n = 1
++        while n < D:
++            m = torch.kron(base, m); n *= 2
++        h = (m * (D ** -0.5)).to(device).contiguous()
++        _QAT_H_CACHE[key] = h
++    return h
++
++@triton.jit
++def _apply_hadamard128(x, H_ptr, D: tl.constexpr):
++    r = tl.arange(0, D)
++    Hm = tl.load(H_ptr + r[:, None] * D + r[None, :])  # [D,D] row-major H[j,i]
++    rot = tl.sum(Hm * x[None, :], axis=1)
++    _B: tl.constexpr = 32
++    r2 = tl.reshape(rot, (D // _B, _B))
++    amax = tl.max(tl.abs(r2), axis=1)
++    amax = tl.maximum(amax, 7.0529664e-38)
++    s = tl.exp2(tl.ceil(tl.log2(amax * (1.0 / 6.0))))
++    y = r2 / s[:, None]
++    y = tl.minimum(tl.maximum(y, -6.0), 6.0)
++    a = tl.abs(y)
++    sg = tl.where(y < 0.0, -1.0, 1.0)
++    qv = tl.where(a < 0.25, 0.0, tl.where(a < 0.75, 0.5, tl.where(a < 1.25, 1.0, tl.where(a < 1.75, 1.5, tl.where(a < 2.5, 2.0, tl.where(a < 3.5, 3.0, tl.where(a < 5.0, 4.0, 6.0)))))))
++    return tl.reshape(qv * sg * s[:, None], (D,))             # (H @ x)[j]
+ 
+ 
+ def compress_norm_rope_store_triton(
+@@ -67,6 +112,20 @@
+         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
+         num_warps = 1
+ 
++    apply_qat = (
++        head_dim == 128
++        and not use_fp4_cache
++        and _DS4_IDX_OFFICIAL
++    )
++    _is_indexer_fp8 = kernel is _fused_kv_compress_norm_rope_insert_indexer_attn
++    global _DS4_QAT_DBGK
++    if _is_indexer_fp8 and not _DS4_QAT_DBGK:
++        _DS4_QAT_DBGK=True
++        print("[DS4_QAT] indexer-K APPLY_QAT=%s head_dim=%d" % (apply_qat, head_dim), flush=True)
++    qat_extra = (_qat_hadamard(head_dim, kv_cache.device),) if _is_indexer_fp8 else ()
++    qat_cx = {"APPLY_QAT": apply_qat} if _is_indexer_fp8 else {}
++    _is_sparse512 = kernel is _fused_kv_compress_norm_rope_insert_sparse_attn
++    bf16_cx = {"BF16": (kv_cache.dtype != torch.uint8)} if _is_sparse512 else {}
+     kernel[(num_actual,)](
+         # state cache
+         state_cache,
+@@ -89,6 +148,7 @@
+         kv_cache,
+         k_cache_metadata.slot_mapping,
+         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
++        *qat_extra,
+         # constexprs
+         HEAD_SIZE=head_dim,
+         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
+@@ -101,6 +161,8 @@
+         TOKEN_STRIDE=token_stride,
+         SCALE_DIM=scale_dim,
+         KV_BLOCK_STRIDE=kv_cache.stride(0),
++        **qat_cx,
++        **bf16_cx,
+         num_warps=num_warps,
+         **pdl_kwargs,
+     )
+@@ -144,6 +206,7 @@
+     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
+     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
+     KV_BLOCK_STRIDE: tl.constexpr,
++    BF16: tl.constexpr = False,
+ ):
+     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
+ 
+@@ -234,66 +297,60 @@
+     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM  # 448
+     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2  # 32
+ 
+-    # FP8 UE8M0 quant: cast fp32 → bf16 → fp32 before quant to match reference.
++    # ── constexprs (hoisted; valid for both branches) ──
+     N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
+     N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK  # 7
+     INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
+-
+-    quant_input = normed.to(tl.bfloat16).to(tl.float32)
+-    quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
+-    abs_2d = tl.abs(quant_2d)
+-    block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
+-    block_absmax = tl.maximum(block_absmax, 1e-4)
+-
+-    raw_scales = block_absmax * INV_FP8_MAX
+-    exponents = tl.ceil(tl.log2(raw_scales))
+-    inv_scales = tl.exp2(-exponents)
+-    inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+-    x_scaled = quant_2d * inv_scales_col
+-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+-    x_fp8 = x_clamped.to(tl.float8e4nv)
+-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+-    x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+-
+-    nope_mask = block < NOPE_HEAD_DIM
+-    tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
+-
+-    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+-    encoded = exponents + 127.0
+-    encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
+-    tl.store(
+-        scale_ptr + scale_idx,
+-        encoded.to(tl.uint8),
+-        mask=scale_idx < N_NOPE_BLOCKS,
+-    )
+-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+-
+-    # Register-based GPT-J RoPE in fp32.
+     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+ 
++    # ── GPT-J RoPE (fp32) -> full [HEAD_SIZE] result (nope pass-through) ──
+     pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+     even, odd = tl.split(pair_2d)  # each [NUM_PAIRS] fp32
+-
+     pair_idx = tl.arange(0, NUM_PAIRS)
+     rope_pair_local = pair_idx - NOPE_PAIRS
+     is_rope_pair = rope_pair_local >= 0
+     cs_idx = tl.maximum(rope_pair_local, 0)
+-
+     compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+     cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+     cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
+     sin_v = tl.load(cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0)
+-
+     new_even = even * cos_v - odd * sin_v
+     new_odd = odd * cos_v + even * sin_v
+     result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
+ 
+-    # Store rotated rope portion as bf16 into the cache's bf16 area.
+-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+-    rope_local = block - NOPE_HEAD_DIM
+-    is_rope = (block >= NOPE_HEAD_DIM) & mask
+-    tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
++    if BF16:
++        # DS4_KV_BF16: plain bf16 contiguous cache [n_blocks, block_size, HEAD_SIZE].
++        # Store the full rotated 512-dim row (matches ds4.c F16Compressor).
++        bf16_row = cache_block_ptr + kv_pos_in_block * HEAD_SIZE
++        tl.store(bf16_row + block, result.to(tl.bfloat16), mask=mask)
++    else:
++        # ── FP8 UE8M0 quant of NoPE + bf16 RoPE (fp8_ds_mla layout) ──
++        quant_input = normed.to(tl.bfloat16).to(tl.float32)
++        quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
++        abs_2d = tl.abs(quant_2d)
++        block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
++        block_absmax = tl.maximum(block_absmax, 1e-4)
++        raw_scales = block_absmax * INV_FP8_MAX
++        exponents = tl.ceil(tl.log2(raw_scales))
++        inv_scales = tl.exp2(-exponents)
++        inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
++        x_scaled = quant_2d * inv_scales_col
++        x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
++        x_fp8 = x_clamped.to(tl.float8e4nv)
++        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
++        x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
++        nope_mask = block < NOPE_HEAD_DIM
++        tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
++        scale_idx = tl.arange(0, N_QUANT_BLOCKS)
++        encoded = exponents + 127.0
++        encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
++        tl.store(scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS)
++        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
++        bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
++        rope_local = block - NOPE_HEAD_DIM
++        is_rope = (block >= NOPE_HEAD_DIM) & mask
++        tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
+ 
+ 
+ # =============================================================================
+@@ -322,6 +379,7 @@
+     k_cache_ptr,
+     kv_slot_mapping_ptr,
+     kv_cache_block_size,
++    qat_h_ptr,
+     # ── constexprs ──
+     HEAD_SIZE: tl.constexpr,
+     TRITON_BLOCK_SIZE: tl.constexpr,
+@@ -334,6 +392,7 @@
+     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
+     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
+     KV_BLOCK_STRIDE: tl.constexpr,
++    APPLY_QAT: tl.constexpr,
+ ):
+     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
+ 
+@@ -446,6 +505,8 @@
+     new_even = even * cos_v - odd * sin_v
+     new_odd = odd * cos_v + even * sin_v
+     result = tl.interleave(new_even, new_odd)  # fp32
++    if APPLY_QAT:
++        result = _apply_hadamard128(result, qat_h_ptr, TRITON_BLOCK_SIZE)
+ 
+     # ── FP8 UE8M0 quant: single block, flat reduction ────────────────
+     tl.static_assert(

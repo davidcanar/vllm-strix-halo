@@ -1,0 +1,21 @@
+--- a/vllm/models/deepseek_v4/amd/rocm.py	2026-09-29 14:31:06.103483556 -0600
++++ b/vllm/models/deepseek_v4/amd/rocm.py	2026-09-29 14:31:06.103604192 -0600
+@@ -865,8 +865,18 @@
+     def prepare_attn_preshuffle(self) -> None:
+         from vllm._aiter_ops import rocm_aiter_ops
+ 
++        # vllm-strix-halo (ds4): the preshuffle exists solely for the aiter
++        # linear (bpreshuffle GEMM) path. gfx1151 runs the stock Triton fp8
++        # kernel, which needs the weights in their plain layout -- and the
++        # in-place shuffle would destroy it. Skip when the aiter LINEAR path
++        # is off (VLLM_ROCM_USE_AITER_LINEAR=0) or on gfx1151 outright.
+         if not rocm_aiter_ops.is_enabled():
+             return
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1151
++
++            if on_gfx1151() or not rocm_aiter_ops.is_linear_enabled():
++                return
+         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+             _upcast_e8m0_to_fp32,
+             get_fp8_block_weight_scale,
