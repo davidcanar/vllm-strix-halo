@@ -747,6 +747,44 @@ levers are launch overhead (~6%, needs the #51540-class graphs fix) and the
 already-int4 MoE. Keep the `glm53_profiler_dir` knob — it is inert until
 `POST /start_profile` and made this measurement a 5-minute job.
 
+### 2026-10-02 fp8 requant — BUILT but blocked at kernel selection on gfx1151
+
+The antirez-analogue experiment was carried out end to end up to the point
+where the silicon says no:
+
+- `requant-fp8attn.py` builds `~/models/GLM-5.3-Flash-AWQ-W4A16-fp8attn` as a
+  **shard-patch checkpoint** (symlinked original shards + 3 new shards,
+  ~6.2 GB: 12.30 GiB of bf16 `self_attn.*` 2-D linear weights + `lm_head`
+  requantized to fp8 e4m3 per-output-channel + scales; the indexer
+  projections, conv1d weights and norms stay bf16; `layers.45` stays
+  ignored). config.json gains a fp8 W8A8 config_group placed FIRST
+  (first-match order beats the `Linear` catch-all; the `RoutedExperts`
+  helper keeps the experts on W4A16). Re-runs in ~18 s.
+- `kda.py` got an env-gated patch (`VSH_KDA_QUANT`, default off): the
+  Glm5NextLinearAttention constructor nulls `vllm_config.quant_config`
+  ("fp8 checkpoints omit their scales") — with our checkpoint they exist.
+- **Boot fails at kernel selection** for every ScaledMM candidate:
+  aiter hipbmm requires CDNA3+ (`get_cdna_version() > 2`; gfx1151 is RDNA),
+  the two aiter a8w8 kernels require a *tuned configuration* per (N, K)
+  (`a8w8_tuned_gemm.csv` has gfx942 rows only), `ROCmFP8ScaledMMLinearKernel`
+  requires CDNA3+/RDNA4, and the three torch `_scaled_mm` variants are
+  unsupported on this platform. Enabling
+  `VLLM_ROCM_USE_AITER_LINEAR[_HIPBMM]=1` does not help (the CDNA gate).
+- The un-blocker is upstream: PRs #59531/#59479 ("gfx1151 W8A8 wvSplitK
+  blockscale skinny path") are building exactly this fp8 skinny-GEMM path.
+  Once one lands (or a seeded `a8w8_tuned_gemm.csv` provides our shapes),
+  the fp8 checkpoint is ready to serve; ceiling remains the measured ~+8%.
+
+The alternative that reuses *proven* kernels today is **W4A16 for
+`self_attn.*`** — the exact pack-quantized scheme the routed experts already
+use (same wna16 kernels, same loading path, §12's ~+20% estimate) at the
+cost of 4-bit attention precision, which the A/B probes would have to
+validate.
+
+Env plumbing added for the attempt and kept, default-off: `VSH_KDA_QUANT`,
+`VLLM_ROCM_USE_AITER_LINEAR`, `VLLM_ROCM_USE_AITER_LINEAR_HIPBMM` in
+`vsh-cluster-restart.sh` ENVPASS (worker-visible at ray start).
+
 ## 14. Deterministic MoE-router top-k (`vsh-moe-router-deterministic-topk.patch`)
 
 The stock Python router selects experts with
