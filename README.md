@@ -1,6 +1,6 @@
 # vllm-strix-halo — GLM-5.3-Flash (and DeepSeek-V4-Flash) on 2× AMD Strix Halo, TP=2 over Thunderbolt
 
-> # STATUS 2026-10-01: GLM long-context FIXED at all tested lengths (up to 105K, including adversarial); DS4 native port incomplete
+> # STATUS 2026-10-01: GLM long-context FIXED at all tested lengths (up to the full 256K rated context, including adversarial); DS4 native port incomplete
 >
 > **The GLM-5.3 long-context retrieval bug is fixed.** Four stacked fixes
 > (one upstream PR port + three local) took tail-retrieval from failing at
@@ -14,6 +14,9 @@
 > | 54K | FAIL | **PASS** (deterministic) |
 > | 75K | FAIL | **PASS** |
 > | 95–105K | FAIL | **PASS** |
+| 146K | — | **PASS** |
+| 204K | — | **PASS** |
+| 255K (max) | — | **PASS** |
 > | adversarial 54K (1000× decoy) | FAIL | **PASS** |
 >
 > **Measured speeds (2026-10-01, GLM-5.3-Flash AWQ W4A16, TP=2, MTP k=3):**
