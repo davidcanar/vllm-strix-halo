@@ -1418,3 +1418,56 @@ non-kernel time in a 224 ms step is: the mamba/KDA `prepare_chunk_indices()
 .tolist()` sync (a true device→host round trip per step, upstream #51540) and
 the per-step host work that the trace shows as ~17 % API occupancy. That is what
 to attack next — not the launch path, and not the pointer lookups.
+
+## 22. Host syncs, measured to the end: the rig is GPU-bound, not CPU-bound
+
+Section 21 killed the `hipPointerGetAttribute` figure. This section finishes the
+job on the two remaining suspects -- the KDA chunk-index round trip and the
+per-layer `nonzero` readbacks -- and closes the "the host is the bottleneck"
+line of reasoning.
+
+**The KDA chunk-index sync** (`third_party/flash_linear_attention/ops/index.py`,
+`cdiv(lens, chunk_size).tolist()`, upstream #51540) is real, but it is on the
+*chunked* path only: `models/glm5next/common/kda.py` takes it when
+`attn_metadata_narrowed.num_prefills > 0`. Pure-decode steps run the recurrent
+kernels (`fused_recurrent_kda` for spec rows, `causal_conv1d_update` +
+recurrent for plain decode) and never call it. It fires **once per
+prefill-bearing step**, not per decode step -- a profiled prefill shows the
+chunked kernels (`chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter/intra`,
+`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`, 68 launches = 34 KDA layers
+x 2) with the sync ahead of them. The generic GDN backend already passes a CPU
+mirror (`v1/attention/backends/gdn_attn.py:201`), so the upstream fix is
+"hand it the host-side query lengths"; the GLM path passes the device tensor.
+
+**What the sync and its friends actually cost.** A profiled 6 972-token prefill
+(TTFT 25.9 s, 270 tok/s):
+
+| host API | calls | total | worst single |
+|---|---:|---:|---:|
+| `hipMemcpyWithStream` (the 4/8-byte count readbacks) | 1 490 | 24.1 s | 1.459 s |
+| `aten::nonzero` (median 0.088 ms) | 228 | 23.4 s | 1.459 s |
+| `aten::to` / `_to_copy` | 3 132 / 1 082 | 0.49 s | 0.41 s |
+| `hipPointerGetAttribute` | 137 335 (decode window) | 0.11 s | -- |
+
+**And here is the number that settles it: during that same window the GPU was
+99.2 % busy** -- 25.87 s of merged kernel time in a 26.09 s span, 0.8 % idle, no
+gap longer than 2 ms. The host spending 24 s inside synchronous copies is the
+host *waiting for a saturated GPU*, not the GPU waiting for the host. The same
+analysis on a decode window shows 79 % busy. A busy-GPU loop with a
+synchronous D2H readback per layer is normal; nothing is being wasted.
+
+So: **do not chase host syncs on this rig.** The kernel time is memory traffic
+(MoE at ~87 % of achieved bandwidth, bf16 GEMMs at roofline), so the only
+levers left are the ones that reduce *bytes per token*: the weight format
+(§12/§13), the number of verified rows (k), and the drafter. That is also why
+k=1/2/3/4 all land within 3 % of each other (§17): the weights are read once
+per step regardless of how many rows are verified.
+
+**Kept for reuse:** `container/patches/vsh-sync-instr.py`
+(`VSH_SYNC_INSTR=1` times the chunk-index copy and logs every 20th miss; off by
+default -- note the log gate means a short run prints nothing) and the trace
+analysers `scripts/trace_gap_analyze.py` (GPU busy vs idle, gap attribution),
+`scripts/trace_dtoh.py` (device->host copy inventory) and
+`scripts/trace_sync.py` (blocking-op worst cases). Those three scripts are what
+produced the corrections in sections 21 and 22, and they are the first thing to
+run before believing any host-side number from the profiler summary.
