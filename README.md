@@ -240,6 +240,9 @@ vllm-strix-halo/
    `container/pinned-vllm/` holds the modified `vllm/` files exported
    byte-exact from the running container, and `container/Dockerfile` copies
    them over the patched tree (valid for the pinned VLLM_COMMIT). The
-   Triton-side patches (`vsh-triton-ptr-cache.py`) and the launcher-side
-   retention flag are not part of that copy — re-apply them with the scripts
-   in `container/patches/` after a rebuild.
+   launcher-side retention flag is not part of that copy — re-apply it with
+   the script in `container/patches/`. The Triton-side change is pinned too:
+   `container/pinned-triton/backends/amd/driver.c` is the patched driver
+   (inert unless `VSH_TRITON_PTR_CACHE=1`); copy it over
+   `/opt/venv/lib/python3.12/site-packages/triton/backends/amd/driver.c` at
+   image build.
