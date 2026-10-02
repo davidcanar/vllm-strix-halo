@@ -622,6 +622,43 @@ Even if (3) were fixed, **11.43 GiB of graph memory per rank** is not
 affordable against the ~18.6 GiB free that the 8 GiB KV pin leaves — it would
 have to be traded against KV, i.e. against context.
 
+### 2026-10-02 retry — replay-time root cause found; still not shippable
+
+Reproduced with the knob (`glm53_enforce_eager: 0`) under reduced pressure
+(ctx 32 K, KV 8 GiB, `--cudagraph-capture-sizes 1..32` — the cap lives in
+`vsh-manual-serve.sh` and only applies with eager off). Findings, in order:
+
+1. **The 2026-09-28 "wedge" had two stacked causes.** With eager off the box
+   runs the JIT-warmup/compile phase for the first time (eager disables it),
+   which pushed host RAM to 0 + swap during the full 35-size capture — a
+   thrash that mimics a deadlock. Separately, the large end of the capture
+   list deadlocked rank 1 inside a KDA Triton launch (py-spy: stuck in
+   `triton/backends/amd/driver.py` launching `layer_norm_gated_fwd`) while
+   rank 0 spun in the MoE all-reduce. With ctx 32 K / 7 capture sizes both
+   ranks capture cleanly (~2.7–3.3 GiB of graph memory) and the API comes up.
+
+2. **The first real request then deadlocks at replay — and it is NOT the MTP
+   drafter** (the old attribution was wrong). py-spy on rank 0 shows it
+   spinning in `prepare_chunk_indices`
+   (`vllm/third_party/flash_linear_attention/ops/index.py:28`), whose
+   `.tolist()` is a device→host sync *inside the KDA eager-break segment at
+   replay* (the file's own comment: "This will be fixed by
+   vllm-project/vllm/pull/51540" — still open, and main still has the sync).
+   With MTP on, every decode step routes the non-spec rows through
+   `chunk_kda_with_fused_gate` → `prepare_chunk_indices` → a per-step sync
+   that deadlocks against the peer rank's in-flight TP collective.
+
+3. **With MTP off, graphs work end to end and compute correctly**: the 12 K
+   needle probe PASSES under graphed decode; steady decode is 8.8 t/s
+   (engine stat) vs ~7.6 eager spec-off — the ~+15 % the §11 profile
+   predicted (32 ms launch overhead of a ~200 ms step), not more. But it
+   loses to production eager+MTP (~13–14 t/s), so it is a net regression.
+
+**Verdict**: production stays `glm53_enforce_eager: 1`. Graphs become worth
+revisiting only when the #51540-class sync removal is extended to the
+MTP-decode chunked-KDA path (or upstream ships it; the PR is scoped to
+prefill only), or if a future engine ends up running without MTP anyway.
+
 So: `glm53_enforce_eager: 1` stays the default, `glm53_max_seqs: 256` is kept
 on its own merits, and the knob is in place for whoever retries this after
 porting the DS4 stream-sync fix. Set `glm53_enforce_eager: 0` to reproduce.
