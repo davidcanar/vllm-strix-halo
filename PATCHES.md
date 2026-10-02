@@ -709,6 +709,44 @@ ignore list.
 Either way this is checkpoint work, not serving work. The cheapest route is
 asking `wtdcode` for a variant that quantizes layer 45 (and optionally the MLA
 projections) rather than re-deriving one from the 643 GB BF16 original.
+### 2026-10-02 profile — the requant gate, measured (`torch` profiler, MTP k=3)
+
+Fresh 96-step decode window (191.6 ms/step; traces in `~/glmprof/` on both
+boxes, `glm53_profiler_dir` knob in `vsh-config.yaml`):
+
+| kernel class | ms/step | share |
+|---|---:|---:|
+| routed experts `fused_moe_kernel_gptq_awq` (int4) | 42.7 | 22% |
+| **bf16 GEMMs (`wvSplitK_hf_sml` family + hipBLASLt `Cijk_*`)** | **27.7** | **14.5%** |
+| MLA sparse attention core | 6.6 | 3.5% |
+| aiter fp8 batched GEMM (indexer scoring) | 5.7 | 3.0% |
+| fused index/mask triton (`arange/eq/bitwise_not`) | 5.7 | 3.0% |
+| launch-path overhead (`hipPointerGetAttribute` 8.7 GPU-serialized + `hipModuleLaunchKernel`) | ~12 | ~6% |
+| collectives (`odl2_wait_add` + nccl all-gather) | 3.7 | 1.9% |
+| mhc fused ops | 2.1 | 1.1% |
+| KDA recurrent core | 0.6 | 0.3% |
+
+Cross-check: the bf16 GEMM time (27.7 ms) moving ~6.1 GB/rank implies
+~220 GB/s — **the bf16 kernels are at roofline** (matches the §12 analysis
+above; the kernels are not pathological, the *format* is). Consequences:
+
+- **fp8 W8A8 on `self_attn.*`** (the antirez/ds4 analogue) halves those
+  bytes: ceiling ≈ −14 ms/step ≈ **+8% decode** (14.6 → ~15.8 t/s). Below
+  the >20–25% gate; not worth the surgery on speed alone.
+- **int4 on `self_attn.*`** stays the bigger prize (§12's ~+20%) but is the
+  highest quality risk and needs calibration + eval, not blind RTN.
+- **The disk constraint**: any full-checkpoint requant writes ~172 GB and
+  box1 has 113 GB free. Feasible only after freeing ~60 GB (dangling podman
+  images ≈ 45 GB + the official-nightly images) or by building the variant
+  on box2 (199 GB free) first. A `layers.45`-only patch checkpoint (symlink
+  unchanged shards + new layer-45 shards, ~4 GB) fits today and is the
+  low-risk memory lever (frees ~7 GB/rank for KV), not a decode lever.
+
+**Verdict: stand down on the requant-for-speed.** The remaining honest
+levers are launch overhead (~6%, needs the #51540-class graphs fix) and the
+already-int4 MoE. Keep the `glm53_profiler_dir` knob — it is inert until
+`POST /start_profile` and made this measurement a 5-minute job.
+
 ## 14. Deterministic MoE-router top-k (`vsh-moe-router-deterministic-topk.patch`)
 
 The stock Python router selects experts with
