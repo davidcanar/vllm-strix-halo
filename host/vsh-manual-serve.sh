@@ -24,6 +24,7 @@ source "$HOME/vsh-cluster-env.${VSH_TRANSPORT:-tcp}.sh"
 echo "[vsh-serve] HOME=$HOME VLLM_ROCM_USE_AITER=$VLLM_ROCM_USE_AITER VLLM_ROCM_USE_AITER_MOE=${VLLM_ROCM_USE_AITER_MOE:-unset} DS4_ODL_AR2=${DS4_ODL_AR2:-unset} NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-unset}"
 
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
+
 PORT=${VSH_GLM53_API_PORT:-1235}
 
 # Speculative decoding. glm53_spec_method: glm5_next_mtp (default; the
@@ -74,6 +75,18 @@ fi
 # upstream; keep auto (bf16) until the ROCm fp8 sparse path lands.
 # MiaAI's 2xDGX-Spark kit uses fp8 KV on SM12x where the packed fp8_ds_mla
 # kernel exists; gfx1151 has no equivalent today.
+# [vsh-apc-retention] Retention interval for sliding-window / Mamba (KDA)
+# prefix-cache checkpoints. Stock default (flag absent) is 0 = "keep only the
+# latest replay boundary", the sparsest setting; on this hybrid model that ties
+# every hit to a KDA checkpoint that may not exist yet, so a repeat of the same
+# prompt can miss once before it hits. A positive multiple of the scheduler
+# block size (2304) keeps one checkpoint per segment. Env-gated: unset = stock.
+APCR=()
+if [ -n "${VSH_GLM53_APC_RETENTION:-}" ]; then
+  APCR=(--prefix-cache-retention-interval "${VSH_GLM53_APC_RETENTION}")
+  echo "[vsh-serve] prefix-cache retention interval: ${VSH_GLM53_APC_RETENTION}"
+fi
+
 KVD=()
 if [ -n "${VSH_GLM53_KV_DTYPE:-}" ] && [ "${VSH_GLM53_KV_DTYPE}" != "auto" ]; then
   KVD=(--kv-cache-dtype "$VSH_GLM53_KV_DTYPE")
@@ -84,6 +97,7 @@ fi
 # profile). Turning it off enables torch.compile + CUDA graphs, which costs a
 # long first-boot compile and is unproven on this hybrid (KDA + sparse-MLA)
 # model, so it stays the default. Set glm53_enforce_eager: 0 to experiment.
+CGS=()
 EAGER=(--enforce-eager)
 if [ "${VSH_GLM53_ENFORCE_EAGER:-1}" != "1" ]; then
   EAGER=()
@@ -94,6 +108,11 @@ if [ "${VSH_GLM53_ENFORCE_EAGER:-1}" != "1" ]; then
   #   piecewise CUDA graphs unavailable, model is not torch-compiled and
   #   breakable CUDA graph is off.
   export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+  # TEST 2026-10-02: cap capture sizes. Single-user decode never exceeds a few
+  # seqs; the large end of the 35-size default list is where rank1 wedged in
+  # KDA Triton launches during capture, and each size costs capture memory.
+  CGS=(--cudagraph-capture-sizes 1 2 4 8 16 24 32)
+  echo "[vsh-serve] capture sizes capped to 1..32"
   echo "[vsh-serve] enforce-eager OFF (CUDA graphs, breakable capture)"
 fi
 
@@ -102,11 +121,11 @@ exec vllm serve "$MODEL_DIR" \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   --quantization compressed-tensors \
-  "${EAGER[@]}" \
+  "${EAGER[@]}" "${CGS[@]}" \
   --skip-mm-profiling \
   --gpu-memory-utilization ${VSH_GLM53_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${VSH_GLM53_KV_BYTES:-4294967296} \
-  "${KVD[@]}" \
+  "${KVD[@]}" "${APCR[@]}" \
   --max-model-len "${VSH_GLM53_MAX_CTX:-32768}" \
   --max-num-batched-tokens ${VSH_GLM53_MAX_BATCHED:-512} \
   --max-num-seqs ${VSH_GLM53_MAX_SEQS:-256} \

@@ -1191,3 +1191,175 @@ Geramy/OdinLink-Five). The all-reduce/MessageQueue hooks are re-anchored
 derivatives of that project's patch set. The previous tbv-era attribution
 (rdma-core provider work via hellas-ai/thunderbolt-ibverbs) remains accurate
 for the pre-2026-09-27 history of this repo. See THIRD_PARTY_NOTICES.md.
+
+## 17. Adaptive draft length, wired for async scheduling (`vsh-adaptive-k.py`)
+
+Ported from MiaAI-Lab's `overlay/patch_adaptive_k.py` (see the review in
+`.analysis/`), then fixed: **the v1 port could not fire on this build.**
+
+**Why it could not fire.** v1 trimmed `request.spec_token_ids` inside
+`Scheduler.update_draft_token_ids`. This build resolves async scheduling **ON**
+for spec decode, and `v1/engine/core.py:252` guards that call with
+`not self.async_scheduling` — so the function is never reached, and the trim was
+dead code. In async mode the *verify length* is fixed at **schedule time** by
+`SchedulerOutput.num_spec_tokens_to_schedule`:
+`AsyncScheduler._update_after_schedule` sizes `_spec_token_placeholders` from it,
+and the worker hands the same number to the drafter
+(`gpu_model_runner.py:4972` → `drafter.propose(num_speculative_tokens=…)`).
+That cap inside `schedule()` is therefore the only lever that works here; the
+sync-path trim is kept for the `async_scheduling=False` case.
+
+**v2 adds** (a) the cap as the primary path, (b) per-step telemetry
+(`VSH_ADAPTIVE_K_DEBUG=1`: the k that was *scheduled* vs the k actually
+*verified*, the per-request choices and the accepted-token histogram), and
+(c) a live override file (`VSH_ADAPTIVE_K_JSON`, `{"force": n}` / `{"margin": x}`)
+so a **k-sweep needs one boot, not four**.
+
+**Measured k-curve** (prose, temp 0, single request, 2.4K prompt, alternating
+A/B/A/B, each window exactly one request; `force` from the override file):
+
+| force | drafts | draft tokens | tokens/draft | accepted/step | steps/s | decode tok/s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 129 | 387 | 3.00 | 1.98 | 4.41 | 8.92 |
+| 2 | 128 | 256 | 2.00 | 1.88 | 4.41 | 8.54 |
+| 3 | 113 | 339 | 3.00 | 1.85 | 4.45 | 8.26 |
+| 2 | 121 | 242 | 2.00 | 1.87 | 4.45 | 8.35 |
+
+**The override provably controls the verify batch** (tokens/draft is exactly
+3.00 / 2.00), which is what v1 could not demonstrate.
+
+**Verdict: adaptive K is throughput-neutral-to-negative on this rig, and the
+reason is structural.** The step time is *independent of the verify length*
+(225–227 ms at k=1, 2 and 3 — the step is CPU/launch-bound, see §13's profile:
+~50% GPU-idle), so accepted tokens are nearly free and trimming only gives them
+away. MiaAI's +13–21% comes from prose cells where *their* acceptance is 0.34;
+ours is 0.85–0.99.
+
+**k=4 was tried and does not help either** (boot with `glm53_mtp_tokens: 4`,
+then forced down through the override in the same boot):
+
+| force | tokens/draft | accepted/step | steps/s | decode tok/s |
+|---:|---:|---:|---:|---:|
+| 4 | 4.00 | 2.02 | 4.16 | 8.38 |
+| 3 | 3.00 | 2.00 | 4.26 | 8.57 |
+| 2 | 2.00 | 2.00 | 4.31 | 8.70 |
+| 4 | 4.00 | 2.07 | 4.18 | 8.70 |
+
+Per-position acceptance is ≈0.68 / 0.44 / 0.12 / 0.02, so **accepted tokens per
+step saturate at ~2.0 for every k** — the MTP drafter's useful depth is two
+drafts, and the step rate falls ~3 % from k=2 to k=4. The draft-length axis is
+therefore exhausted on this rig in both directions.
+
+**Verdict:** leave `VSH_ADAPTIVE_K=off` in production. The mechanism is
+installed, env-gated and instrumented (`vsh-adaptive-k.py`), and the live
+override makes a k-sweep a one-boot job — but there is no regime on this
+workload where it beats a static k=3. Its value is the *receipts*: it is what
+proved the scheduler-side verify length is the live lever and that our step cost
+is draft-length-independent, which re-targets the work at the step time itself
+(§13's launch/CPU overhead) rather than at the drafter.
+
+## 18. Prefix-cache hits were being truncated by a mis-flagged EAGLE set (`vsh-glm53-apc-align.py`)
+
+**Symptom.** Repeated prompts showed 0 % cache benefit, and the engine logged
+`Prefix cache hit rate: 0.0%` on boots where identical prompts were replayed.
+
+**Root cause (verified live).** `v1/core/kv_cache_utils.py:2364-2365` returns
+**early** for GLM-5-Next (`elif glm5_groups := _get_kv_cache_groups_glm5_next(…):
+return glm5_groups`), so `_annotate_eagle_groups()` (called later, at 2419) is
+dead code and **no group ever gets `is_eagle_group = True`**. Our spec method
+normalizes to `mtp` (`config/speculative.py:1135-1139`), so `use_eagle()` is
+True and `kv_cache_coordinator.py:108-110` — "conservatively fall back to flag
+all groups" — flagged **all five** groups. Every lookup then paid the EAGLE
+last-block pop, i.e. one scheduler page (**2304 tokens**) off the hit.
+
+**Fix.** Resolve the set to groups holding **only** drafter layers (layer-name
+markers, or an exact `SlidingWindowSpec` group; `KpoolTailSpec` subclasses it and
+is excluded by type identity). The MTP drafter layer merges into group 0 with the
+target MLA layers, so the resolved set is **empty** and the drop stays off —
+which is what upstream means by "the group that holds the drafter", not "every
+group". The write-side protection is untouched (the last
+`num_reprefillable_tokens = num_prefill_lookahead - 1` tokens are never cached,
+`kv_cache_coordinator.py:347`), and the lookahead guard at 120-131 is re-asserted
+explicitly because an empty set silently bypasses it. Env-gated with
+`VSH_GLM53_APC_ALIGN=1` (default off = byte-identical behaviour).
+
+**Boot receipt** (both lines absent before):
+
+```
+[vsh-glm53-apc-align] 5 groups, no annotation: eagle_group_ids=[] (upstream fallback would be all 5)
+[vsh-glm53-apc-align] eagle=[] scheduler_block=2304 align=2304 partial_hash_hits=False retention=0
+                      groups=[('MLAAttentionSpec', (0,), 'FullAttentionManager', False),
+                              ('MambaSpec', (2, 3, 4), 'MambaManager', False)]
+```
+
+**Measured** (identical prompts, same `cache_salt`, `force=3` so the draft length
+is held constant):
+
+| probe | before fix | after fix |
+|---|---|---|
+| 13 877-token prompt, repeat | 11 520 cached (5 pages) | **13 824 cached (6 pages)** |
+| 2 362-token prompt, repeat | **0 cached** | **2 304 cached** |
+| TTFT, 13.9K prompt, cached | 8.92 s | **2.05 s** |
+| TTFT, 13.9K prompt, cold | — | 53.57 s (259 tok/s prefill) |
+
+One page is exactly the EAGLE pop; a prompt whose length is between one and two
+scheduler pages used to get **nothing**. Spec acceptance is unchanged
+(0.85–0.99 accepted/draft, per-position 0.67/0.31/0.12 before and after), which
+is the gate this patch had to pass — the drop exists to keep draft KV written
+with a lookahead out of reused blocks, and that is still covered by the
+write-side trim.
+
+**One more page hides behind the retention policy.** The fix above restores the
+EAGLE page, but an identical repeat could still miss once before it hit
+(observed: cold miss, repeat miss, third request hit). That is
+`CacheConfig.prefix_cache_retention_interval`, whose default is **0** = "retain
+only semantic checkpoints (the latest replay boundary and shared-prefix
+junctions)" — the *sparsest* setting, and it applies to the sliding-window and
+Mamba (KDA) groups, which sit inside the hybrid `min()`. See §20.
+
+## 19. SHM reader busy-spin window (`vsh-shm-spin.py`)
+
+`SpinCondition.wait()` busy-loops on `sched_yield()` for `busy_loop_s` seconds
+after every read before falling back to the zmq poll; the reader is built with
+the stock default of **1 s**, so the EngineCore↔worker control-plane reader
+never idles while a request is in flight. Tracks MiaAI's `busy_loop_s 1 → 0.016`
+(+0.95 % decode, −85 % EngineCore CPU on their kit). Env-gated:
+`VSH_SHM_BUSY_LOOP_S` (unset = stock 1.0).
+
+**Measured here: no gain — mildly negative.** Step rate is the sensitive
+metric (it is remarkably stable across boots): **4.41 / 4.41 / 4.45 / 4.45
+steps/s** at the stock 1.0 s window, versus **4.16 / 4.26 / 4.31 / 4.18
+steps/s** at 0.016 s. Decode tok/s moved with it (8.92/8.54/8.26/8.35 →
+8.38/8.57/8.70/8.70), and the difference is inside run-to-run spread, so treat
+it as null. Unlike MiaAI's kit, our control plane already rides `odl_mq` (§15),
+which is why there is less CPU left to win. Reverted to the stock window; the
+knob stays available (`VSH_SHM_BUSY_LOOP_S=0.016`) for anyone chasing
+host-side CPU again.
+
+## 20. Prefix-cache retention interval (`VSH_GLM53_APC_RETENTION`)
+
+`CacheConfig.prefix_cache_retention_interval` defaults to **0**, documented as
+"retain only semantic checkpoints, including the latest replay boundary and
+shared-prefix junctions" — the sparsest of the three settings (`0` / `N` /
+`None` = dense) and, per its own docstring, it "sparsifies sliding-window and
+Mamba (linear-attention) checkpoints" only. GLM-5.3's hybrid `min()` includes
+three padded KDA/Mamba groups, so a hit is tied to a Mamba checkpoint that, at
+retention 0, is only guaranteed at the previous request's replay boundary.
+
+Measured on a 13.9K prompt, identical requests back to back:
+
+| request | retention 0 (stock) | retention 2304 |
+|---|---|---|
+| 1st (cold) | 0 hits | 0 hits |
+| **2nd (first repeat)** | **0 hits**, TTFT 53.1 s | **11 520 hits**, TTFT 9.62 s |
+| 3rd | 13 824 hits, TTFT 0.94 s | 13 824 hits, TTFT 0.95 s |
+
+So the first repeat went from "worse than cold" to five of the six pages. It is
+**decode-neutral** (8.54 tok/s, 4.45 steps/s, 1.91 tokens/step — identical to
+the stock-retention baseline) because it only changes which checkpoints are
+retained, not what is computed.
+
+The flag is stock `EngineArgs` (`engine/arg_utils.py:576`), so **no vLLM patch
+is needed** — only the env-gated launcher plumbing
+(`vsh-apc-retention.py`, `VSH_GLM53_APC_RETENTION=2304`; the value must be a
+multiple of the scheduler block size, 2304 here). Unset = no flag = stock 0.
