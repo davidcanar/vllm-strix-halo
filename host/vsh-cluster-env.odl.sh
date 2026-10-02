@@ -37,3 +37,34 @@ export DS4_ODL_AR2=${VSH_GLM53_ODL_AR2:-1}
 export ODL2_RANK1_IP=${VSH_ODL_RANK1_IP:-10.0.2.2}
 export ODL2_PORT=${VSH_ODL_PORT:-18541}
 export ODL2_DEV=${VSH_ODL_DEV:-0}
+
+# --- GLM-5.3 cache + draft-length knobs (2026-10-02) -------------------------
+# VSH_GLM53_APC_ALIGN: resolve the EAGLE last-block-drop set to *pure drafter*
+#   groups instead of the upstream "flag every group" fallback. On this model
+#   that resolves to the empty set (the MTP layer shares group 0 with the target
+#   MLA layers), which is what stops prefix-cache hits losing a scheduler page
+#   per lookup. PATCHES.md 18.
+# VSH_GLM53_APC_RETENTION: Mamba/sliding-window prefix-cache checkpoint interval
+#   (multiple of the scheduler block size, 2304 here). The stock default of 0
+#   keeps only the latest replay boundary, which made the first identical repeat
+#   miss. PATCHES.md 20.
+# VSH_ADAPTIVE_K: EMA policy for the verified draft-prefix length. Installed and
+#   instrumented but OFF: the step time is draft-length independent up to k=4 and
+#   acceptance saturates near 2 tokens/step, so trimming only gives tokens away.
+#   The JSON override below is the in-run k-sweep instrument. PATCHES.md 17.
+# VSH_SYNC_INSTR: times the KDA chunk-index host sync (index.py). Off; the sync
+#   is on the chunked path only and the GPU is 99% busy while it blocks.
+#   PATCHES.md 22.
+export VSH_GLM53_APC_ALIGN=1
+export VSH_GLM53_APC_RETENTION=2304
+export VSH_ADAPTIVE_K=off
+export VSH_ADAPTIVE_K_ALPHA=0.25
+export VSH_ADAPTIVE_K_MARGIN=0.5
+export VSH_ADAPTIVE_K_MIN_STEPS=4
+export VSH_ADAPTIVE_K_SET=1,2,3
+export VSH_ADAPTIVE_K_HIST=200
+export VSH_ADAPTIVE_K_DEBUG=0
+export VSH_ADAPTIVE_K_DEBUG_EVERY=25
+export VSH_ADAPTIVE_K_JSON=/home/davidcanar/vsh-adaptive-k.json
+export VSH_ADAPTIVE_K_FORCE=0
+export VSH_SYNC_INSTR=0

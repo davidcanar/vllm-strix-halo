@@ -1,6 +1,6 @@
 # vllm-strix-halo — GLM-5.3-Flash (and DeepSeek-V4-Flash) on 2× AMD Strix Halo, TP=2 over Thunderbolt
 
-> # STATUS 2026-10-01: GLM long-context FIXED at all tested lengths (up to the full 256K rated context, including adversarial); DS4 native port incomplete
+> # STATUS 2026-10-02: GLM long-context fixed; prefix-cache truncation fixed; decode is bandwidth-bound and measured to its limits
 >
 > **The GLM-5.3 long-context retrieval bug is fixed.** Four stacked fixes
 > (one upstream PR port + three local) took tail-retrieval from failing at
@@ -14,13 +14,32 @@
 > | 54K | FAIL | **PASS** (deterministic) |
 > | 75K | FAIL | **PASS** |
 > | 95–105K | FAIL | **PASS** |
-| 146K | — | **PASS** |
-| 204K | — | **PASS** |
-| 255K (max) | — | **PASS** |
+> | 146K | — | **PASS** |
+> | 204K | — | **PASS** |
+> | 255K (max) | — | **PASS** |
 > | adversarial 54K (1000× decoy) | FAIL | **PASS** |
 >
-> **Measured speeds (2026-10-01, GLM-5.3-Flash AWQ W4A16, TP=2, MTP k=3):**
-> prefill 400–2100 tok/s · decode 10.8–15.0 tok/s · spec acceptance length 2.7–3.0
+> **Prefix caching was losing a scheduler page on every hit** — the EAGLE
+> last-block drop was being applied to *all five* KV groups because the GLM
+> grouping path returns before the annotator runs. Fixed (§18), plus the
+> Mamba/KDA retention interval (§20): an identical 13.9K-token follow-up now
+> costs **0.95 s TTFT instead of 52 s** cold, and a prompt that used to get
+> *nothing* gets 2304 of its 2362 tokens back.
+>
+> **Measured speeds (2026-10-02, GLM-5.3-Flash AWQ W4A16, TP=2, MTP k=3):**
+> prefill **250–270 tok/s** cold (4000: 268, 13.9K: 261) · decode **9.1 tok/s
+> prose / 11.6 tok/s JSON** (2.0–2.6 accepted tokens per ~210–224 ms step) ·
+> TTFT on a cached 13.9K context **0.95 s**
+>
+> **Decode is weight-bandwidth-bound and the easy axes are exhausted.** A live
+> profile puts the GPU at **85 % busy** with no gap over 2 ms; 61 % of that time
+> is weight traffic already running at 80–87 % of the achieved ~200–215 GB/s.
+> The draft-length axis (k=1…4, one boot via the live override, §17), the drafter
+> choice (MTP k=3 vs DFlash2 k=3/k=7, matched A/B, §25), the host launch path
+> (§21) and the per-step host syncs (§22) have all been measured; none of them
+> has headroom left. What remains is the BF16 requant (**~+6 %**, §23) and the
+> prefill MoE tile regime at large M (41.5 % of prefill, ~12–18 % of achievable
+> FLOPS, never tuned).
 >
 > **DS4 (DeepSeek-V4-Flash) native port is incomplete**: prefill works at
 > ~213 tok/s but decode runs at 2–6 tok/s with degraded output quality. The
@@ -63,6 +82,17 @@ configuration lives in `~/vsh-config.yaml` (flat keys → `VSH_*` env vars).
 
 ## Current patch set
 
+### GLM-5.3 decode + cache fixes (2026-10-02)
+
+| patch | file | what it does |
+|---|---|---|
+| `vsh-glm53-apc-align.py` | `v1/core/kv_cache_coordinator.py` | The EAGLE last-block drop is resolved to *pure drafter* groups instead of upstream's "flag every group" fallback. On this model that is the empty set (the MTP layer shares group 0 with the target MLA layers), so MLA/KDA hits stop losing one scheduler page (2304 tokens) per lookup. Env `VSH_GLM53_APC_ALIGN`. §18 |
+| `vsh-apc-retention.py` | `host/vsh-manual-serve.sh` | Adds `--prefix-cache-retention-interval` (stock EngineArgs flag, `VSH_GLM53_APC_RETENTION=2304`). The stock default of 0 keeps only the latest replay boundary for the Mamba/KDA groups, which made the *first* identical repeat miss. §20 |
+| `vsh-adaptive-k.py` | `v1/core/sched/scheduler.py` | EMA policy for the verified draft-prefix length, wired for **async** scheduling (the v1 port hooked a function this build never calls) plus per-step telemetry and a live JSON override for one-boot k-sweeps. Installed, instrumented, **off** — the step time is draft-length independent and acceptance saturates near 2 tokens/step. §17 |
+| `vsh-triton-ptr-cache.py` | `triton/backends/amd/driver.c` | Memoises Triton's per-pointer `hipPointerGetAttribute`. Applied and validated bit-exact, **left off**: the call costs 0.5 µs, ~0.3 % of a step. §21 |
+| `vsh-sync-instr.py` | `third_party/.../ops/index.py` | Opt-in timer for the KDA chunk-index host sync. Off; that sync is on the chunked path only and the GPU is 99 % busy while it blocks. §22 |
+| `host/moe-configs/E=288,N=1024,device_name=AMD_Radeon_8060S.json` | tuned MoE tiles | The runtime asks for this name (no `dtype=` suffix) since the Sep-27 pin; the file deployed in September carried the suffix, so the tuning had been silently unused. Supplying it changes nothing measurable — the September sweep is stale, not lost. §23 |
+
 ### GLM-5.3 long-context fixes (2026-10-01)
 
 | patch | file | what it fixes |
@@ -81,8 +111,8 @@ configuration lives in `~/vsh-config.yaml` (flat keys → `VSH_*` env vars).
 
 ### gfx1151 platform fixes (2026-09-27)
 
-| patch | what it fixes |
-|---|---|
+| patch | file | what it fixes |
+|---|---|---|
 | `vsh-aiter-gfx1151-gate.patch` | Unlocks the AITER sparse-indexer/MLA ops on gfx1151 (CDNA-only gate hides them from Strix Halo) |
 | `vsh-fp8-fnuz-mqa.patch` | NVIDIA-style fp8 (e4nv) → ROCm-native fp8e4m3fnuz conversion at the MQA-logits seam |
 | `vsh-ds4-no-aiter-fp8-gfx1151.patch` | AITER fp8 block-scaled MM is MI300-only; gate it off so the stock Triton path works |
@@ -124,18 +154,30 @@ history.
   vLLM pinned at `73859fec`)
 - **Container**: `vllm-glm` (podman, shared by both models)
 - **KV cache**: 16 GiB pinned (`glm53_kv_bytes`), 256K max context
-- **Speculative decoding**: MTP k=3 (`glm53_mtp_tokens`), validated ~1.9×
+- **Speculative decoding**: MTP k=3 (`glm53_mtp_tokens`), validated ~1.9×.
+  DFlash2 k=7 is one config line away (`glm53_spec_method: dflash`) but is a
+  **wash on prose and slower on JSON** in a matched A/B; it only leads on
+  tool-call output (§25)
 - **Quantization**: AWQ W4A16 (compressed-tensors) for MoE experts; bf16 for
   KDA projections, MLA, and lm_head (checkpoint `ignore` list)
 
-## Measured performance (2026-10-01)
+## Measured performance (2026-10-02)
 
 | metric | GLM-5.3-Flash | DS4 (June stack) | DS4 (native 0.31) |
 |---|---|---|---|
-| prefill | 400–2100 tok/s | ~112–136 tok/s | ~213 tok/s |
-| decode | 10.8–15.0 tok/s | 19–24 tok/s | 2–6 tok/s ⚠️ |
-| spec acceptance | 2.7–3.0 | — | — |
-| long-context retrieval | ✅ to 105K+ | ✅ | ⚠️ untested |
+| prefill | 250–270 tok/s cold | ~112–136 tok/s | ~213 tok/s |
+| decode | 9.1 (prose) / 11.6 (JSON) tok/s | 19–24 tok/s | 2–6 tok/s ⚠️ |
+| spec acceptance | 2.0–2.6 tokens/step at k=3 | — | — |
+| TTFT, 13.9K context | 52 s cold → **0.95 s cached** | — | — |
+| long-context retrieval | ✅ to 255K | ✅ | ⚠️ untested |
+
+Measurement method and receipts: `scripts/vsh_ab.py` (matched A/B with
+engine-side step accounting and a tool-call gate), `scripts/vsh_bench.py`
+(per-request decode/TTFT with spec-decode and prefix-cache deltas),
+`scripts/trace_share.py` / `trace_gap_analyze.py` / `trace_dtoh.py` /
+`trace_sync.py` (kernel-class share, GPU duty cycle, copy inventory, blocking
+ops) and `scripts/bf16_bw.py` (linear bandwidth at the real weight shapes).
+All numbers above are medians of ≥2 boots or ≥5 repetitions.
 
 ⚠️ DS4 native decode is the open issue — output degenerates into repetition
 loops. All A/B eliminations (drafter patches, spec on/off, C4A gate, ragged
@@ -150,12 +192,15 @@ vllm-strix-halo/
 ├── vllm-strix-halo.sh       # supervisor launcher (glm53 | ds4)
 ├── vsh-config.yaml           # site config template
 ├── host/                     # host-side scripts (restart, serve, heal)
+│   └── moe-configs/          # tuned MoE tiles (both accepted filenames)
 ├── container/
 │   ├── Dockerfile            # image build (base + patches)
-│   └── patches/              # all reference copies of patched files
-│       ├── debug/            # instrumentation (inert, for future debugging)
-│       └── ds4-native-fixed-refs/  # DS4 native port curated refs
-├── PATCHES.md                # detailed patch history and lessons
+│   ├── patches/              # all reference copies of patched files
+│   │   ├── debug/            # instrumentation (inert, for future debugging)
+│   │   └── ds4-native-fixed-refs/  # DS4 native port curated refs
+│   └── pinned-vllm/          # byte-exact patched vllm files (rebuild input)
+├── scripts/                  # measurement harnesses (vsh_ab, vsh_bench, trace_*)
+├── PATCHES.md                # detailed patch history and lessons (§1–§25)
 └── README.md                 # this file
 ```
 
@@ -166,7 +211,20 @@ vllm-strix-halo/
    decode-side forward path. The June delegate engine works correctly.
 2. **GLM CUDA graphs** — parked since 2026-09-28 (first replay wedges the MTP
    drafter on hybrid attention backends). Typically 1.5–2× decode if fixed.
-3. **Upstream tracking** - the block-table granularity bug is upstream
+   Note for whoever retries: the KDA chunk-index host sync that blocks capture
+   is on the *chunked* (prefill-bearing) path only, not the pure-decode path
+   (§22), so the deadlock reproduction needs a mixed step.
+3. **Decode headroom: ~+6 % and no more.** 61 % of decode GPU time is weight
+   traffic at 80–87 % of achieved bandwidth. The only measured lever left is
+   quantizing the BF16 tensors (KDA/MLA projections + `lm_head`, 6.47 GB/rank
+   /step) to fp8 or W4A16 — `~+6 %` decode, `~+4 %` prefill, half a day of
+   checkpoint work plus real KDA precision risk. Do not use `lm_head` alone as
+   a probe (2.8 % of the step, inside the run-to-run spread). §23
+4. **Prefill is the remaining inefficiency** (does not move t/s, does move
+   TTFT): 41.5 % of prefill GPU time is the int4 MoE at ~12–18 % of achievable
+   FLOPS, and the tuned tile config only covers M≤512 while a prefill chunk
+   runs at M≈65 k rows. That regime has never been tuned.
+5. **Upstream tracking** - the block-table granularity bug is upstream
    #58858, with the fix in open PR #59412 (page-aligned kernel-block
    selection for pooled indexers). We posted independent gfx1151 validation
    data on the PR (deterministic dead zone at pool 7,295; an equivalent
@@ -176,9 +234,12 @@ vllm-strix-halo/
    is filed as #59741 with measured evidence and our force-tail mitigation.
    Once #59412 merges and we rebase, our gather-site expansion
    (`vsh-idx-bt-gather-v4-ops.py`) can be dropped.
-4. **Image rebuild** - done 2026-10-02. Both boxes carry committed
+6. **Image rebuild** - done 2026-10-02. Both boxes carry committed
    snapshots (`vllm-strix-halo:glm-longctx-fixed-20261002`,
    `ds4-vllm-patched:june-debug-20261002`). Reproducible rebuilds are wired:
-   `container/pinned-vllm/` holds the 22 modified `vllm/` files exported
+   `container/pinned-vllm/` holds the modified `vllm/` files exported
    byte-exact from the running container, and `container/Dockerfile` copies
-   them over the patched tree (valid for the pinned VLLM_COMMIT).
+   them over the patched tree (valid for the pinned VLLM_COMMIT). The
+   Triton-side patches (`vsh-triton-ptr-cache.py`) and the launcher-side
+   retention flag are not part of that copy — re-apply them with the scripts
+   in `container/patches/` after a rebuild.
