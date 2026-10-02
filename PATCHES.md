@@ -1363,3 +1363,58 @@ The flag is stock `EngineArgs` (`engine/arg_utils.py:576`), so **no vLLM patch
 is needed** — only the env-gated launcher plumbing
 (`vsh-apc-retention.py`, `VSH_GLM53_APC_RETENTION=2304`; the value must be a
 multiple of the scheduler block size, 2304 here). Unset = no flag = stock 0.
+
+## 21. The `hipPointerGetAttribute` hunt: root-caused, measured, and stood down
+
+**Where it comes from (proven, not inferred).** gdb on the live TP0 worker
+(`sudo gdb -p <worker> -ex "set solib-search-path <container-rootfs>/..."`,
+breakpoint on the symbol, 8/8 identical backtraces):
+
+```
+hipPointerGetAttribute
+  <- extractPointer()      triton/backends/amd/driver.c:715   (compiled into
+  <- launchKernel()        ~/.triton/cache/<hash>/hip_utils...so)
+  <- <python> vLLM op -> ray worker
+```
+
+`extractPointer` resolves every **pointer argument of every Triton kernel
+launch** with `hipPointerGetAttribute(..., HIP_POINTER_ATTRIBUTE_DEVICE_POINTER,
+ptr)`. The driver fetches that symbol through `hipGetProcAddress`, so an
+`LD_PRELOAD` interposer cannot see it — only the source can be patched.
+
+**What it actually costs: ~0.5 µs.** Measured three independent ways:
+
+| method | result |
+|---|---|
+| direct `ctypes` call on a real device pointer, 20 000 iterations | **0.50 µs/call** |
+| the profiler's own API table (`hipPointerGetAttribute` 113.4 ms / 137 335 calls) | **0.83 µs/call** |
+| the profiler *summary* table ("Self CUDA" 831.6 ms / 137 335 calls) | 6.06 µs/call ← **wrong** |
+
+So the 8.7 ms/step figure quoted in §13's profile table (and repeated in the
+2026-10-02 review) is **tracing overhead, not execution time**: ~1430 calls/step
+× 0.5 µs ≈ **0.7 ms/step, 0.3 %**. Every `hip*` row in that summary table is
+inflated the same way (each API call pays a profiler callback); the *kernel*
+rows are device timestamps and remain trustworthy.
+
+**A second correction from the same investigation.** Re-analysing the raw trace
+(`scripts/trace_gap_analyze.py`, 96-step window) shows the GPU **79 % busy**
+(9.07 s of merged kernel time in an 11.51 s span) with **no gap longer than
+2 ms**. The "GPU ~50 % idle" reading in the review came from comparing the
+profiler's *self* CUDA total (9.21 s) against an annotation CUDA total that
+double-counts nested regions (18.40 s) — not against wall time. Live decode is
+reproducible at **2.06 accepted tokens per 224 ms step = 9.2 tok/s**, confirmed
+engine-side (`generation_tokens_total` delta over the same window: 9.2 tok/s),
+so the client measurement was not understating anything.
+
+**Outcome.** The memoisation patch (`container/patches/vsh-triton-ptr-cache.py`,
+env `VSH_TRITON_PTR_CACHE=1`) is written, applied to box1's container, and
+validated bit-exact (`max_abs_err=0.00e+00` with the flag on and off) — but the
+honest verdict is **do not enable it**: 0.3 % is inside run-to-run noise and the
+change touches every kernel launch. It stays in the tree as a documented,
+reversible experiment.
+
+**Where that leaves the step time.** With the API rows debunked, the remaining
+non-kernel time in a 224 ms step is: the mamba/KDA `prepare_chunk_indices()
+.tolist()` sync (a true device→host round trip per step, upstream #51540) and
+the per-step host work that the trace shows as ~17 % API occupancy. That is what
+to attack next — not the launch path, and not the pointer lookups.
