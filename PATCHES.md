@@ -1525,3 +1525,52 @@ gain recorded in section 6 was against a stock configuration that the Sep-27
 pin no longer ships, so the September sweep is stale rather than lost. Keep the
 correctly named file (it is free and it is what any future sweep will overwrite)
 but do not count it as a win.
+
+## 24. DFlash2 k=7 vs MTP k=3, by workload: the drafter is fine, prose is just prose
+
+Section 15.6 closed the DFlash2 port at "parity, not the MiaAI 2.6x" and blamed
+the auxiliary-state convention, on the strength of a **k=7 acceptance of ~24 %**
+that looked like draft-depth collapse (the signature of a causal mask inside the
+draft block -- the failure the MiaAI kit warns about for `TRITON_ATTN`). This
+re-measures it per draft position, on two workloads, with the same prompt and
+the same client. Both boots are otherwise identical (APC fix on, retention 2304,
+MTP/DFlash as noted, k from `vsh-config.yaml`).
+
+| workload | drafter | drafts | draft tok | accepted/step | tok/step | decode tok/s |
+|---|---|---:|---:|---:|---:|---:|
+| structured (JSON) | MTP k=3 | 29 | 87 | 1.62-1.66 | **2.62-2.66** | 12.43 |
+| structured (JSON) | **DFlash2 k=7** | 48 | 336 | **1.94** | **2.94** | **18.24** |
+| prose | MTP k=3 | 123 | 369 | 0.85 | 1.85 | 8.41 |
+| prose | DFlash2 k=7 | 111 | 777 | 0.88-1.24 | 1.88-2.24 | 7.63-9.18 |
+
+**Per-position acceptance is the diagnostic, and it acquits the drafter:**
+
+```
+structured, DFlash k=7 : 30  21  14   9   8   7   4     (of 48 drafts)
+prose,      DFlash k=7 : 64  23  10   1   0   0   0     (of 111 drafts)
+```
+
+Positions 4-6 accept on structured output (8/7/4) -- a drafter with a causal
+mask inside its block could not do that. On prose the same positions accept
+zero: the block-parallel drafter has nothing to latch onto six tokens deep in
+unpredictable text, which is a property of the workload, not of the mask. So
+15.6's "draft-depth collapse" was a prose-only artefact, and the auxiliary
+states are exonerated.
+
+**What it means for the rig.** DFlash2 k=7 is the better drafter exactly where
+an agent workload spends its tokens -- structured/tool-call output: **2.94 vs
+2.62 tokens/step (+12 %) and 18.2 vs 12.4 tok/s (+47 %) on the same prompt**.
+On prose it is a wash (1.9-2.2 vs 1.9-2.1 tokens/step) and it costs ~10 % more
+per step plus 15 % of the KV pool (1,000,204 vs 1,183,680 tokens).
+
+Caveats before making it the default: the two structured runs generated
+different lengths (141 vs 72 tokens), the decode-rate gap is larger than the
+tokens/step gap (165 vs 210 ms/step, unexplained -- likely fewer distinct
+experts routed on the predictable JSON), and n=1 boot per arm. The next step is
+a matched-length, >=5-repetition A/B on real tool-call traffic, plus a k sweep
+for DFlash on prose (k=4-5 may keep the structured win without paying for seven
+drafts on prose). The adaptive-k machinery from section 17 is the natural place
+to switch depth per phase once that A/B lands.
+
+Switch: `glm53_spec_method: dflash` + `glm53_mtp_tokens: 7`. Production is left
+on MTP k=3, the validated default.
