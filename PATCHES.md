@@ -1574,3 +1574,42 @@ to switch depth per phase once that A/B lands.
 
 Switch: `glm53_spec_method: dflash` + `glm53_mtp_tokens: 7`. Production is left
 on MTP k=3, the validated default.
+
+## 25. DFlash2 vs MTP, matched A/B: the single-shot win was an artefact
+
+Section 24 proposed DFlash2 k=7 as the default on the strength of a single JSON
+probe (18.2 vs 12.4 tok/s, +47 %) and listed its caveats. This is the matched A/B
+that was needed to settle it: same prompts, same `max_tokens=200`, 5 reps per
+cell, medians, both arms booted back to back, and a step metric taken from the
+engine's own draft counter (HTTP chunks undercount steps -- one step can deliver
+several accepted tokens in one chunk, which is what inflated the earlier
+number).
+
+| workload | MTP k=3 | DFlash2 k=3 | DFlash2 k=7 |
+|---|---|---|---|
+| JSON output | 2.37 tok/step, 209 ms, **11.62 tok/s** | 2.20, 209 ms, 10.22 | 2.59, 239 ms, 9.83 |
+| tool calls | 2.53 tok/step, 226 ms, 11.34 | 2.66, 210 ms, **12.65** | 2.92, 253 ms, 11.71 |
+| prose | 2.01 tok/step, 220 ms, **9.14** | 1.92, 213 ms, 8.98 | 2.06, 243 ms, 8.37 |
+
+**Verdict: do not switch the default.** MTP k=3 wins JSON by 12-14 % and prose by
+2-9 %; DFlash k=3 wins the tool-call cell by 11.6 % but that cell's ranges
+overlap (MTP 10.16-13.77, DFlash 11.47-13.86 over n=5) and its JSON cost is the
+larger effect. The k=7 arm loses everywhere except the tool cell because the
+8-row verify batch costs 13-23 % more per step (209 -> 239 ms, 226 -> 253,
+220 -> 243) -- the step is *not* k-independent past k=4, which is where the
+earlier "+47 %" went.
+
+Per-position acceptance still stands as measured in section 24 (the drafter is
+healthy, positions 4-6 accept on structured output); what fails is the economics:
+the extra accepted tokens do not pay for the wider verify batch, and DFlash also
+costs KV (1,000,204 tokens at k=7 and 1,105,488 at k=3 against 1,183,680 for
+MTP).
+
+If someone wants to chase the tool-call cell anyway, the honest next step is a
+larger sample (>=20 reps) on real harness traffic, not a config flip: a single
+specialised cell at n=5 is not a default. A DFlash k=3 default would also need
+the JSON regression explained, and the only mechanism that captures both is the
+per-phase adaptive depth from section 17.
+
+**Production stays on MTP k=3.** Tooling added: `scripts/vsh_ab.py` (matched
+A/B with engine-side step accounting, tool-call gate optional).
