@@ -166,8 +166,19 @@ vllm-strix-halo/
    decode-side forward path. The June delegate engine works correctly.
 2. **GLM CUDA graphs** — parked since 2026-09-28 (first replay wedges the MTP
    drafter on hybrid attention backends). Typically 1.5–2× decode if fixed.
-3. **Upstream reporting** — the block-table granularity bug and the
-   force-tail approach are worth reporting upstream; they affect every ROCm
-   user of the GLM kpool indexer.
-4. **Image rebuild** — the container currently carries edits in its overlay;
-   a `podman commit` or Dockerfile rebuild would bake them in properly.
+3. **Upstream tracking** - the block-table granularity bug is upstream
+   #58858, with the fix in open PR #59412 (page-aligned kernel-block
+   selection for pooled indexers). We posted independent gfx1151 validation
+   data on the PR (deterministic dead zone at pool 7,295; an equivalent
+   gather-site table-expansion fix validated to the full 256K context).
+   The selection-side tail gap (config `always_select_tail` covers only the
+   <=3-token incomplete pool; recent complete pools can drop out of top-k)
+   is filed as #59741 with measured evidence and our force-tail mitigation.
+   Once #59412 merges and we rebase, our gather-site expansion
+   (`vsh-idx-bt-gather-v4-ops.py`) can be dropped.
+4. **Image rebuild** - done 2026-10-02. Both boxes carry committed
+   snapshots (`vllm-strix-halo:glm-longctx-fixed-20261002`,
+   `ds4-vllm-patched:june-debug-20261002`). Reproducible rebuilds are wired:
+   `container/pinned-vllm/` holds the 22 modified `vllm/` files exported
+   byte-exact from the running container, and `container/Dockerfile` copies
+   them over the patched tree (valid for the pinned VLLM_COMMIT).

@@ -172,6 +172,16 @@ RUN cd /opt/venv/lib/python3.12/site-packages && \
       /tmp/vsh-ds4-no-gateup-preshuffle-gfx1151.patch && \
     rm -f /tmp/vsh-*.patch
 
+# Authoritative full-file overlay for the pinned vLLM commit: the exact
+# vllm/ sources the production containers run, exported byte-exact from
+# vllm-strix-halo:glm-longctx-fixed-20261002 (podman diff vllm-glm,
+# 2026-10-02). These are the fixes in container/patches/ applied verbatim:
+# the GLM long-context set (#55222 port, gather-site block-table expansion,
+# force-tail 128, pool-aligned prefill subchunks), the DSV4 native port set,
+# and the gfx1151 gates. Overwrites whatever the .patch stage above produces.
+# Valid for the VLLM_COMMIT pin above only - re-derive after a rebase.
+COPY container/pinned-vllm/vllm/ /opt/venv/lib/python3.12/site-packages/vllm/
+
 # Drop stale bytecode for the touched package so the first import recompiles
 # from the patched sources.
 RUN find /opt/venv/lib/python3.12/site-packages/vllm \
