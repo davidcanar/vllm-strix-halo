@@ -1471,3 +1471,57 @@ analysers `scripts/trace_gap_analyze.py` (GPU busy vs idle, gap attribution),
 `scripts/trace_sync.py` (blocking-op worst cases). Those three scripts are what
 produced the corrections in sections 21 and 22, and they are the first thing to
 run before believing any host-side number from the profiler summary.
+
+## 23. Should we requant the BF16 tensors (the "Q8-attention" idea)? Measured: ~+6 %, and the tuned MoE config was stale
+
+**The question.** antirez's PR-1024 measuring stick requantized a KDA/attention
+checkpoint's BF16 tensors to Q8_0 and got decode 11.8 -> 19.0 t/s and prefill
+69/72/52 -> 146/140/122, because "on the official GGUF those BF16 tensors were
+more than half of the decode step". Our AWQ checkpoint has the same tensor class
+in BF16 (`self_attn.*` incl. KDA, the MLA projections and `lm_head`; only the
+routed experts are int4). So: what would it buy here?
+
+**What the tensors cost, measured three ways.**
+
+1. *Byte inventory* (per rank, per decode step, M=4): KDA projections
+   34 x (12576x4096 + 4096x4096) x 2 B = **4.64 GB**, MLA projections
+   11 x (2048x4096 + 4096x4096) x 2 B = **0.55 GB**, `lm_head` 1.27 GB ->
+   **6.47 GB per rank per step**.
+2. *Kernel bandwidth at those exact shapes* (`scripts/bf16_bw.py`, M=1..8):
+   the big tensors run at **192-204 GB/s** (KDA in-proj 0.51 ms, `lm_head`
+   6.2 ms) -- i.e. DRAM-bound, at the same rate the whole rig sustains. The
+   small ones (`o_proj` 367 GB/s, MLA 531-571 GB/s) are L2-inflated in a
+   microbenchmark and will not do that in-model, where every layer's weights are
+   read once per step.
+3. *Profile share*: bf16 dense GEMM = **27.7 ms of a 191.6 ms decode step
+   (29 % of GPU time, 14.5 % of the step)** and only **7.9 % of a prefill
+   window**.
+
+**So the answer is the byte-ratio one, not the pathological one.** Our BF16 path
+is *not* the C engine's: it is at roofline. Halving the bytes (fp8) gives
+3.24 GB -> ~15 ms and saves ~14 ms of a 224 ms step = **+6.3 %**; quartering
+them (int4) gives 1.62 GB but runs on the Triton wna16 path at ~95 GB/s
+(measured, see the MoE sweep), which is also **~+6 %**. Prefill gains ~4 %
+(7.9 % share, halved). That is the whole prize, and it is computable without
+touching the checkpoint -- which is the useful part: the half-day of requant
+surgery (plus the real precision risk on the KDA gates, which the checkpoint
+authors left BF16 deliberately) buys about a sixth of what DFlash is worth.
+
+**Do not use `lm_head` as the probe.** It is 1.27 GB = 6.2 ms/step = 2.8 % of the
+step, inside the +-4 % run-to-run spread measured on this rig today. A probe has
+to move at least the KDA class (4.64 GB, 9.6 %) to be readable.
+
+**Side find: the tuned MoE tile config had been silently unused since the
+Sep-27 pin bump.** The runtime builds the config filename as
+`E=..,N=..,device_name=..[,dtype=..].json` and now asks for the name *without*
+the dtype suffix, while the file deployed in September (and committed under
+`host/moe-configs/`) carries `,dtype=int4_w4a16`. Every boot since Sep-27 logged
+"Using default MoE config ... not found at ...8060S.json". Supplying the plain
+name (both boxes; the original file is left in place) makes it load --
+`fused_moe.py:1150 Using configuration from .../E=288,N=1024,device_name=AMD_Radeon_8060S.json`
+-- and the measured effect is **nil**: decode 8.66/8.94 tok/s and prefill
+268/261 tok/s, against 8.54/8.92 and 264-269/253-259 before. The +59 % decode
+gain recorded in section 6 was against a stock configuration that the Sep-27
+pin no longer ships, so the September sweep is stale rather than lost. Keep the
+correctly named file (it is free and it is what any future sweep will overwrite)
+but do not count it as a win.
