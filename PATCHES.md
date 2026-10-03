@@ -1816,3 +1816,93 @@ model is no longer writing into a corrupted context), and the tool-call cell
 gains most. `vsh-toolcall-failopen` is kept as defence in depth: it is inert
 unless a turn ends with an unterminated tool call, and it now has nothing to do
 in normal operation.
+
+## 28. Decode speed, round 1 (2026-10-03): power budget, fp8 BMM, router, split attention
+
+Starting point after §27: ~224 ms/step at short context, ~229 ms at ~3K
+(`scripts/stepbench.py`, thinking on, back-to-back requests). The plan and the
+corrected profile analysis are in [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md).
+
+| change | short ctx step | ~3K ctx step | tok/s (3K) |
+|---|---:|---:|---:|
+| baseline (§27 build) | 224 ms | 229 ms | 12.0 |
+| + iGPU SCLK cap 2100 MHz (28.1) | ~202 ms | -- | ~13.9 |
+| + `VLLM_ROCM_USE_AITER_FP8BMM=0` + packed-key router (28.2, 28.3) | **183 ms** | **192 ms** | 14.5 |
+| + split-KV decode attention (28.4) | 185 ms | 206 ms* | 16.7* |
+
+\* different generated text (3.45 vs 2.78 tok/step), so the 3K step is not
+directly comparable; the profile (below) is the receipt for 28.4.
+Prefill: 264-270 -> **283 tok/s** at 9.6K (28.1). Mid-context retrieval
+(§27 needle test) re-checked after each change: 3/3 at 6.8K, 13K and 32K.
+
+### 28.1 The CPU was clamped to 2.0 GHz during decode (`glm53_gpu_sclk_max`)
+
+The iGPU and CPU share one package power budget. Under decode the GPU runs at
+~2.4-2.5 GHz and the firmware drops **every CPU core to its 2.0 GHz floor**
+within ~5 s (temperatures 53-58 C: not thermal; governor/EPP/tuned are already
+`performance`). Steady-state decode is partly CPU-bound (Python launch path),
+so the first ~25 steps of a request after idle run at 188 ms and everything
+after at ~226 ms -- which is also why single runs disagreed (186 vs 224 ms) and
+why "thinking vs non-thinking" looked like a factor (it was run order).
+
+Capping the iGPU SCLK frees budget for the rest of the chip. Sweep (both boxes,
+same cap, 3K context, steady state):
+
+| cap MHz | 1500 | 1800 | 2000 | **2100** | 2200 | 2300 | 2400 | 2600 | 2900 (stock) |
+|---|---|---|---|---|---|---|---|---|---|
+| step ms | 244 | 219 | 206 | **202** | 205-212 | 226 | 227 | 226 | 229-234 |
+
+Prefill also improves (264-270 -> 283 tok/s at 9.6K): at 2.9 GHz the GPU is
+already power-throttled. New launcher knob `glm53_gpu_sclk_max: 2100`
+(`host/vsh-gpu-sclk.sh`, applied to both boxes in `vsh-cluster-restart.sh`;
+non-persistent sysfs `pp_od_clk_voltage`; `auto` restores stock). Re-sweep if
+the step becomes fully GPU-bound (graphs) -- the optimum will move up.
+
+### 28.2 `VLLM_ROCM_USE_AITER_FP8BMM=0`
+
+MLA's W_UK/W_UV absorption ran aiter's Triton fp8 BMM, emulated on RDNA3.5:
+~0.38 ms x 28 calls = 10.7 ms/step. Off -> plain bf16 `torch.bmm` (0.9 ms/step
+in the profile), more precise, and boot skips the 2x1024-shape precompile.
+Set in `vsh-cluster-env.odl.sh` (`VSH_GLM53_FP8BMM` overrides).
+
+### 28.3 Packed-key router top-k (`vsh-router-packed-topk.py`)
+
+The deterministic router's stable sort compiled, *in-model*, into one persistent
+Triton kernel at 2 workgroups x 32 threads: 242 us x 45 calls = ~10.9 ms/step.
+Replaced by `topk` over unique int64 keys (monotonic fp32 bits << 16 |
+65535 - index): bit-identical selection (600 random/tie/-inf cases; full
+`grouped_topk` ids and weights identical at M = 1/4/8/740), ~1 ms/step.
+
+### 28.4 Split-KV sparse decode attention (`vsh-sparse-attn-split.py`)
+
+Decode ran the sparse MLA attention through the prefill ragged kernel (one
+program per query x 16-head block: 8 workgroups at M=4). New flash-decoding
+split + combine for <=64 (query x head-block) programs:
+unit test max abs diff ~1e-3 (bf16 output rounding), 2.3x at M=4 / 2048 keys,
+3.9x at M=1; in-model at 3K: ~7.7 -> 4.0 ms/step. Gate `VSH_SPARSE_ATTN_SPLIT=0`.
+
+### Where the step is now (profile, ~3K context, all of the above)
+
+196.6 ms/step profiled, **GPU 90 % busy** (was 72 %): int4 routed MoE 89.8 ms
+(51 %), BF16 GEMV ~49 ms, MTP BF16 experts 8.4 ms, odl2 all-reduce waits 7.5 ms,
+mHC 4.3 ms, fp32 router gate 4.1 ms, sparse attention 4.0 ms, indexer logits
+0.45 ms (§27's reader; was ~16.7 ms with the fp8 copy + stage1 + head-sum).
+
+### Tried and parked: a Triton int4 MoE GEMV
+
+`container/patches/debug/vsh_moe_int4_gemv.py` (not installed): bit-correct
+(rel err 2e-3 = the stock kernel's bf16 rounding), but 0.6-0.9x the stock
+kernel in two formulations (broadcast-FMA spills registers on RDNA; a
+byte-once WMMA variant ~0.87x). Note the stock MoE kernel slowed 75.6 -> 85.3
+ms/step when SCLK dropped 2900 -> 2100: it is latency/ALU-bound, not
+bandwidth-bound, so the ~2x headroom is real -- but it needs a hand-written
+HIP kernel (wvSplitK-style), not more Triton.
+
+### Next
+
+1. CUDA graphs (README known issues #2): the step is now ~90 % GPU-busy, so
+   graphs mainly remove the remaining CPU-side gaps and protect against the
+   power-clamp; required before the CPU frequency stops mattering.
+2. HIP int4 MoE decode kernel (~90 ms -> ~45 ms target).
+3. 8-bit weights for the BF16 classes (~49 ms of GEMV -> ~25 ms; needs a W8A16
+   skinny kernel), lm_head x4 reads (draft vocab or Q8), MTP experts int4.

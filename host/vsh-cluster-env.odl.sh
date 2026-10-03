@@ -73,3 +73,8 @@ export VSH_SYNC_INSTR=0
 # when a tool call is emitted inside an unclosed reasoning span.
 export VSH_TOOLCALL_DROP_LOG=1
 export VSH_TOOLCALL_DROP_DIR=/tmp/vsh-toolcall-drops
+
+# MLA W_UK/W_UV absorption: aiter's triton fp8 BMM has no fp8 hardware on RDNA3.5
+# (emulated, ~0.38 ms x 28 calls = ~10.7 ms/step); 0 = plain bf16 torch.bmm.
+# Also skips the 2x1024-shape fp8-BMM precompile at boot. (PATCHES.md 28)
+export VLLM_ROCM_USE_AITER_FP8BMM=${VSH_GLM53_FP8BMM:-0}

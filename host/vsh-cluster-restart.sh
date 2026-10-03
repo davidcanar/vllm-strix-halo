@@ -72,6 +72,16 @@ echo "== containers =="
 box2 "\$HOME/container-heal.sh $CTR" 60 2>/dev/null | sed 's/^/   /'
 inbox true 20 >/dev/null 2>&1 || { echo "!! box1 $CTR container not exec-able"; exit 1; }
 box2 "podman exec $CTR true" 20 >/dev/null 2>&1 || { echo "!! box2 $CTR container not exec-able"; exit 1; }
+
+# iGPU clock cap (glm53_gpu_sclk_max). The Strix Halo iGPU and CPU share one
+# package power budget: at the stock 2.9 GHz the GPU starves the CPU (clamped
+# to 2.0 GHz during decode), and steady-state decode is partly CPU-bound.
+# Measured 2026-10-03 (PATCHES.md 28): 2100 MHz -> decode ~227 -> ~202 ms/step,
+# prefill +6 %. Non-persistent sysfs; "auto" restores stock.
+if [ -n "${VSH_GLM53_GPU_SCLK_MAX:-}" ]; then
+  "$HOME/vsh-gpu-sclk.sh" "$VSH_GLM53_GPU_SCLK_MAX" 2>&1 | sed 's/^/   gpu sclk box1: /'
+  box2 "\$HOME/vsh-gpu-sclk.sh $VSH_GLM53_GPU_SCLK_MAX" 30 2>&1 | sed 's/^/   gpu sclk box2: /'
+fi
 echo "   $CTR container exec-able on both boxes"
 
 echo "== ray =="

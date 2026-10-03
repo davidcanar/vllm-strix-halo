@@ -3568,6 +3568,16 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         "_rocm_sparse_attn_prefill_ragged_triton",
     )
 
+    # [vsh-sparse-attn-split] few query rows (decode / MTP verify): split the key range
+    import os as _vs_os
+    if num_queries * triton.cdiv(num_heads, 16) <= 64 and _vs_os.environ.get(
+        "VSH_SPARSE_ATTN_SPLIT", "1"
+    ) not in ("", "0", "off"):
+        from vllm.v1.attention.ops.vsh_sparse_attn_split import sparse_attn_ragged_split
+
+        return sparse_attn_ragged_split(
+            q, kv, indices, indptr, scale, attn_sink if has_attn_sink else None
+        )
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
     block_k = 16 if head_dim >= 256 else 32
