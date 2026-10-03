@@ -1771,3 +1771,48 @@ reasoning (recent tokens, always attended) stayed coherent.
 Tooling added: `scripts/midneedle.py` (mid-context retrieval, the test that
 discriminates this bug -- tail needles cannot), `scripts/needlepos.py`,
 `scripts/test_kpool_logits.py`, `scripts/test_prefill_logits.py`.
+
+### 27.1 Verification of section 27, and the decode numbers it was missing
+
+Section 26 concluded that the tool-call degeneration was a checkpoint-level
+deficiency. **That conclusion was wrong**, and this is the measurement that
+settles it: the same harness, the same captured requests, run against the
+containers carrying section 27's four fixes.
+
+| harness | before the four fixes | after |
+|---|---|---|
+| opencode's exact request (7 055-token prompt, 10 tools), 8 replays | ~30-40 % usable (4/6, 5/12, 2/6 across three samples) | **8/8 usable** |
+| the same request with a trivial user prompt, 6 replays | 0/4 usable | **6/6 usable** |
+
+Why the sparse-attention bugs produced exactly the symptom in section 26: in
+opencode's prompt the *tool-format instruction* -- the line that tells the
+model `<tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>` --
+sits at character 21 113 of a 30 931-character prompt, i.e. about 5 k tokens in,
+right inside the "dead zone past ~4 K tokens". The model was being asked to
+emit a format whose specification it could no longer read, so it guessed:
+Python calls, shell one-liners, markdown fences, `<parameter=name>` XML, mixed
+scripts. That also explains why every synthetic probe in section 26 (600-1 100
+token prompts, format spec well inside the healthy region) produced clean tool
+calls on the first try, and why disabling thinking, cutting the tool list or
+forcing k=1 changed nothing -- none of them touch the broken retrieval.
+
+**Decode, re-measured** (the section-27 open item; medians of 5, 200 tokens,
+same harness as the pre-fix baseline):
+
+| workload | before | after | delta |
+|---|---|---|---|
+| JSON output | 2.37 tok/step, 209 ms, 11.62 tok/s | 2.67 tok/step, 217 ms, **11.87 tok/s** | tok/step +12.7 %, rate +2.2 % |
+| tool calls | 2.53 tok/step, 226 ms, 11.34 tok/s | 2.95 tok/step, 226 ms, **13.07 tok/s** | tok/step +16.6 %, rate **+15.3 %** |
+| prose | 2.01 tok/step, 220 ms, 9.14 tok/s | 1.95 tok/step, 223 ms, 8.74 tok/s | within run-to-run spread |
+
+Prefill: a 4 683-token prompt now measures **279 tok/s** against 268 tok/s at the
+same size before (+4 %). The 16 028-token point (182 tok/s, 88 s TTFT) is not
+comparable to the earlier 13 879-token baseline (261 tok/s) because it is a
+different prompt crossing a chunk boundary -- re-measure at matched sizes before
+reading anything into it.
+
+The wins land where the fix applies: acceptance per step rises everywhere (the
+model is no longer writing into a corrupted context), and the tool-call cell
+gains most. `vsh-toolcall-failopen` is kept as defence in depth: it is inert
+unless a turn ends with an unterminated tool call, and it now has nothing to do
+in normal operation.
