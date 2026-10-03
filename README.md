@@ -165,6 +165,6 @@ vllm-strix-halo/
 7. **DS4 native decode** — repetition loops, 2–6 t/s. New lead: DS4's ratio-1/2
    indexer caches hit the same broken `stage1` fallback §27 fixed; the new
    reader covers that path — retest DS4 native before further bisection.
-8. **Image snapshots** — done 2026-10-03: `vllm-strix-halo:glm-perf32-20261003`
-   on both boxes (everything through §32; `:local` now points at it, so a
+8. **Image snapshots** — done 2026-10-03: `vllm-strix-halo:glm-perf33-20261003`
+   on both boxes (everything through §33; `:local` now points at it, so a
    recreated container gets the current stack).
