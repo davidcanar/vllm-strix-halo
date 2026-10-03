@@ -1956,6 +1956,32 @@ side), `lm_head` x4 reads (8.4 ms, still BF16), MTP layer-45 BF16 experts
 (8.0 ms; int4 would put them on the 28.5 kernel), fp32 router gate (6.7 ms),
 odl2 waits (7.6 ms).
 
+### 28.7 DFlash2 vs MTP, re-run on the fixed and faster stack: DFlash2 k=3 wins
+
+Section 25 kept MTP k=3 (DFlash2 k=3 ~parity, k=7 13-23 % costlier per step).
+Both inputs to that verdict changed: the sparse-attention bugs (§27) corrupted
+the context past ~4K tokens for any drafter, and §28.5-28.6 changed how step cost
+scales with verify rows and removed most of the BF16 cost. Same harness
+(`scripts/vsh_ab.py`, 5 reps, 220 tokens, medians), same build, one boot per arm:
+
+| arm | step ms | JSON tok/s | tool calls tok/s | prose tok/s |
+|---|---:|---:|---:|---:|
+| MTP k=3 | 126-128 | 18.88 | 20.13 | 15.96 |
+| **DFlash2 k=3** | **114-119** | **19.92** | **21.46** | **16.12** |
+| DFlash2 k=5 | 136-142 | 19.10 | 21.05 | 13.72 |
+| DFlash2 k=7 | 160-165 | 16.09 | 19.49 | 11.96 |
+
+DFlash2 k=3 correctness: §27 needles 3/3 (6.8K, 13K), opencode replay 3/3
+(k=7: 3/3 and 3/3 too). Its step is cheaper than MTP's because drafting is
+one forward of a small dense model instead of three MTP-layer forwards with
+BF16 experts and three lm_head reads; the extra verify rows of k=5/7 cost more
+than their extra accepted tokens. Memory: without the MTP layer, MemAvailable at
+boot is **16.6 GB** (MTP: 10.4 GB). `stepbench.py`: 110.5 ms/step short context
+(23.8 tok/s), 117.5 ms at 3K.
+
+Default changed: `glm53_spec_method: dflash`, `glm53_mtp_tokens: 3`
+(`glm5_next_mtp` reverts). The section 24/25 "corruption" was the section 27 family.
+
 ### Where the step is now (profile, ~3K context, 28.1-28.4, before 28.5)
 
 196.6 ms/step profiled, **GPU 90 % busy** (was 72 %): int4 routed MoE 89.8 ms
