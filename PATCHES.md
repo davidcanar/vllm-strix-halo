@@ -2084,3 +2084,48 @@ kernel launches 14 ms, mHC 10 ms. Further GPU work will not show until this
 shrinks. Next CPU levers: a streamlined decode MoE path (one fused
 sigmoid+bias+top-8+renorm routing kernel, HIP GEMVs called directly, no
 moe_align/Dynamo for M <= 8), then the mHC wrapper; or graphs (§29).
+
+## 31. Decode MoE host path: fused router + direct HIP MoE (2026-10-03)
+
+Follow-up to section 30's "the CPU is the floor" (MoE custom op ~963 us of host
+time per layer). Two pieces, both decode-only (<= 64 token-expert pairs) and
+both falling back to the stock path otherwise:
+
+1. **Fused routing kernel** (`vsh-fused-router.py`, `vsh_sigmoid_bias_topk` in
+   `libvsh_w8a16.so`, `VSH_FUSED_ROUTER`): `GroupedTopKRouter._compute_routing`
+   with sigmoid scoring, a correction bias and n_group == 1 (GLM-5.3) runs one
+   256-thread kernel -- sigmoid, +bias, top-8 by biased score, weights from the
+   unbiased scores, renormalise, x routed_scaling -- instead of the
+   torch.compile'd `grouped_topk` and its Dynamo guards. Unit test
+   (`scripts/test_fused_router.py`): ids identical 400/400, weights within 9e-8,
+   67 -> 10 us wall per call. Server: needles 3/3, replay 3/3, NLL in band;
+   steps 111-116 -> 108-113 ms.
+2. **Direct int4 MoE** (`vsh-moe-direct.py`, `vsh_moe_int4.direct_moe`,
+   `VSH_MOE_DIRECT`): `CompressedTensorsWNA16MoEMethod.apply` skips the modular
+   kernel (prepare/finalize, workspace sizing, config lookup, moe_align_block_size)
+   and issues three HIP launches: w13 with one workgroup column per (token, k)
+   slot, where the first slot holding an expert gathers every pair routed to it
+   and streams that expert's weights once (no alignment pass); w2 with
+   `silu(min(g, L)) * clamp(u, -L, L)` fused into its activation staging
+   (rounded to bf16 like `silu_and_mul_with_clamp`) and the router weight
+   applied; an fp32 top-k sum. Engages only for the plain config (TritonWNA16Experts,
+   symmetric int4 group 128, no EP/expert_map, no LoRA, sync prepare/finalize,
+   SILU with a clamp limit); the check is cached per layer. Unit test
+   (`scripts/test_moe_direct.py`) against the stock pipeline: within 1 bf16 ulp
+   (worst rel 0.0074, the same as Triton-vs-HIP), kernel time at parity.
+
+Result (DFlash2 k=3, production config):
+
+| | JSON | tools | prose |
+|---|---|---|---|
+| step, section 30 | 111 ms | 116 ms | 113 ms |
+| step, + fused router | 108 ms | 113 ms | 111 ms |
+| step, + direct MoE | **102 ms** | **107 ms** | **105 ms** |
+| tok/s, section 30 | 21.2 | 22.5 | 17.2 |
+| tok/s, now | 21.5 | **25.9** | 17.9 |
+
+(tok/s also carries acceptance noise: tokens/step 2.21 / 2.79 / 1.88.) Quality:
+NLL 2.2016 / 1.8058 / 0.9594 (section 30: 2.2012 / 1.8057 / 0.9594); needles 3/3
+at 6.8K and 13K; opencode replay 3/3. The step is now within ~4-9 ms of the
+section 30 GPU-busy figure (98.2 ms), so GPU-side work counts again. Remaining
+host levers: the mHC wrapper (~10 ms/step), model glue (~29 ms), graphs (section 29).

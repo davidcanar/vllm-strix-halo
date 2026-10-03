@@ -194,3 +194,66 @@ extern "C" int vsh_w32_gemv(void* stream, const void* W, const void* X, void* Y,
 #undef L32
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+
+// ---- fused MoE routing for sigmoid + correction-bias top-k (one expert group) ----
+// Matches vLLM grouped_topk(scoring="sigmoid", e_score_correction_bias, n_group=1)
+// with the deterministic selection order (biased score desc, expert index asc):
+// weights = unbiased sigmoid scores of the selected experts, renormalised, scaled.
+#define RT 256
+__global__ __launch_bounds__(RT) void sigmoid_bias_topk_kernel(
+    const float* __restrict__ logits, const float* __restrict__ bias, float* __restrict__ w_out,
+    int32_t* __restrict__ id_out, int E, int K, long ls, float scale, int renorm) {
+  __shared__ float biased[512];
+  __shared__ float orig[512];
+  __shared__ float red_v[RT / WS];
+  __shared__ int red_i[RT / WS];
+  __shared__ int sel[16];
+  const int row = blockIdx.x, t = threadIdx.x, lane = t % WS, wv = t / WS;
+  for (int e = t; e < E; e += RT) {
+    const float x = logits[(long)row * ls + e];
+    const float s = 1.0f / (1.0f + expf(-x));
+    orig[e] = s;
+    biased[e] = s + bias[e];
+  }
+  __syncthreads();
+  for (int k = 0; k < K; ++k) {
+    float bv = -INFINITY; int bi = 0x7fffffff;
+    for (int e = t; e < E; e += RT) {
+      const float v = biased[e];
+      if (v > bv || (v == bv && e < bi)) { bv = v; bi = e; }
+    }
+#pragma unroll
+    for (int off = WS / 2; off > 0; off >>= 1) {
+      const float ov = __shfl_xor(bv, off, WS); const int oi = __shfl_xor(bi, off, WS);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0) { red_v[wv] = bv; red_i[wv] = bi; }
+    __syncthreads();
+    if (t == 0) {
+      float v = red_v[0]; int i = red_i[0];
+      for (int w = 1; w < RT / WS; ++w)
+        if (red_v[w] > v || (red_v[w] == v && red_i[w] < i)) { v = red_v[w]; i = red_i[w]; }
+      sel[k] = i;
+      biased[i] = -INFINITY;
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    float sum = 0.f;
+    for (int k = 0; k < K; ++k) sum += orig[sel[k]];
+    const float inv = renorm ? 1.0f / sum : 1.0f;
+    for (int k = 0; k < K; ++k) {
+      w_out[(long)row * K + k] = orig[sel[k]] * inv * scale;
+      id_out[(long)row * K + k] = sel[k];
+    }
+  }
+}
+
+extern "C" int vsh_sigmoid_bias_topk(void* stream, const void* logits, const void* bias, void* w_out,
+                                     void* id_out, int M, int E, int K, long ls, float scale, int renorm) {
+  if (E > 512 || K > 16 || M < 1) return -1;
+  hipLaunchKernelGGL(sigmoid_bias_topk_kernel, dim3(M), dim3(RT), 0, (hipStream_t)stream,
+                     (const float*)logits, (const float*)bias, (float*)w_out, (int32_t*)id_out, E, K, ls,
+                     scale, renorm);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}

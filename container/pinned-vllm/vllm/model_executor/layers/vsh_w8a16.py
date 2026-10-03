@@ -133,3 +133,39 @@ def w32_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if rc != 0:
         raise RuntimeError(f"vsh_w32_gemv failed: {rc}")
     return y
+
+
+# ---- fused sigmoid + bias top-k routing (GroupedTopKRouter, n_group == 1) -------
+def route_ok(router_logits: torch.Tensor, bias, scoring_func: str, num_expert_group: int,
+             topk_group: int, top_k: int) -> bool:
+    return (os.environ.get("VSH_FUSED_ROUTER", "1") not in ("", "0", "off")
+            and scoring_func == "sigmoid" and bias is not None
+            and (num_expert_group in (0, 1) or topk_group == num_expert_group)
+            and router_logits.dtype == torch.float32 and router_logits.dim() == 2
+            and router_logits.stride(1) == 1 and 0 < router_logits.shape[0] <= 64
+            and router_logits.shape[1] <= 512 and top_k <= 16)
+
+
+_BIAS32 = {}
+
+
+def sigmoid_bias_topk(router_logits, bias, top_k, renormalize, scale):
+    m, e = router_logits.shape
+    b = _BIAS32.get(id(bias))
+    if b is None or b[0] is not bias:
+        b = (bias, bias.detach().float().contiguous())
+        _BIAS32[id(bias)] = b
+    w = torch.empty((m, top_k), dtype=torch.float32, device=router_logits.device)
+    ids = torch.empty((m, top_k), dtype=torch.int32, device=router_logits.device)
+    lib = _lib()
+    if not getattr(lib, "_rt_init", False):
+        lib.vsh_sigmoid_bias_topk.restype = ctypes.c_int
+        lib.vsh_sigmoid_bias_topk.argtypes = ([ctypes.c_void_p] * 5 + [ctypes.c_int] * 3
+                                              + [ctypes.c_long, ctypes.c_float, ctypes.c_int])
+        lib._rt_init = True
+    rc = lib.vsh_sigmoid_bias_topk(torch.cuda.current_stream().cuda_stream, router_logits.data_ptr(),
+                                   b[1].data_ptr(), w.data_ptr(), ids.data_ptr(), m, e, top_k,
+                                   router_logits.stride(0), float(scale), int(bool(renormalize)))
+    if rc != 0:
+        raise RuntimeError(f"vsh_sigmoid_bias_topk failed: {rc}")
+    return w, ids

@@ -338,6 +338,19 @@ class GroupedTopKRouter(BaseRouter):
                 )
             return topk_weights, topk_ids
 
+        # [vsh-fused-router] decode-sized sigmoid+bias routing in one HIP kernel (gfx1151)
+        if current_platform.is_rocm() and not rocm_aiter_ops.is_fused_moe_enabled():
+            from vllm.model_executor.layers import vsh_w8a16 as _vr
+
+            if _vr.route_ok(
+                router_logits, self.e_score_correction_bias, self.scoring_func,
+                self.num_expert_group, self.topk_group, self.top_k,
+            ):
+                return _vr.sigmoid_bias_topk(
+                    router_logits, self.e_score_correction_bias, self.top_k,
+                    self.renormalize, self.routed_scaling_factor,
+                )
+
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():
             if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():

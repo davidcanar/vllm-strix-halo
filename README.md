@@ -139,11 +139,14 @@ vllm-strix-halo/
 
 ## Known issues and next steps
 
-1. **Decode speed** — ~125–130 ms/step after §28. The profile was long
-   misread (two GPU streams halved every per-step figure; the rig is
-   CPU≈GPU-balanced — see [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md)).
-   Remaining: BF16 GEMV ~49 ms (8-bit weights + W8A16), MTP bf16 experts,
-   CUDA graphs. Projected ~95–110 ms/step if it all lands.
+1. **Decode speed** — 102–107 ms/step, 21.5 / 25.9 / 17.9 tok/s
+   (JSON / tools / prose, DFlash2 k=3) after §28–§31; 12 tok/s at the start.
+   Done: GPU clock cap, HIP int4 MoE, int8 BF16 linears (W8A16), int8
+   `lm_head`, split-KV sparse attention, fused router, direct decode MoE.
+   The step is ~4–9 ms above GPU busy (~98 ms), so GPU work counts again.
+   Remaining: router gate (BF16 weight / fp32 out, ~6 ms), mHC wrapper and
+   model glue on the host, CUDA graphs (2). See
+   [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md).
 2. **CUDA graphs** — blockers understood, not shipped: `odl_ar2` is
    graph-unsafe by design (host-side counter; needs a device-side counter),
    the KDA chunk-index sync is prefill-only (`FULL_DECODE_ONLY` keeps it
