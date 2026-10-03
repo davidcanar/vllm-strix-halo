@@ -2050,3 +2050,37 @@ are worth ~5-10 %, and they make later GPU savings land 1:1.
 
 Production stays eager (DFlash2 k=3, odl_ar2): 109.9 ms/step short context
 (24.3 tok/s), 116.9 ms at 3K (23.3 tok/s).
+
+## 30. GPU-side quick wins on the DFlash2 stack (2026-10-03) -- and the CPU is now the floor
+
+Profile of production (DFlash2 k=3, all of §27-§28) before this section: GPU busy
+107.6 ms/step. Three items:
+
+1. **DFlash2 drafter attention -> `TRITON_ATTN`** (`VSH_GLM53_DRAFT_ATTN`, default
+   `TRITON_ATTN` in `vsh-manual-serve.sh`; empty = vLLM default). The drafter's
+   non-causal 4-token block was running a prefill-style `_fwd_kernel` with 16
+   workgroups: 5 x 1.49 ms = 7.4 ms/step. Acceptance unchanged (tokens/step
+   2.33/2.63/1.82 vs 2.27/2.55/1.89, JSON/tools/prose), steps 3-4 ms cheaper:
+   JSON 19.9 -> 21.0, tools 21.5 -> 22.2 tok/s, prose within noise; needles 3/3.
+2. **int8 `lm_head`** (`vsh-gate-lmhead.py`, `VSH_W8A16_LMHEAD`): an int8 group-128
+   copy next to the BF16 weight (kept because the DFlash2 drafter shares the
+   module); target (4 rows) and drafter (3 rows) logits run the W8A16 GEMV.
+3. **fp32 router-gate GEMV** (`vsh_w32_gemv`, `VSH_ROUTER_GEMV`): written and unit
+   tested (rel err ~2e-6, 1.4-2.3x standalone) but it **does not engage** -- on
+   this pin the GLM gate weight is BF16 with an fp32 *output* (GateLinear tier 4,
+   hipBLASLt, 42 x 150 us = 6.4 ms/step); a BF16-weight/fp32-out variant is the
+   follow-up.
+
+Quality after 1+2: NLL 2.2012 / 1.8057 / 0.9594 (BF16 2.2141 / 1.8093 / 0.9596;
+int8-linears 2.1938 / 1.8068 / 0.9529) -- inside the band; needles 3/3 at 6.8K
+and 13K; opencode replay 3/3. A/B: JSON 21.2, tools 22.5, prose 17.2 tok/s.
+
+**GPU busy dropped 107.6 -> 98.2 ms/step, but the step did not move** (111-116
+ms): kernels now start ~0.3 ms after launch (empty queue) -- the CPU is the
+floor. Profiled CPU per step ~123 ms: MoE custom op 40 ms (963 us/layer: 387 us
+of Python between ops, 202 us in the torch.compile'd `grouped_topk` + 52 us of
+Dynamo guard lookups, 57 us router mm, 38 us moe_align), model glue 29 ms, raw
+kernel launches 14 ms, mHC 10 ms. Further GPU work will not show until this
+shrinks. Next CPU levers: a streamlined decode MoE path (one fused
+sigmoid+bias+top-8+renorm routing kernel, HIP GEMVs called directly, no
+moe_align/Dynamo for M <= 8), then the mHC wrapper; or graphs (§29).

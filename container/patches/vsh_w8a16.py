@@ -68,7 +68,7 @@ def eligible(layer: torch.nn.Module) -> bool:
 
 
 @torch.no_grad()
-def quantize_(layer: torch.nn.Module) -> None:
+def quantize_(layer: torch.nn.Module, keep_bf16: bool = False) -> None:
     w = layer.weight.data
     n, k = w.shape
     q = torch.empty((n, k), dtype=torch.int8, device=w.device)
@@ -84,7 +84,8 @@ def quantize_(layer: torch.nn.Module) -> None:
     layer.vsh_w8_s = s
     layer.vsh_w8_shape = (n, k)
     # free the BF16 copy (keep a 0-element parameter so attribute access still works)
-    layer.weight.data = torch.empty(0, dtype=torch.bfloat16, device=w.device)
+    if not keep_bf16:
+        layer.weight.data = torch.empty(0, dtype=torch.bfloat16, device=w.device)
     del w
 
 
@@ -108,3 +109,27 @@ def apply(layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None) ->
     if rc != 0:
         raise RuntimeError(f"vsh_w8_dequant failed: {rc}")
     return torch.nn.functional.linear(x, wt.to(x.dtype), bias)
+
+
+# ---- fp32 router gate GEMV (GateLinear on ROCm, fp32 weights) -------------------
+def w32_ok(weight: torch.Tensor, x: torch.Tensor) -> bool:
+    return (os.environ.get("VSH_ROUTER_GEMV", "1") not in ("", "0", "off")
+            and weight.dtype == torch.float32 and weight.ndim == 2 and weight.is_contiguous()
+            and weight.shape[1] in (2048, 3072, 4096, 6144, 7168)
+            and x.dtype == torch.bfloat16 and x.dim() == 2 and 0 < x.shape[0] <= MAX_ROWS)
+
+
+def w32_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    n, k = weight.shape
+    x = x.contiguous()
+    y = torch.empty((x.shape[0], n), dtype=torch.float32, device=x.device)
+    lib = _lib()
+    if not getattr(lib, "_w32_init", False):
+        lib.vsh_w32_gemv.restype = ctypes.c_int
+        lib.vsh_w32_gemv.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3 + [ctypes.c_long] * 2
+        lib._w32_init = True
+    rc = lib.vsh_w32_gemv(torch.cuda.current_stream().cuda_stream, weight.data_ptr(), x.data_ptr(),
+                          y.data_ptr(), n, k, x.shape[0], x.stride(0), y.stride(0))
+    if rc != 0:
+        raise RuntimeError(f"vsh_w32_gemv failed: {rc}")
+    return y

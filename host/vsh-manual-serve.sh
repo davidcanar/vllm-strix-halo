@@ -36,7 +36,11 @@ if [ "${VSH_GLM53_SPEC_METHOD:-glm5_next_mtp}" = "dflash" ]; then
   DRAFT=${VSH_GLM53_DRAFT_MODEL:-/home/davidcanar/models/GLM-5.3-Flash-DFlash2}
   KTOK=${VSH_GLM53_MTP_TOKENS:-7}
   [ "$KTOK" -gt 0 ] || KTOK=7
-  SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$KTOK}")
+  # drafter attention backend override (PATCHES 30); empty = vLLM default
+  DATTN=${VSH_GLM53_DRAFT_ATTN-TRITON_ATTN}
+  DATTN_JSON=""
+  [ -n "$DATTN" ] && DATTN_JSON=",\"attention_backend\":\"$DATTN\""
+  SPEC=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$KTOK$DATTN_JSON}")
   echo "[vsh-serve] DFlash2 speculative decoding ON (k=$KTOK, draft=$DRAFT)"
 elif [ "${VSH_GLM53_MTP_TOKENS:-0}" -gt 0 ]; then
   SPEC=(--speculative-config "{\"method\":\"glm5_next_mtp\",\"num_speculative_tokens\":${VSH_GLM53_MTP_TOKENS}}")

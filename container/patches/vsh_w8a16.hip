@@ -128,3 +128,69 @@ extern "C" int vsh_w8_dequant(void* stream, const void* W, const void* S, void* 
                      (const float*)S, (uint16_t*)out, total16, K);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+
+// ---- fp32-weight GEMV for the MoE router gate (fp32 weights, bf16 x, fp32 out) ----
+// One wave per output row; each lane reads 16 contiguous fp32 weights (4 x 16 B)
+// and 16 bf16 activations per step.
+template <int K, int MT>
+__global__ __launch_bounds__(WAVES * WS) void w32_gemv_kernel(
+    const float* __restrict__ W, const uint16_t* __restrict__ X, float* __restrict__ Y,
+    int N, int M, long sx, long sy) {
+  constexpr int STEP = WS * 16;
+  static_assert(K % STEP == 0, "K");
+  const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
+  const int n = blockIdx.x * WAVES + wave;
+  if (n >= N) return;
+  float acc[MT];
+#pragma unroll
+  for (int t = 0; t < MT; ++t) acc[t] = 0.f;
+  const float* wrow = W + (long)n * K;
+#pragma unroll 2
+  for (int it = 0; it < K / STEP; ++it) {
+    const int k0 = it * STEP + lane * 16;
+    const float4* p = (const float4*)(wrow + k0);
+    float4 w4[4] = {p[0], p[1], p[2], p[3]};
+    const float* w = (const float*)w4;
+#pragma unroll
+    for (int t = 0; t < MT; ++t) {
+      if (t >= M) break;
+      const uint4* xp = (const uint4*)(X + (long)t * sx + k0);
+      uint4 xa = xp[0], xb = xp[1];
+      const uint32_t xu[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+      float s = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        s += w[2 * j] * __uint_as_float(xu[j] << 16);
+        s += w[2 * j + 1] * __uint_as_float(xu[j] & 0xFFFF0000u);
+      }
+      acc[t] += s;
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int off = WS / 2; off > 0; off >>= 1) acc[t] += __shfl_xor(acc[t], off, WS);
+  if (lane == 0)
+    for (int t = 0; t < M; ++t) Y[(long)t * sy + n] = acc[t];
+}
+
+extern "C" int vsh_w32_gemv(void* stream, const void* W, const void* X, void* Y, int N, int K, int M,
+                            long sx, long sy) {
+  if (M < 1 || M > MMAX) return -1;
+  dim3 grid((N + WAVES - 1) / WAVES), block(WAVES * WS);
+  hipStream_t st = (hipStream_t)stream;
+#define L32(KK, MM) hipLaunchKernelGGL((w32_gemv_kernel<KK, MM>), grid, block, 0, st, (const float*)W, \
+      (const uint16_t*)X, (float*)Y, N, M, sx, sy)
+#define LK32(KK) do { if (M == 1) L32(KK, 1); else if (M <= 4) L32(KK, 4); else L32(KK, 8); } while (0)
+  switch (K) {
+    case 2048: LK32(2048); break;
+    case 3072: LK32(3072); break;
+    case 4096: LK32(4096); break;
+    case 6144: LK32(6144); break;
+    case 7168: LK32(7168); break;
+    default: return -2;
+  }
+#undef LK32
+#undef L32
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
