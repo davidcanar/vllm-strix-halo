@@ -111,8 +111,12 @@ if [ "${VSH_GLM53_ENFORCE_EAGER:-1}" != "1" ]; then
   # TEST 2026-10-02: cap capture sizes. Single-user decode never exceeds a few
   # seqs; the large end of the 35-size default list is where rank1 wedged in
   # KDA Triton launches during capture, and each size costs capture memory.
-  CGS=(--cudagraph-capture-sizes 1 2 4 8 16 24 32)
-  echo "[vsh-serve] capture sizes capped to 1..32"
+  # 2026-10-03 (PATCHES 29): single-user decode is 4 rows (k=3 verify); graph only
+  # pure-decode batches -- prefill-bearing steps stay eager (the KDA chunk-index
+  # host sync lives on that path, #51540).
+  CGS=(--cudagraph-capture-sizes ${VSH_GLM53_CG_SIZES:-1 2 4 8}
+       --compilation-config "{\"cudagraph_mode\": \"${VSH_GLM53_CG_MODE:-FULL_DECODE_ONLY}\"}")
+  echo "[vsh-serve] capture sizes ${VSH_GLM53_CG_SIZES:-1 2 4 8}, cudagraph_mode ${VSH_GLM53_CG_MODE:-FULL_DECODE_ONLY}"
   echo "[vsh-serve] enforce-eager OFF (CUDA graphs, breakable capture)"
 fi
 

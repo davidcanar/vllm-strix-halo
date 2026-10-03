@@ -2007,3 +2007,46 @@ HIP kernel (wvSplitK-style), not more Triton.
 2. HIP int4 MoE decode kernel (~90 ms -> ~45 ms target).
 3. 8-bit weights for the BF16 classes (~49 ms of GEMV -> ~25 ms; needs a W8A16
    skinny kernel), lm_head x4 reads (draft vocab or Q8), MTP experts int4.
+
+## 29. CUDA graphs, 2026-10-03 attempt: first graphed decode step hangs in an RCCL kernel (open)
+
+Launcher knobs added (inert while `glm53_enforce_eager: 1`): capture sizes
+`VSH_GLM53_CG_SIZES` (default `1 2 4 8`) and `VSH_GLM53_CG_MODE` (default
+`FULL_DECODE_ONLY`, so prefill-bearing steps -- the KDA chunk-index host sync of
+§11/§22 -- stay eager). Capture itself is fine: target FULL graphs 2/2 sizes and
+the DFlash2 drafter graphs capture in ~2 s, 0.4 GiB/rank (FULL_AND_PIECEWISE:
+1.7 GiB).
+
+**Every configuration tried hangs on the first graphed decode step** (warmup
+request): {DFlash2 k=3, spec off} x {FULL_DECODE_ONLY, FULL_AND_PIECEWISE} x
+{odl_ar2 on, off} x {the §27/§28 kernels on, all four off}. Evidence:
+
+* torch PG watchdog on both ranks: stuck at SeqNum 32 `_ALLGATHER_BASE`
+  (309 760 elements = 4 rows x 77 440 vocab: the logits all-gather right after
+  the target forward), last completed 31 -- symmetric, no PG divergence.
+* rocgdb on both workers (`info dispatches`): the GPU (100 % busy) is spinning in
+  `ncclDevKernel_Generic_4` on queue QID 3 with ~3 667 packets still queued
+  behind it on *both* ranks (read 4423/write 8090 vs 4415/8082) -- the same point
+  of identical graph replays, i.e. the ranks did not diverge; a collective inside
+  the replayed graph never completes.
+* Not the transport: standalone 2-rank RCCL over the same OdinLink net plugin
+  and env (`scripts/nccl_graph.py`, `nccl_graph2.py`) -- all-reduce captured in a
+  graph and replayed, and 30 x (graph of 50 all-reduces on comm A + eager
+  all-gather on comm B) -- all complete and correct.
+* Not the new kernels (hangs with VSH_MOE_INT4_HIP / W8A16 / SPARSE_ATTN_SPLIT /
+  KPOOL_PAGED_LOGITS all 0). The 2026-10-02 MTP-off graph success predates §27
+  (PR #59412 kernel-block change, force-tail boost, fp8max) and §28.2-28.3 --
+  those are the remaining bisection candidates, plus vLLM's pynccl path under
+  graph capture.
+
+Next steps, cheapest first: (1) bisect the remaining 10-02 -> now deltas with
+graphs on (59412 port first: it changes the MLA/indexer group's kernel block
+size); (2) `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=COLL` at capture to list each
+rank's captured collectives (op, count, comm); (3) the ds4-vllm approach -- an
+eager break around every TP all-reduce (`communication_op.py` wrapper), which
+keeps collectives out of graphs entirely and lets odl_ar2 serve them. Expected
+value once working: the step is CPU/GPU balanced at ~110-118 ms, so graphs alone
+are worth ~5-10 %, and they make later GPU savings land 1:1.
+
+Production stays eager (DFlash2 k=3, odl_ar2): 109.9 ms/step short context
+(24.3 tok/s), 116.9 ms at 3K (23.3 tok/s).
