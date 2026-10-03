@@ -1650,7 +1650,11 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
-        if _VSH_ADAPTIVE_K.boot_enabled or _VSH_ADAPTIVE_K.force_k:  # [vsh-adaptive-k]
+        if (  # [vsh-adaptive-k] the live JSON override counts as enabled too
+            _VSH_ADAPTIVE_K.boot_enabled
+            or _VSH_ADAPTIVE_K.force_k
+            or _VSH_ADAPTIVE_K.force() is not None
+        ):
             _ak_force = _VSH_ADAPTIVE_K.force()
             if _ak_force:
                 # Live override: pin the whole batch (k-sweep without a restart).

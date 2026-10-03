@@ -1613,3 +1613,68 @@ per-phase adaptive depth from section 17.
 
 **Production stays on MTP k=3.** Tooling added: `scripts/vsh_ab.py` (matched
 A/B with engine-side step accounting, tool-call gate optional).
+
+## 26. The degenerate tool-call mode: the model, not the rig
+
+Section 25's fail-open fix stopped the silent loss; this is what the salvaged
+text revealed about *why* it happens, and every configuration tested.
+
+**Symptom.** Roughly 30-40 % of turns produce a usable tool call. The rest end
+with `finish_reason=stop`, no tool call, and the model's attempt delivered as
+content (after the fix) or dropped (before). The reasoning text is always
+coherent; the *format* falls apart. Samples collected on the opencode prompt
+(10 tools, 7055 prompt tokens), short user request:
+
+    <tool_call>write</arg_key><arg_value>content</arg_key><arg_value>hello\n</arg_value>
+    <tool_call>bash$$\n<parameter=name>bash</parameter>\n<command>echo hello ...
+    <tool_call>writeXML\u200f=null_file\rplaceholderscript>
+    write("/tmp/snake-test/hello.txt", "hello")
+    bash -c 'echo hello > hello.txt' cwd=/tmp/snake-test
+    ```bash\necho "hello" > /tmp/snake-test/hello.txt\n```
+    <tool_call>write# Write hello.txt\n\nvoid main() {\n    print("hello");\n}
+    <tool_call>Write借助内容/file</think>文件已创建：hello.txt 包含单词 "hello"
+
+i.e. missing opening `<arg_key>` tags, invented dialects (Python call, C
+function, shell one-liner, markdown fence, `<parameter=name>` XML), mixed
+scripts, and false success claims. Occasionally a clean call.
+
+**What it is not** (each measured, same request, ~5 repetitions per arm):
+
+| hypothesis | test | result |
+|---|---|---|
+| output budget truncates the call | captured opencode request | `max_tokens=32000`, `stop=None` -- not it |
+| the reasoning span eats it | `chat_template_kwargs {thinking: false}` | same rate (2/6) |
+| the tool count overloads it | 2 tools vs 10 tools | 0/4 vs 2/4 -- not monotonic, not the lever |
+| spec-decode depth corrupts it | live `{"force": 1}` (verified 1.00 draft tok/step) | **worse**: 1/6 usable |
+| thinking effort | `reasoning_effort` low / high | 1/5 / 2/5 |
+| the prompt never states the format | rendered `chat_template.jinja` | it states it exactly: `<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...` |
+| a patched/substituted template | model dir mtimes | `chat_template.jinja` is the checkpoint's own (Sep 27 15:08); only `tokenizer_config.json` was touched (Sep 27 15:59, empty inline template -> external file) |
+
+**What it is.** A checkpoint-level deficiency in emitting this tool format. The
+model has the format in its prompt, at temperature 0, and still substitutes
+Python, C, shell, markdown and invented XML dialects for it a majority of the
+time, with coherent reasoning around it. Nothing in the serving stack selects
+those tokens.
+
+**Consequences and what to do.**
+  * Keep the fail-open patch (section 25): the attempt is delivered as content,
+    and a client (or a human) can act on it.
+  * The 12 k-token loops are the same failure: the model writes the whole file
+    into an `<arg_value>` it never closes, and with `max_tokens=32000` that is
+    ~20 minutes of GPU. Bound it client-side (opencode `limit.output` /
+    `maxTokens` ~8192 is ample for normal edits) -- it turns a 20-minute black
+    hole into a 5-minute one.
+  * The obvious cross-check -- the same model at a different quantization -- is
+    not available on this rig (the fp8/bf16 checkpoints do not fit, section 3),
+    so "AWQ W4A16 damage" versus "this checkpoint is weak at tool calls" cannot
+    be separated here. Worth testing on any box that can hold another build.
+  * MTP-off cannot be used as a control: it crashes the worker with an illegal
+    memory access. Note also that MTP-off changes `scheduler_block_size`
+    (2304 -> 2176), so `VSH_GLM53_APC_RETENTION` must be re-derived or the
+    coordinator refuses to start (`prefix_cache_retention_interval ... must be
+    a multiple of scheduler_block_size`).
+
+Tooling added: `scripts/loop_probe.py` (per-run capture plus a repetition
+score), `scripts/tool_count.py`, `scripts/effort_test.py`, `scripts/replay.py`
+(replay a captured request verbatim), `scripts/render_prompt.py` (render the
+tool prompt through the checkpoint's template).
