@@ -68,3 +68,8 @@ export VSH_ADAPTIVE_K_DEBUG_EVERY=25
 export VSH_ADAPTIVE_K_JSON=/home/davidcanar/vsh-adaptive-k.json
 export VSH_ADAPTIVE_K_FORCE=0
 export VSH_SYNC_INSTR=0
+
+# tool-call drop instrumentation (2026-10-02): dump text the parser discards
+# when a tool call is emitted inside an unclosed reasoning span.
+export VSH_TOOLCALL_DROP_LOG=1
+export VSH_TOOLCALL_DROP_DIR=/tmp/vsh-toolcall-drops
