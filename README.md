@@ -42,8 +42,8 @@
 > **Decode speed is not measured to its limits** (the earlier verdict rested on
 > halved per-step profile numbers and a GPU-bound misdiagnosis -- see Known
 > issues #1). After §28 (2026-10-03): ~183-185 ms/step at short context and
-> ~192-206 ms at ~3K (14.5-16.7 tok/s on the stepbench workload; was 12.0),
-> prefill 283 tok/s at 9.6K. GPU now ~90 % busy.
+> ~130 ms at ~3K with the HIP int4 MoE kernel (§28.5): **~22 tok/s** on the
+> stepbench workload (was 12.0), prefill 283 tok/s at 9.6K.
 >
 > **DS4 (DeepSeek-V4-Flash) native port is incomplete**: prefill works at
 > ~213 tok/s but decode runs at 2–6 tok/s with degraded output quality. The
@@ -224,9 +224,9 @@ vllm-strix-halo/
 
 1. **Decode speed (the main open item).** Round 1 landed (§28): GPU clock cap
    (power budget), bf16 MLA BMM, packed-key router, split-KV attention ->
-   ~183-206 ms/step (was ~224-229), GPU ~90 % busy. Remaining: int4 MoE ~90
-   ms/step (51 %, needs a HIP decode kernel), BF16 GEMV ~49 ms (8-bit weights),
-   graphs. The earlier "~+6 % and no more" verdict
+   ~183-206 ms/step, then the HIP int4 MoE decode kernel (§28.5, MoE 90 -> 37
+   ms) -> ~125-130 ms/step, ~22 tok/s. Remaining: BF16 GEMV ~49 ms (8-bit
+   weights + W8A16 kernel), MTP BF16 experts 8 ms, graphs. The earlier "~+6 % and no more" verdict
    (§21-§23) rested on two measurement errors, corrected in
    [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md): the profiler annotates each step on two GPU
    streams, so every per-step kernel figure was halved (the int4 MoE is

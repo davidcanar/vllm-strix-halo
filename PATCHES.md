@@ -1881,7 +1881,44 @@ split + combine for <=64 (query x head-block) programs:
 unit test max abs diff ~1e-3 (bf16 output rounding), 2.3x at M=4 / 2048 keys,
 3.9x at M=1; in-model at 3K: ~7.7 -> 4.0 ms/step. Gate `VSH_SPARSE_ATTN_SPLIT=0`.
 
-### Where the step is now (profile, ~3K context, all of the above)
+### 28.5 HIP int4 MoE decode kernel (`vsh-moe-int4-hip.py`) -- the big one
+
+`container/patches/vsh_moe_int4.hip` (+ `vsh_moe_int4.py` ctypes wrapper,
+built with `hipcc --offload-arch=gfx1151 -O3 -shared -fPIC`): a wvSplitK-style
+GEMV for symmetric int4 / group-128 MoE weights in the layout the stock kernel
+uses (`B[E][N][K/2]`, `S[E][N][K/128]`, moe_align blocks). One workgroup =
+(expert block, 32 output rows), 8 wave32s x 4 rows; each lane streams 16
+contiguous packed bytes per step, the block's tokens are staged once in LDS,
+fp32 accumulate, shuffle reduce. Routed from `invoke_fused_moe_wna16_triton_kernel`
+for <= 64 (token, expert) pairs; anything else stays on Triton.
+Gate `VSH_MOE_INT4_HIP=0`.
+
+Unit test (`container/patches/debug/test_moe_gemv.py`, real shapes, 48 experts
+to fit memory): rel err 2.4e-3 vs stock (= the stock kernel's bf16 rounding of
+the dequantised weights; this kernel accumulates in fp32), and
+
+| case | stock Triton | HIP | |
+|---|---:|---:|---:|
+| M=1 w13 (N 2048, K 4096) | 0.493 ms, 70 GB/s | 0.166 ms, **208 GB/s** | 2.97x |
+| M=4 w13 (MTP verify) | 1.517 ms, 71 GB/s | 0.666 ms, 162 GB/s | 2.28x |
+| M=4 w2 (N 4096, K 1024) | 0.705 ms | 0.283 ms, 191 GB/s | 2.49x |
+| M=8 w13 | 2.069 ms | 0.978 ms | 2.12x |
+
+In model (profile, ~3K context): routed MoE **89.8 -> 37.3 ms/step**.
+End to end (`stepbench.py`): **185 -> 125 ms/step at short context, 192-206 ->
+130 ms at ~3K: 22.0-22.3 tok/s** (was 12.0 at the start of section 28).
+Correctness: §27 needles 3/3 (6.8K, 13K), opencode replay 4/4 valid tool calls.
+SCLK cap re-swept after this change: 1800-2100 MHz all 127-133 ms, 2400 154 ms,
+2900 183 ms -- the cap matters *more* now (less GPU work, larger CPU share);
+2100 kept (best for prefill).
+
+Remaining (profile): BF16 GEMV ~49 ms/step (40 % of GPU time) -> 8-bit weights
++ a W8A16 kernel of the same shape as this one; MTP layer-45 BF16 experts
+8.4 ms (requant to int4 and they ride this kernel); odl2 waits 6.7 ms; mHC
+4.4 ms; fp32 router gate 4.3 ms; sparse attention 4.0 ms. CPU is now close
+behind the GPU (launch->start median 5-24 ms), so graphs come back into play.
+
+### Where the step is now (profile, ~3K context, 28.1-28.4, before 28.5)
 
 196.6 ms/step profiled, **GPU 90 % busy** (was 72 %): int4 routed MoE 89.8 ms
 (51 %), BF16 GEMV ~49 ms, MTP BF16 experts 8.4 ms, odl2 all-reduce waits 7.5 ms,
