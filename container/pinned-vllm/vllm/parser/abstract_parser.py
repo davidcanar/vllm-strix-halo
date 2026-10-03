@@ -32,6 +32,43 @@ def _vsh_drop_log(text: str | None, where: str) -> None:
         pass
 # -----------------------------------------------------------------------------
 
+# [vsh-toolcall-failopen] ------------------------------------------------------
+_VSH_TOOL_CALL_START = "<tool_call>"
+
+
+def _vsh_failopen_enabled() -> bool:
+    import os
+
+    return os.environ.get("VSH_TOOLCALL_FAILOPEN", "1") not in ("", "0", "off")
+
+
+def _vsh_salvage_unterminated_tool_call(
+    delta_message, state, logger_
+):
+    """Emit a never-surfaced tool call as content instead of dropping it."""
+    if not _vsh_failopen_enabled() or getattr(state, "vsh_tool_call_emitted", False):
+        return delta_message
+    raw = getattr(state, "vsh_raw_text", "") or ""
+    idx = raw.find(_VSH_TOOL_CALL_START)
+    if idx == -1:
+        return delta_message
+    salvaged = raw[idx:]
+    if not salvaged.strip():
+        return delta_message
+    if delta_message is None:
+        delta_message = DeltaMessage()
+    if delta_message.tool_calls:
+        # a partial call is already visible to the client; nothing is lost
+        return delta_message
+    delta_message.content = (delta_message.content or "") + salvaged
+    logger_.warning(
+        "vsh-toolcall-failopen: recovered %d chars of an unterminated tool "
+        "call as content (no tool call was surfaced)",
+        len(salvaged),
+    )
+    return delta_message
+# -----------------------------------------------------------------------------
+
 from openai.types.responses import ToolChoiceFunction
 from pydantic import TypeAdapter, ValidationError
 from xgrammar import Grammar, StructuralTag
@@ -95,6 +132,10 @@ class StreamState:
     # tracks whether function name has been fully returned in the stream yet
     function_name_returned: bool = False
     engine_based: bool = False
+    # [vsh-toolcall-failopen] raw text of this stream, and whether a tool
+    # call was ever handed to the client
+    vsh_raw_text: str = ""
+    vsh_tool_call_emitted: bool = False
 
     def advance(
         self,
@@ -802,6 +843,11 @@ class DelegatingParser(Parser):
                     delta_message = DeltaMessage()
                 delta_message.content = (delta_message.content or "") + promoted
 
+        # [vsh-toolcall-failopen]
+        delta_message = _vsh_salvage_unterminated_tool_call(
+            delta_message, state, logger
+        )
+
         self._append_unstreamed_tool_args(delta_message)
         return delta_message
 
@@ -852,6 +898,10 @@ class DelegatingParser(Parser):
                 )
 
         current_text, current_token_ids = state.advance(delta_text, delta_token_ids)
+        # [vsh-toolcall-failopen] keep the raw text: engine-based parsers
+        # consume it and never hand it back, so this is the only copy left
+        # if the turn ends mid tool call.
+        state.vsh_raw_text = state.vsh_raw_text + (delta_text or "")
         # [vsh-toolcall-drop-log] the turn ended while still inside the
         # reasoning span: if the model emitted tool-call markup there, the
         # tool parser never saw it. Persist it before the request goes away.
@@ -954,6 +1004,10 @@ class DelegatingParser(Parser):
             and not self._in_tool_call_phase(state)
         ):
             delta_message = DeltaMessage(content=delta_text)
+
+        # [vsh-toolcall-failopen]
+        if delta_message is not None and delta_message.tool_calls:
+            state.vsh_tool_call_emitted = True
 
         state.commit(current_text, current_token_ids)
 
