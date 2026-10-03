@@ -2129,3 +2129,25 @@ NLL 2.2016 / 1.8058 / 0.9594 (section 30: 2.2012 / 1.8057 / 0.9594); needles 3/3
 at 6.8K and 13K; opencode replay 3/3. The step is now within ~4-9 ms of the
 section 30 GPU-busy figure (98.2 ms), so GPU-side work counts again. Remaining
 host levers: the mHC wrapper (~10 ms/step), model glue (~29 ms), graphs (section 29).
+
+## 32. Router gate: bf16-weight / fp32-out GEMV (2026-10-03)
+
+The follow-up from section 30 item 3. GLM-5.3's MoE gate on this pin is a BF16
+weight [288, 4096] with an fp32 output, so `GateLinear` takes tier 4
+(`torch.mm(out_dtype=fp32)` -> hipBLASLt `Cijk_..._BSS_BH`), ~150 us per layer in
+the server profile. `vsh-gate-bf16.py` inserts a ROCm branch in front of tier 4:
+for <= 8 bf16 rows, `vsh_w8a16.w16_gemv` -> `vsh_w16_gemv` in `libvsh_w8a16.so`
+(4 waves per output row, 16 contiguous bf16 weights per lane per step, fp32
+accumulate, LDS reduction of the 4 partials). `VSH_ROUTER_GEMV=0` disables it.
+
+Unit test (`scripts/test_gate_bf16.py`, M = 1..8, three shapes): max error vs
+fp64 ~4e-7, against ~3e-5 for the hipBLASLt epilogue, so it is *more* exact than tier 4;
+288 x 4096, M=4: GPU 51.3 -> 6.6 us, wall 42 -> 9 us per call. A forward-level
+check confirmed the branch engages with the gate's tier-4 flags.
+
+Server (DFlash2 k=3): NLL 2.2015 / 1.8001 / 0.9627 (band); needles 3/3 at 6.8K
+and 13K; replay 3/3. Steps 102 / 107 / 105 -> **101 / 106 / 104 ms**; tok/s
+22.8 / 24.8 / 18.5 (JSON / tools / prose; tokens/step 2.32 / 2.63 / 1.93).
+Only ~1 ms of the ~6 ms of GPU time shows up in the step: the rig is still
+partly host-bound (mHC wrapper, model glue, launches), so the remaining levers
+are host-side or graphs (section 29).

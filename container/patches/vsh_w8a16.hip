@@ -195,6 +195,86 @@ extern "C" int vsh_w32_gemv(void* stream, const void* W, const void* X, void* Y,
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
+// ---- bf16-weight GEMV with fp32 output (MoE router gate: bf16 W, bf16 x) ----------
+// GateLinear tier 4 (torch.mm out_dtype=fp32 -> hipBLASLt) costs ~150 us for a
+// 288 x 4096 gate at decode. SPLIT waves per output row, each lane reads 16
+// contiguous bf16 weights (2 x 16 B) per step; partials reduced through LDS.
+#define W16_SPLIT 4
+template <int K, int MT>
+__global__ __launch_bounds__(WAVES * WS) void w16_gemv_kernel(
+    const uint16_t* __restrict__ W, const uint16_t* __restrict__ X, float* __restrict__ Y,
+    int N, int M, long sx, long sy) {
+  constexpr int STEP = WS * 16 * W16_SPLIT;
+  static_assert(K % STEP == 0, "K");
+  constexpr int RPB = WAVES / W16_SPLIT;            // output rows per block
+  __shared__ float part[WAVES][MT];
+  const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
+  const int r = wave / W16_SPLIT, sp = wave % W16_SPLIT;
+  const int n = blockIdx.x * RPB + r;
+  float acc[MT];
+#pragma unroll
+  for (int t = 0; t < MT; ++t) acc[t] = 0.f;
+  if (n < N) {
+    const uint16_t* wrow = W + (long)n * K;
+#pragma unroll 2
+    for (int it = 0; it < K / STEP; ++it) {
+      const int k0 = it * STEP + (sp * WS + lane) * 16;
+      const uint4* p = (const uint4*)(wrow + k0);
+      const uint4 wa = p[0], wb = p[1];
+      const uint32_t wu[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        if (t >= M) break;
+        const uint4* xp = (const uint4*)(X + (long)t * sx + k0);
+        const uint4 xa = xp[0], xb = xp[1];
+        const uint32_t xu[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          s += __uint_as_float(wu[j] << 16) * __uint_as_float(xu[j] << 16);
+          s += __uint_as_float(wu[j] & 0xFFFF0000u) * __uint_as_float(xu[j] & 0xFFFF0000u);
+        }
+        acc[t] += s;
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int off = WS / 2; off > 0; off >>= 1) acc[t] += __shfl_xor(acc[t], off, WS);
+  if (lane == 0)
+#pragma unroll
+    for (int t = 0; t < MT; ++t) part[wave][t] = acc[t];
+  __syncthreads();
+  if (sp == 0 && lane < M && n < N) {
+    float s = 0.f;
+#pragma unroll
+    for (int q = 0; q < W16_SPLIT; ++q) s += part[r * W16_SPLIT + q][lane];
+    Y[(long)lane * sy + n] = s;
+  }
+}
+
+extern "C" int vsh_w16_gemv(void* stream, const void* W, const void* X, void* Y, int N, int K, int M,
+                            long sx, long sy) {
+  if (M < 1 || M > MMAX) return -1;
+  constexpr int RPB = WAVES / W16_SPLIT;
+  dim3 grid((N + RPB - 1) / RPB), block(WAVES * WS);
+  hipStream_t st = (hipStream_t)stream;
+#define L16(KK, MM) hipLaunchKernelGGL((w16_gemv_kernel<KK, MM>), grid, block, 0, st, (const uint16_t*)W, \
+      (const uint16_t*)X, (float*)Y, N, M, sx, sy)
+#define LK16(KK) do { if (M == 1) L16(KK, 1); else if (M <= 4) L16(KK, 4); else L16(KK, 8); } while (0)
+  switch (K) {
+    case 2048: LK16(2048); break;
+    case 4096: LK16(4096); break;
+    case 6144: LK16(6144); break;
+    case 8192: LK16(8192); break;
+    default: return -2;
+  }
+#undef LK16
+#undef L16
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
 // ---- fused MoE routing for sigmoid + correction-bias top-k (one expert group) ----
 // Matches vLLM grouped_topk(scoring="sigmoid", e_score_correction_bias, n_group=1)
 // with the deterministic selection order (biased score desc, expert index asc):

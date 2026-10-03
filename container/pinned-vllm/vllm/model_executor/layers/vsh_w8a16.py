@@ -135,6 +135,32 @@ def w32_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return y
 
 
+# ---- bf16-weight router gate GEMV, fp32 out (GateLinear tier 4 on ROCm) ----------
+def w16_ok(weight: torch.Tensor, x: torch.Tensor) -> bool:
+    return (os.environ.get("VSH_ROUTER_GEMV", "1") not in ("", "0", "off")
+            and weight.dtype == torch.bfloat16 and weight.ndim == 2 and weight.is_contiguous()
+            and weight.shape[1] in (2048, 4096, 6144, 8192)
+            and x.dtype == torch.bfloat16 and x.dim() == 2 and x.stride(1) == 1
+            and 0 < x.shape[0] <= MAX_ROWS)
+
+
+def w16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    n, k = weight.shape
+    if x.stride(0) % 8:
+        x = x.contiguous()
+    y = torch.empty((x.shape[0], n), dtype=torch.float32, device=x.device)
+    lib = _lib()
+    if not getattr(lib, "_w16_init", False):
+        lib.vsh_w16_gemv.restype = ctypes.c_int
+        lib.vsh_w16_gemv.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3 + [ctypes.c_long] * 2
+        lib._w16_init = True
+    rc = lib.vsh_w16_gemv(torch.cuda.current_stream().cuda_stream, weight.data_ptr(), x.data_ptr(),
+                          y.data_ptr(), n, k, x.shape[0], x.stride(0), y.stride(0))
+    if rc != 0:
+        raise RuntimeError(f"vsh_w16_gemv failed: {rc}")
+    return y
+
+
 # ---- fused sigmoid + bias top-k routing (GroupedTopKRouter, n_group == 1) -------
 def route_ok(router_logits: torch.Tensor, bias, scoring_func: str, num_expert_group: int,
              topk_group: int, top_k: int) -> bool:

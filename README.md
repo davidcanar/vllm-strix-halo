@@ -139,14 +139,14 @@ vllm-strix-halo/
 
 ## Known issues and next steps
 
-1. **Decode speed** — 102–107 ms/step, 21.5 / 25.9 / 17.9 tok/s
-   (JSON / tools / prose, DFlash2 k=3) after §28–§31; 12 tok/s at the start.
+1. **Decode speed** — 101–106 ms/step, 22.8 / 24.8 / 18.5 tok/s
+   (JSON / tools / prose, DFlash2 k=3) after §28–§32; 12 tok/s at the start.
    Done: GPU clock cap, HIP int4 MoE, int8 BF16 linears (W8A16), int8
-   `lm_head`, split-KV sparse attention, fused router, direct decode MoE.
-   The step is ~4–9 ms above GPU busy (~98 ms), so GPU work counts again.
-   Remaining: router gate (BF16 weight / fp32 out, ~6 ms), mHC wrapper and
-   model glue on the host, CUDA graphs (2). See
-   [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md).
+   `lm_head`, split-KV sparse attention, fused router, direct decode MoE,
+   bf16 router-gate GEMV. The step sits a few ms above GPU busy and GPU
+   savings only partly land (§32: ~6 ms of GPU time → ~1 ms of step), so the
+   rest is host-side: the mHC wrapper, model glue, launches, or CUDA graphs (2).
+   See [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md).
 2. **CUDA graphs** — blockers understood, not shipped: `odl_ar2` is
    graph-unsafe by design (host-side counter; needs a device-side counter),
    the KDA chunk-index sync is prefill-only (`FULL_DECODE_ONLY` keeps it
@@ -166,6 +166,6 @@ vllm-strix-halo/
 7. **DS4 native decode** — repetition loops, 2–6 t/s. New lead: DS4's ratio-1/2
    indexer caches hit the same broken `stage1` fallback §27 fixed; the new
    reader covers that path — retest DS4 native before further bisection.
-8. **Image snapshots predate §27/§28** — commit fresh `podman commit`
-   snapshots on both boxes; the running containers and `pinned-vllm/` are
-   current.
+8. **Image snapshots** — done 2026-10-03: `vllm-strix-halo:glm-perf32-20261003`
+   on both boxes (everything through §32; `:local` now points at it, so a
+   recreated container gets the current stack).

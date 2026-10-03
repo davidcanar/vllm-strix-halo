@@ -226,6 +226,12 @@ class GateLinear(ReplicatedLinear):
             output = bf16x3_router_gemm(x, self.weight)
             return self._return(output)
 
+        # [vsh-gate-bf16] ROCm bf16-weight/fp32-out router GEMV for decode-sized batches
+        if self.allow_cublas_router_gemm and current_platform.is_rocm():
+            from vllm.model_executor.layers import vsh_w8a16 as _w8
+
+            if _w8.w16_ok(self.weight, x):
+                return self._return(_w8.w16_gemv(x, self.weight))
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
