@@ -293,7 +293,10 @@ __global__ __launch_bounds__(RT) void sigmoid_bias_topk_kernel(
     const float x = logits[(long)row * ls + e];
     const float s = 1.0f / (1.0f + expf(-x));
     orig[e] = s;
-    biased[e] = s + bias[e];
+    // NaN ranks highest (as in torch.topk), so garbage inputs -- e.g. the dummy
+    // batches of CUDA-graph warmup -- still yield valid, distinct expert ids.
+    const float b = s + bias[e];
+    biased[e] = b != b ? INFINITY : b;
   }
   __syncthreads();
   for (int k = 0; k < K; ++k) {

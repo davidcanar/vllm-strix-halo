@@ -139,19 +139,18 @@ vllm-strix-halo/
 
 ## Known issues and next steps
 
-1. **Decode speed** — 101–106 ms/step, 22.8 / 24.8 / 18.5 tok/s
-   (JSON / tools / prose, DFlash2 k=3) after §28–§32; 12 tok/s at the start.
-   Done: GPU clock cap, HIP int4 MoE, int8 BF16 linears (W8A16), int8
-   `lm_head`, split-KV sparse attention, fused router, direct decode MoE,
-   bf16 router-gate GEMV. The step sits a few ms above GPU busy and GPU
-   savings only partly land (§32: ~6 ms of GPU time → ~1 ms of step), so the
-   rest is host-side: the mHC wrapper, model glue, launches, or CUDA graphs (2).
-   See [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md).
-2. **CUDA graphs** — blockers understood, not shipped: `odl_ar2` is
-   graph-unsafe by design (host-side counter; needs a device-side counter),
-   the KDA chunk-index sync is prefill-only (`FULL_DECODE_ONLY` keeps it
-   eager), drafter metadata rebuild can stay eager. Graphs alone are worth
-   ~0–10 %; their value is making every later GPU fix land 1:1.
+1. **Decode speed** — 96–100 ms/step, 26.5 / 28.5 / 19.9 tok/s
+   (JSON / tools / prose, DFlash2 k=3, CUDA graphs) after §28–§33; 12 tok/s
+   at the start. Done: GPU clock cap, HIP int4 MoE, int8 BF16 linears
+   (W8A16), int8 `lm_head`, split-KV sparse attention, fused router, direct
+   decode MoE, bf16 router-gate GEMV, piecewise CUDA graphs. Remaining
+   levers: the mHC wrapper and model glue on the host, fewer eager breaks
+   per layer. See [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md).
+2. **CUDA graphs** — on by default since §33: PIECEWISE breakable capture,
+   every TP collective an eager break (odl_ar2 serves them as in eager
+   mode). FULL modes still hang on the first replay (RCCL inside the graph,
+   §29); root cause not isolated. The first request after a boot can stall
+   ~2 min on Triton JIT. Revert with `glm53_enforce_eager: 1`.
 3. **MTP-off crashes rank 1** on first generation (§26) — likely the §27
    page-aliasing bug at the changed block geometry; retest now that #59412 is
    ported. Gates the MTP-off graph bench.

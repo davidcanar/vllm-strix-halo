@@ -2008,7 +2008,7 @@ HIP kernel (wvSplitK-style), not more Triton.
 3. 8-bit weights for the BF16 classes (~49 ms of GEMV -> ~25 ms; needs a W8A16
    skinny kernel), lm_head x4 reads (draft vocab or Q8), MTP experts int4.
 
-## 29. CUDA graphs, 2026-10-03 attempt: first graphed decode step hangs in an RCCL kernel (open)
+## 29. CUDA graphs, 2026-10-03 attempt: first graphed decode step hangs in an RCCL kernel (resolved by section 33)
 
 Launcher knobs added (inert while `glm53_enforce_eager: 1`): capture sizes
 `VSH_GLM53_CG_SIZES` (default `1 2 4 8`) and `VSH_GLM53_CG_MODE` (default
@@ -2151,3 +2151,51 @@ and 13K; replay 3/3. Steps 102 / 107 / 105 -> **101 / 106 / 104 ms**; tok/s
 Only ~1 ms of the ~6 ms of GPU time shows up in the step: the rig is still
 partly host-bound (mHC wrapper, model glue, launches), so the remaining levers
 are host-side or graphs (section 29).
+
+## 33. CUDA graphs work: PIECEWISE breakable capture, TP collectives eager (2026-10-03)
+
+Resolves section 29. In FULL modes (`FULL_DECODE_ONLY`, `FULL_AND_PIECEWISE`)
+the breakable wrapper deliberately disables every eager break
+(`eager_break_during_capture` returns straight into the op when the runtime
+mode is FULL), so the whole forward -- including the TP all-reduces over RCCL --
+is one graph, and its first replay hangs inside `ncclDevKernel` (section 29). The root
+cause of that RCCL-in-graph hang was not isolated (standalone RCCL graphs over
+the same plugin work); this sidesteps it instead of fixing RCCL:
+
+1. **`vsh-cg-eager-collectives.py`** (`distributed/parallel_state.py`):
+   `GroupCoordinator.all_reduce / all_gather / reduce_scatter`, when called inside
+   an active *breakable* capture (not FULL), end the current graph segment, run
+   the collective eagerly -- odl_ar2 for decode sizes, exactly as in eager mode --
+   and record a replay step that re-runs it and copies into the capture-time
+   result tensor (a fixed address the next segment was captured against).
+   Outside a breakable capture nothing changes. `VSH_CG_EAGER_COLLECTIVES=0`
+   disables.
+2. **`glm53_cg_mode: PIECEWISE`** (new passthrough `VSH_GLM53_CG_MODE` in
+   `vsh-cluster-restart.sh`; the default in it and in `vsh-manual-serve.sh` is now
+   PIECEWISE) with `glm53_enforce_eager: 0`. Capture sizes stay `1 2 4 8`;
+   capture takes ~2 s and 1.56 GiB per rank (target + DFlash2 drafter).
+3. **Fused-router NaN bug found by the graph warmup**: the dummy batches of
+   capture warmup feed uninitialised hidden states, and with NaN logits the
+   section 31 `sigmoid_bias_topk` kernel never selected anything -- it wrote
+   expert id 0x7fffffff (and out of LDS), and the direct MoE kernel then faulted
+   (`HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION`, rank 1, first boot). NaN now ranks
+   highest (as in `torch.topk`), so ids are always valid and distinct
+   (`scripts/test_fused_router_nan.py`: all-NaN / partial-NaN / inf / garbage;
+   finite inputs unchanged). Real decode inputs never hit this, so eager
+   production was not affected.
+
+Result (DFlash2 k=3):
+
+| | JSON | tools | prose |
+|---|---|---|---|
+| step, eager (section 32) | 101 ms | 106 ms | 104 ms |
+| step, PIECEWISE graphs | **96 ms** | **100 ms** | **98 ms** |
+| tok/s, graphs | 26.5 | 28.5 | 19.9 |
+
+(tokens/step 2.57 / 2.86 / 1.96 -- acceptance noise inflates the tok/s gain; the
+step is the clean number, -5 to -6 ms.) Quality: NLL 2.1948 / 1.8068 / 0.9520;
+needles 3/3 at 6.8K and 13K; opencode replay 3/3; image input fine (9.1 s for the
+448x448 probe vs 12 s eager). The first request after a boot can stall ~2 min
+while Triton JIT-compiles graph-mode kernel variants (rank 1 logged
+`FusedQKVRMSNormKernel`, `rotary_kernel`); later requests and later boots hit the
+cache. Revert: `glm53_enforce_eager: 1`.

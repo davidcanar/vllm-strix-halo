@@ -118,9 +118,12 @@ if [ "${VSH_GLM53_ENFORCE_EAGER:-1}" != "1" ]; then
   # 2026-10-03 (PATCHES 29): single-user decode is 4 rows (k=3 verify); graph only
   # pure-decode batches -- prefill-bearing steps stay eager (the KDA chunk-index
   # host sync lives on that path, #51540).
+  # 2026-10-03 (PATCHES 33): FULL modes hang on the first replay (RCCL inside the
+  # graph); PIECEWISE breakable capture with every TP collective as an eager
+  # break (vsh-cg-eager-collectives) works: 96-100 ms/step vs 101-106 eager.
   CGS=(--cudagraph-capture-sizes ${VSH_GLM53_CG_SIZES:-1 2 4 8}
-       --compilation-config "{\"cudagraph_mode\": \"${VSH_GLM53_CG_MODE:-FULL_DECODE_ONLY}\"}")
-  echo "[vsh-serve] capture sizes ${VSH_GLM53_CG_SIZES:-1 2 4 8}, cudagraph_mode ${VSH_GLM53_CG_MODE:-FULL_DECODE_ONLY}"
+       --compilation-config "{\"cudagraph_mode\": \"${VSH_GLM53_CG_MODE:-PIECEWISE}\"}")
+  echo "[vsh-serve] capture sizes ${VSH_GLM53_CG_SIZES:-1 2 4 8}, cudagraph_mode ${VSH_GLM53_CG_MODE:-PIECEWISE}"
   echo "[vsh-serve] enforce-eager OFF (CUDA graphs, breakable capture)"
 fi
 
