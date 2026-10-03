@@ -1614,7 +1614,7 @@ per-phase adaptive depth from section 17.
 **Production stays on MTP k=3.** Tooling added: `scripts/vsh_ab.py` (matched
 A/B with engine-side step accounting, tool-call gate optional).
 
-## 26. The degenerate tool-call mode: the model, not the rig
+## 26. The degenerate tool-call mode (SUPERSEDED by section 27: it was the rig)
 
 Section 25's fail-open fix stopped the silent loss; this is what the salvaged
 text revealed about *why* it happens, and every configuration tested.
@@ -1678,3 +1678,96 @@ Tooling added: `scripts/loop_probe.py` (per-run capture plus a repetition
 score), `scripts/tool_count.py`, `scripts/effort_test.py`, `scripts/replay.py`
 (replay a captured request verbatim), `scripts/render_prompt.py` (render the
 tool prompt through the checkpoint's template).
+
+## 27. Long-context sparse attention was broken past ~4K tokens (four stacked bugs) -- fixed; Issue B was this, not the checkpoint
+
+**Correction to section 26.** The degenerate tool-call mode was not a
+checkpoint deficiency. Above `index_topk` (2048 tokens) GLM-5.3's DSA
+attention only sees the 512 kpool pools the indexer selects, and on this rig
+that selection -- and the index cache it reads -- were broken in four
+independent ways. The model could not look back at the tool schema at the top
+of a 7K-token opencode prompt, so it improvised formats while the local
+reasoning (recent tokens, always attended) stayed coherent.
+
+### Receipts
+
+| test | before | after |
+|---|---|---|
+| 3 watchwords at 25/50/75 % of a 13K prompt (`scripts/midneedle.py`, 3 seeds) | **0/3** each, 3000-token budget exhausted, not even found in the reasoning | **3/3** each, exact, 124-158 tokens |
+| same at 6.8K (single prefill chunk) | right needle, wrong digits | 3/3 exact (3 seeds) |
+| same at 32K | -- | 3/3 exact |
+| 1.7K control (no selection) | 3/3 | 3/3 |
+| opencode captured request, `scripts/replay_n.py 6` | ~2/6 usable tool calls | **6/6**, ~1000 tokens each, short reasoning |
+
+### The four bugs, in the order the data exposed them
+
+1. **fp8 overflow to NaN** (`vsh-idx-fp8max-fnuz.py`). gfx1151's
+   `fp8_dtype()` is e4m3fn (max 448); the kpool writer quantized with
+   `FP8_MAX = 448`, and our `pa_mqa_logits.py` overlay converted the cache to
+   e4m3fnuz (max 240) -- a non-saturating cast, so every value above 240 became
+   NaN (CPU-verified: 256..448 -> nan). Fix: quantize to 224 (vLLM's own fnuz
+   max) on ROCm+e4m3fn. Made moot for decode by fix 2, kept for safety.
+
+2. **Wrong decode reader** (`vsh-kpool-paged-logits.py` +
+   `vsh_kpool_paged_logits.py`). gfx1151 fell through to aiter's
+   `deepgemm_fp8_paged_mqa_logits_stage1`, a block_size==1 reader: it indexed
+   the page table per *pool position* and read the first 128 bytes of a page as
+   a pool row, while the GLM cache is paged (64 pools/page, 16x16 SHUFFLE values
+   + trailing fp32 scales). GPU unit test with the production writer
+   (`scripts/test_kpool_logits.py`): top-512 overlap with ground truth **0.32-0.35
+   (= random for 1500 pools)**; with the bounded page table it even
+   memory-faulted. New Triton reader decodes e4m3fn bits in-kernel, reads the
+   real layout: overlap 1.000, max rel err 9e-8; live, logits match a torch
+   reference on the real cache to ~1e-5. Also removes the 12.6 ms/step
+   whole-pool `float8_copy`. Gate `VSH_KPOOL_PAGED_LOGITS=0`.
+   (The prefill path was verified correct by `scripts/test_prefill_logits.py`.)
+
+3. **Page aliasing in the index cache** (`59412-pooled-indexer-kernel-blocks.py`
+   = port of upstream PR #59412, fixes #58858). On ROCm the indexer backend
+   advertised `[1, MultipleOf(16)]`, so the kernel block stayed at the hybrid
+   manager block while writer and readers address 64-pool pages. Live, 13K
+   prompt: **17 valid table columns for 51 needed pages**; the slots written for
+   pools 3261..3264 were 61, 62, 63, 0 -- every pool past ~1088 (token ~4.3K)
+   was written to and read from page 0, overwriting each other. This is what
+   the "every pool scored exactly 0" / pool-7,295 dead zone was. With the PR the
+   block table is page-granular; `vsh-idx-bt-gather-v4-ops.py`'s gather-site
+   expansion becomes inert (drop it when rebasing onto #59412).
+
+4. **Force-tail evicted selected pools at random**
+   (`vsh-idx-force-tail-boost.py`). `_force_recent_tail_pools` wrote the 128
+   most recent pools over the last 128 top-k columns, assuming they were the
+   lowest-ranked; the top-k output is not sorted, so ~1/4 of the selected pools
+   were discarded. Live: all needle pools selected, only 6/10 needle tokens
+   attended -> digits copied wrong. Fix: boost the recent pools' logits before
+   top-k (same guarantee, nothing evicted). Live after: 10/10, 9/9, 9/9 needle
+   tokens attended, zero duplicate pools.
+
+### Consequences for earlier sections
+
+* Section 26 is superseded: keep the fail-open patch (section 25), but the
+  "AWQ damage vs checkpoint weakness" question no longer needs a second
+  quantization -- the model calls tools fine once it can see the prompt.
+* Section 15.8's long-context tool failures, the >2K greedy nondeterminism and
+  the needle results that only passed for *tail* needles (the force-tail made
+  the tail visible while selection was random) all belong to this family.
+  Re-measure them.
+* Section 26's MTP-off "illegal memory access": PR #59412 notes the same
+  aliasing writes past the row buffer at other block geometries, and MTP-off
+  changes the scheduler block (2304 -> 2176). Likely the same bug; untested.
+* Performance: decode no longer runs the whole-pool fnuz conversion
+  (~12.6 ms/step). Not yet re-benchmarked.
+
+### Leftovers worth cleaning (not changed here)
+
+* The prefill path carries **ungated** debug logging from the 2026-09/10 hunt
+  (`/tmp/glm_scores.log`, `glm_topk.log`, `glm_gather.log`, `glm_kpool.log`,
+  `glm_map.log`, `glm_idxplan.log`), each with host syncs; they grow without
+  bound (MBs per session).
+* Debug-only, inert unless a flag file exists in the container:
+  `container/patches/debug/vsh-kpl-diag.py` (`touch /tmp/vsh_kpl_diag` -> live
+  selection check) and `debug/vsh-kpl-hook.py` (execs `/tmp/vsh_kpl_hook.py`
+  with the decode locals; `scripts/vsh_kpl_hook*.py` are the probes used above).
+
+Tooling added: `scripts/midneedle.py` (mid-context retrieval, the test that
+discriminates this bug -- tail needles cannot), `scripts/needlepos.py`,
+`scripts/test_kpool_logits.py`, `scripts/test_prefill_logits.py`.

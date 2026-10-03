@@ -54,6 +54,24 @@ def _force_recent_tail_pools(pool_ids, visible_pools, k=_FORCE_TAIL_POOLS):
     pool_ids[:, n - k :] = tail.clamp_min(0)
 
 
+# [vsh-idx-force-tail-boost]
+def _boost_recent_tail_logits(logits, row_start, row_end, k=_FORCE_TAIL_POOLS):
+    """Make each row's last ``k`` visible pools win top-k (no post-hoc overwrite)."""
+    if k <= 0 or logits.numel() == 0:
+        return
+    rows = logits.shape[0]
+    ke = row_end.reshape(-1).to(torch.int64)
+    if ke.shape[0] != rows:
+        ke = ke.repeat_interleave(max(rows // max(ke.shape[0], 1), 1))[:rows]
+    ks = row_start.reshape(-1).to(torch.int64) if row_start is not None else torch.zeros_like(ke)
+    if ks.shape[0] != rows:
+        ks = ks.repeat_interleave(max(rows // max(ks.shape[0], 1), 1))[:rows]
+    lo = torch.maximum(ke - int(k), ks)
+    cols = torch.arange(logits.shape[1], device=logits.device, dtype=torch.int64)
+    mask = (cols[None, :] >= lo[:, None]) & (cols[None, :] < ke[:, None])
+    logits.masked_fill_(mask, 3.0e38)
+
+
 # kpool write helper: form pools from the current token batch and compress them
 # into the index K cache via the fused Triton kernel.
 
@@ -414,6 +432,10 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
+            if index_kpool > 1:
+                _boost_recent_tail_logits(
+                    logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
+                )
             torch.ops._C.top_k_per_row_prefill(
                 logits,
                 chunk.cu_seqlen_ks,
@@ -427,7 +449,6 @@ def sparse_attn_indexer_kpool(
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
-                _force_recent_tail_pools(pool_ids, chunk.cu_seqlen_ke)
                 if positions is not None:
                     # Fused expand-pools + append-tail into one Triton kernel
                     # (replaces ~25 elementwise ops). seq_len is token-granular
@@ -667,6 +688,8 @@ def sparse_attn_indexer_kpool(
         else:
             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
+        if index_kpool > 1:
+            _boost_recent_tail_logits(logits, None, seq_lens)
         torch.ops._C.top_k_per_row_decode(
             logits,
             next_n,
@@ -678,6 +701,43 @@ def sparse_attn_indexer_kpool(
             select_k,
         )
 
+        # [vsh-kpl-hook] debug: exec /tmp/vsh_kpl_hook.py (if present) with the decode locals
+        import os as _vh_os
+        if _vh_os.path.exists("/tmp/vsh_kpl_hook.py"):
+            try:
+                exec(open("/tmp/vsh_kpl_hook.py").read(), globals(), dict(locals()))
+            except Exception as _vh_e:
+                with open("/tmp/vsh_kpl_hook.err", "a") as _f:
+                    _f.write(repr(_vh_e) + chr(10))
+        # [vsh-kpl-diag]
+        import os as _vd_os
+        if index_kpool > 1 and _vd_os.path.exists("/tmp/vsh_kpl_diag"):
+            try:
+                import vllm.v1.attention.ops.vsh_kpool_paged_logits as _vkm
+                _vd_n = getattr(_vkm, "_vd_n", 0) + 1
+                _vkm._vd_n = _vd_n
+                _sl = seq_lens.reshape(-1)
+                _v0 = int(_sl[0])
+                if _v0 >= 1024 and _vd_n % 32 == 0:
+                    _ref = _vkm.kpool_paged_mqa_logits_ref(
+                        padded_q_quant_cast[:1], kv_cache,
+                        padded_weights[: next_n], seq_lens[:1],
+                        decode_metadata.block_table[:1], max_pool_len)
+                    _r0 = _ref[0, :_v0]
+                    _kk = min(select_k, _v0)
+                    _a = set(_r0.topk(_kk).indices.tolist())
+                    _b = set(x for x in pool_topk[0].tolist() if 0 <= x < _v0)
+                    _lg = logits[0, :_v0].float()
+                    with open("/tmp/vsh_kpl_diag.log", "a") as _f:
+                        _f.write("call=%d new_reader_calls=%d rows=%d next_n=%d vis0=%d sel_overlap=%.3f "
+                                 "logit_maxdiff=%.3e nan=%d sel_min=%d sel_max=%d\n" % (
+                                 _vd_n, getattr(_vkm, "_calls", -1), num_rows, next_n, _v0,
+                                 len(_a & _b) / max(1, _kk),
+                                 float((_lg - _r0).abs().nan_to_num(1e30).max()),
+                                 int(_lg.isnan().sum()), min(_b) if _b else -1, max(_b) if _b else -1))
+            except Exception as _e:
+                with open("/tmp/vsh_kpl_diag.log", "a") as _f:
+                    _f.write("diag error %r\n" % (_e,))
         # Resolve to token-level indices in the output buffer.
         if index_kpool > 1:
             pool_ids = pool_topk.to(torch.int64)
@@ -685,7 +745,6 @@ def sparse_attn_indexer_kpool(
             if _vis_pools.shape[0] != pool_ids.shape[0]:
                 _ratio = pool_ids.shape[0] // _vis_pools.shape[0]
                 _vis_pools = _vis_pools.repeat_interleave(max(_ratio, 1))
-            _force_recent_tail_pools(pool_ids, _vis_pools)
             n = pool_topk.shape[0]
             # Decode seq_lens are pool-granular; recover token lengths from
             # positions using the padded [B, next_n] row layout when needed.

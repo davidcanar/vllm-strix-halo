@@ -897,6 +897,30 @@ def rocm_fp8_paged_mqa_logits(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
         )
 
+    # [vsh-kpool-paged-logits] gfx1151 has no aiter reader for the paged SHUFFLE indexer
+    # cache; the stage1 fallback below is a block_size == 1 reader and scores
+    # garbage (random top-k). Use the layout-correct Triton reader instead.
+    import os as _vsh_os
+
+    if (
+        _on_gfx1151
+        and block_size > 1
+        and q_fp8.dtype == torch.float8_e4m3fn
+        and not _indexer_k_is_c4a_block_flat(compress_ratio)
+        and _vsh_os.environ.get("VSH_KPOOL_PAGED_LOGITS", "1") not in ("", "0", "off")
+    ):
+        from vllm.v1.attention.ops.vsh_kpool_paged_logits import (
+            kpool_paged_mqa_logits,
+        )
+
+        (_vsh_out,) = current_workspace_manager().get_simultaneous(
+            ((batch_size * next_n, max_model_len), torch.float32),
+        )
+        return kpool_paged_mqa_logits(
+            q_fp8, kv_cache_fp8, weights, context_lens, block_tables,
+            max_model_len, out=_vsh_out,
+        )
+
     aiter_paged_mqa_logits_module = None
 
     if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():

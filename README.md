@@ -82,6 +82,18 @@ configuration lives in `~/vsh-config.yaml` (flat keys → `VSH_*` env vars).
 
 ## Current patch set
 
+### GLM-5.3 long-context sparse attention fixes (2026-10-02, late) — PATCHES.md §27
+
+Mid-context retrieval (3 needles at 25/50/75 %) went from **0/3 to 3/3** at 13K
+and 32K, and the captured opencode tool-call request from ~2/6 to **6/6**.
+
+| patch | file | what it fixes |
+|---|---|---|
+| `59412-pooled-indexer-kernel-blocks.py` | `v1/attention/backends/mla/indexer.py`, `v1/worker/utils.py` | Port of upstream #59412: page-aligned kernel blocks for the kpool indexer. Without it every pool past ~4K tokens was written to and read from page 0 |
+| `vsh-kpool-paged-logits.py` + `vsh_kpool_paged_logits.py` | `v1/attention/ops/rocm_aiter_mla_sparse.py` | Correct decode indexer reader for the paged SHUFFLE cache on gfx1151 (aiter's stage1 fallback scored at random); also drops the 12.6 ms/step whole-pool fp8 conversion. Env `VSH_KPOOL_PAGED_LOGITS` |
+| `vsh-idx-force-tail-boost.py` | `models/glm5next/amd/sparse_indexer.py` | Force-tail now boosts recent pools before top-k instead of overwriting (unsorted) top-k columns, which evicted ~1/4 of the selected pools |
+| `vsh-idx-fp8max-fnuz.py` | `models/glm5next/amd/ops/kpool_compress.py` | Indexer K quantized to 224 so the e4m3fn→fnuz cast cannot overflow to NaN. Env `VSH_IDX_FP8MAX_FNUZ` |
+
 ### GLM-5.3 decode + cache fixes (2026-10-02)
 
 | patch | file | what it does |
