@@ -78,3 +78,6 @@ export VSH_TOOLCALL_DROP_DIR=/tmp/vsh-toolcall-drops
 # (emulated, ~0.38 ms x 28 calls = ~10.7 ms/step); 0 = plain bf16 torch.bmm.
 # Also skips the 2x1024-shape fp8-BMM precompile at boot. (PATCHES.md 28)
 export VLLM_ROCM_USE_AITER_FP8BMM=${VSH_GLM53_FP8BMM:-0}
+
+# Load-time int8 (group 128) for BF16 linears + HIP W8A16 GEMV (PATCHES.md 28.6).
+export VSH_W8A16=${VSH_GLM53_W8A16:-1}

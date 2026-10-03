@@ -1918,6 +1918,44 @@ Remaining (profile): BF16 GEMV ~49 ms/step (40 % of GPU time) -> 8-bit weights
 4.4 ms; fp32 router gate 4.3 ms; sparse attention 4.0 ms. CPU is now close
 behind the GPU (launch->start median 5-24 ms), so graphs come back into play.
 
+### 28.6 Load-time int8 for the BF16 linears (`vsh-w8a16-linear.py`)
+
+The ds4 Q8_0 idea, done online instead of as a checkpoint rewrite. After loading,
+`UnquantizedLinearMethod.process_weights_after_loading` quantizes eligible BF16
+linears to int8 with one fp32 scale per 128 inputs and frees the BF16 copy
+(`vllm/model_executor/layers/vsh_w8a16.py`). Eligible: 2-D bf16, K in
+{1024, 1536, 2048, 3072, 4096, 6144, 8192}, N >= 32, the layer's `forward` is a
+stock Column/Row/Replicated one (the MoE router gate overrides forward and reads
+`.weight` directly -- first boot failed on it), and not `kv_b_proj` (absorbed by
+MLA), `wk_weights_proj` (sliced by the indexer), embeddings, `lm_head`, vision.
+Decode (<= 8 rows) runs `vsh_w8a16.hip` (one wave per output row, 64
+contiguous int8 per lane per step -- best of an 8-way tile sweep on DRAM-bound
+shapes); larger batches dequantize to a transient BF16 weight + stock GEMM.
+Gate `VSH_W8A16` (set to 1 in `vsh-cluster-env.odl.sh`, `VSH_GLM53_W8A16`
+overrides).
+
+| check | BF16 | int8 |
+|---|---|---|
+| mean NLL, PATCHES.md excerpt (2100 tok) | 2.2141 | 2.1938 |
+| mean NLL, AGENTS.md excerpt (2140 tok) | 1.8093 | 1.8068 |
+| mean NLL, vsh_ab.py source (1474 tok) | 0.9596 | 0.9529 |
+| §27 needles 6.8K / 13K / 32K | 3/3 | 3/3 |
+| opencode tool-call replay | 4/4 | 3/3 |
+| prefill, 9.5K prompt | 283 tok/s | 285 tok/s |
+| MemAvailable at boot | ~8.0 GB | **10.4 GB** |
+| decode step short / 3K | 125 / 130 ms | **118 / 126 ms (23.8 / 27.9 tok/s)** |
+
+Kernel microbench (unit test `scripts/test_w8a16.py`): the DRAM-bound KDA
+in_proj (12576 x 4096) runs 171-177 GB/s at M=1/4 (1.5-1.6x the BF16 path on
+half the bytes); kernel error vs dequant reference 2.3e-3, quantization error
+vs BF16 6.7e-3 per layer. In model: BF16 GEMV ~40 -> int8 GEMV 25.6 ms/step.
+
+**The step is balanced again.** GPU busy ~118 ms/step; after the queue drains,
+kernels start ~0.5 ms after launch (CPU floor). Next levers: CUDA graphs (CPU
+side), `lm_head` x4 reads (8.4 ms, still BF16), MTP layer-45 BF16 experts
+(8.0 ms; int4 would put them on the 28.5 kernel), fp32 router gate (6.7 ms),
+odl2 waits (7.6 ms).
+
 ### Where the step is now (profile, ~3K context, 28.1-28.4, before 28.5)
 
 196.6 ms/step profiled, **GPU 90 % busy** (was 72 %): int4 routed MoE 89.8 ms
