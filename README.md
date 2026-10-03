@@ -1,6 +1,6 @@
 # vllm-strix-halo — GLM-5.3-Flash (and DeepSeek-V4-Flash) on 2× AMD Strix Halo, TP=2 over Thunderbolt
 
-> # STATUS 2026-10-02: GLM long-context fixed; prefix-cache truncation fixed; decode is bandwidth-bound and measured to its limits
+> # STATUS 2026-10-03: GLM long-context sparse attention fixed end to end (§27); tool calling works; decode speed is the open item
 >
 > **The GLM-5.3 long-context retrieval bug is fixed.** Four stacked fixes
 > (one upstream PR port + three local) took tail-retrieval from failing at
@@ -31,15 +31,18 @@
 > prose / 11.6 tok/s JSON** (2.0–2.6 accepted tokens per ~210–224 ms step) ·
 > TTFT on a cached 13.9K context **0.95 s**
 >
-> **Decode is weight-bandwidth-bound and the easy axes are exhausted.** A live
-> profile puts the GPU at **85 % busy** with no gap over 2 ms; 61 % of that time
-> is weight traffic already running at 80–87 % of the achieved ~200–215 GB/s.
-> The draft-length axis (k=1…4, one boot via the live override, §17), the drafter
-> choice (MTP k=3 vs DFlash2 k=3/k=7, matched A/B, §25), the host launch path
-> (§21) and the per-step host syncs (§22) have all been measured; none of them
-> has headroom left. What remains is the BF16 requant (**~+6 %**, §23) and the
-> prefill MoE tile regime at large M (41.5 % of prefill, ~12–18 % of achievable
-> FLOPS, never tuned).
+> **§27 (2026-10-02/03): four stacked sparse-attention bugs fixed.** Past
+> ~2K tokens the decode indexer scored at random, the index cache aliased every
+> pool past ~4K tokens onto one page, an fp8 cast produced NaN and the
+> force-tail patch evicted selected pools. The tail-needle table above passed
+> only because force-tail kept the tail visible; **mid-context** retrieval was
+> 0/3 at 13K and is now 3/3 at 6.8K/13K/32K, and opencode's real tool-call
+> request went from ~30-40 % to **8/8** usable (§27.1).
+>
+> **Decode speed is not measured to its limits** (the earlier verdict rested on
+> halved per-step profile numbers and a GPU-bound misdiagnosis -- see Known
+> issues #1). Current: ~217-226 ms/step at 2-4K, JSON 11.9 / tool calls 13.1 /
+> prose 8.7 tok/s.
 >
 > **DS4 (DeepSeek-V4-Flash) native port is incomplete**: prefill works at
 > ~213 tok/s but decode runs at 2–6 tok/s with degraded output quality. The
@@ -218,43 +221,60 @@ vllm-strix-halo/
 
 ## Known issues and next steps
 
-1. **DS4 native decode** — the open bug. Output degenerates into repetition
-   loops; decode at 2–6 t/s. Narrowed by elimination to the target model's
-   decode-side forward path. The June delegate engine works correctly.
-2. **GLM CUDA graphs** — parked since 2026-09-28 (first replay wedges the MTP
-   drafter on hybrid attention backends). Typically 1.5–2× decode if fixed.
-   Note for whoever retries: the KDA chunk-index host sync that blocks capture
-   is on the *chunked* (prefill-bearing) path only, not the pure-decode path
-   (§22), so the deadlock reproduction needs a mixed step.
-3. **Decode headroom: ~+6 % and no more.** 61 % of decode GPU time is weight
-   traffic at 80–87 % of achieved bandwidth. The only measured lever left is
-   quantizing the BF16 tensors (KDA/MLA projections + `lm_head`, 6.47 GB/rank
-   /step) to fp8 or W4A16 — `~+6 %` decode, `~+4 %` prefill, half a day of
-   checkpoint work plus real KDA precision risk. Do not use `lm_head` alone as
-   a probe (2.8 % of the step, inside the run-to-run spread). §23
-4. **Prefill is the remaining inefficiency** (does not move t/s, does move
-   TTFT): 41.5 % of prefill GPU time is the int4 MoE at ~12–18 % of achievable
-   FLOPS, and the tuned tile config only covers M≤512 while a prefill chunk
-   runs at M≈65 k rows. That regime has never been tuned.
-5. **Upstream tracking** - the block-table granularity bug is upstream
-   #58858, with the fix in open PR #59412 (page-aligned kernel-block
-   selection for pooled indexers). We posted independent gfx1151 validation
-   data on the PR (deterministic dead zone at pool 7,295; an equivalent
-   gather-site table-expansion fix validated to the full 256K context).
-   The selection-side tail gap (config `always_select_tail` covers only the
-   <=3-token incomplete pool; recent complete pools can drop out of top-k)
-   is filed as #59741 with measured evidence and our force-tail mitigation.
-   Once #59412 merges and we rebase, our gather-site expansion
-   (`vsh-idx-bt-gather-v4-ops.py`) can be dropped.
-6. **Image rebuild** - done 2026-10-02. Both boxes carry committed
-   snapshots (`vllm-strix-halo:glm-longctx-fixed-20261002`,
-   `ds4-vllm-patched:june-debug-20261002`). Reproducible rebuilds are wired:
-   `container/pinned-vllm/` holds the modified `vllm/` files exported
-   byte-exact from the running container, and `container/Dockerfile` copies
-   them over the patched tree (valid for the pinned VLLM_COMMIT). The
-   launcher-side retention flag is not part of that copy — re-apply it with
-   the script in `container/patches/`. The Triton-side change is pinned too:
-   `container/pinned-triton/backends/amd/driver.c` is the patched driver
-   (inert unless `VSH_TRITON_PTR_CACHE=1`); copy it over
-   `/opt/venv/lib/python3.12/site-packages/triton/backends/amd/driver.c` at
-   image build.
+1. **Decode speed (the main open item).** Measured 2026-10-03 after §27:
+   ~186 ms/step at short context, ~217-226 ms/step at 2-4K (JSON 11.9,
+   tool calls 13.1, prose 8.7 tok/s). The earlier "~+6 % and no more" verdict
+   (§21-§23) rested on two measurement errors, corrected in
+   [FRESH-EYES-20tps.md](FRESH-EYES-20tps.md): the profiler annotates each step on two GPU
+   streams, so every per-step kernel figure was halved (the int4 MoE is
+   ~76 ms/step at ~90 GB/s, not 42.7 ms at 87 %; BF16 traffic is ~10.9 GB/
+   rank/step, not 6.47), and steady-state decode is CPU-bound or balanced, not
+   GPU-bound (kernels start ~0.3-0.5 ms after launch). CPU ~= GPU ~= 190-220 ms
+   per step, which is why single-sided changes keep measuring as noise -- e.g.
+   §27 removed 12.6 ms/step of GPU work and the step did not move. The plan:
+   CUDA graphs (item 2) to remove the CPU floor, then the GPU waste list
+   (fp8 BMM on RDNA3.5, router sort kernel, 8-workgroup decode attention,
+   4x lm_head reads, BF16 MTP experts), then an int4 MoE decode kernel and
+   8-bit BF16 weights. Projected ~95-110 ms/step if most of it lands.
+2. **CUDA graphs** -- not shipped; the blockers are understood. MTP-off graphs
+   work (§11 retry, 114 ms/token). With MTP: (a) `odl_ar2` is graph-unsafe by
+   design (host-side round counter baked into captured kernel args;
+   `eligible()` returns False while capturing, so graphed all-reduces fall back
+   to RCCL while eager segments use odl_ar2), fix = device-side counter;
+   (b) the KDA chunk-index host sync is on prefill-bearing steps only (§22) --
+   `FULL_DECODE_ONLY` keeps them eager; (c) the drafter's between-step
+   metadata rebuild can stay eager (its CPU cost hides under the graphed
+   target). Graphs alone are worth ~0-10 %; their value is that every GPU fix
+   afterwards lands 1:1.
+3. **MTP-off crashes rank 1** with an illegal memory access on the first real
+   generation (§26). Likely the §27 page-aliasing bug (PR #59412 notes the
+   same aliasing writes past the row buffer at other block geometries, and
+   MTP-off changes the scheduler block 2304 -> 2176). Retest now that #59412
+   is ported; it gates the MTP-off graph bench in item 2.
+4. **Prefill is the remaining inefficiency** (moves TTFT, not t/s): 41.5 % of
+   prefill GPU time is the int4 MoE at ~12-18 % of achievable FLOPS; the tuned
+   tile config covers M<=512 while a prefill chunk runs at M~65k rows. Never
+   tuned. Also re-measure prefill at matched sizes after §27 (§27.1).
+5. **Debug leftovers on the prefill path**: ungated logging from the long-context
+   hunt writes six `/tmp/glm_*.log` files (scores, topk, gather, kpool, map,
+   idxplan) with host syncs every chunk; they grow without bound. Remove.
+6. **Upstream tracking.** We carry a port of PR #59412 (#58858, page-aligned
+   kernel blocks for pooled indexers) -- drop `59412-*` when rebasing onto a pin
+   that has it; `vsh-idx-bt-gather-v4-ops.py`'s gather-site expansion is inert
+   with #59412 and can go too. Not yet reported upstream: on gfx1151,
+   `rocm_fp8_paged_mqa_logits` falls through to aiter's block_size==1
+   `stage1` reader for paged SHUFFLE caches (random top-k; our
+   `vsh-kpool-paged-logits` replaces it) -- worth an issue/PR. #59741 (tail
+   gap) mitigation is now `vsh-idx-force-tail-boost` (logit boost before top-k;
+   the old column overwrite evicted selected pools).
+7. **DS4 native decode** -- output degenerates into repetition loops, 2-6 t/s.
+   New lead: DS4's ratio-1/2 indexer caches are also paged SHUFFLE and go
+   through the same `rocm_fp8_paged_mqa_logits` stage1 fallback that §27 found
+   scoring at random on gfx1151 -- the new reader covers that path; retest DS4
+   native before further bisection. The June delegate engine still works.
+8. **Image snapshots predate §27.** `vllm-strix-halo:glm-longctx-fixed-20261002`
+   does not carry the four §27 fixes; the running containers and
+   `container/pinned-vllm/` (commit 0c5fbfb) do. Commit a new snapshot on both
+   boxes. The launcher retention flag and `container/pinned-triton/` notes from
+   the previous rebuild still apply.
+
