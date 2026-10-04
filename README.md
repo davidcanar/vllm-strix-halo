@@ -120,7 +120,7 @@ serves; decode quality/speed unresolved (Known issues 5).
   `kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.30.0`; vLLM pinned
   at `73859fec`; `container/pinned-vllm/` + `container/pinned-triton/` carry
   the byte-exact patched files for reproducible rebuilds). Snapshot of the
-  running stack on both boxes: `vllm-strix-halo:glm-perf33-20261003`
+  running stack on both boxes: `vllm-strix-halo:glm-perf34-20261003`
   (`:local` points at it)
 - **KV cache**: 16 GiB pinned, 256K max context
 - **Speculative decoding**: DFlash2 drafter, k=3 (`glm53_spec_method: dflash`,
