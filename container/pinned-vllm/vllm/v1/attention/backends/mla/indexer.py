@@ -1307,20 +1307,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 sub_m = min(max_q, chunk_m - q_off)
                 chunks.append((req_slice, slice(q_off, q_off + sub_m)))
 
-        try:
-            with open("/tmp/glm_idxplan.log", "a") as _f:
-                _f.write(
-                    "plan align=%d qs=%s ss=%s subs=%s\n"
-                    % (
-                        align,
-                        [int(x) for x in prefill_query_lens_cpu.tolist()],
-                        [int(x) for x in compressed_seq_lens_cpu.tolist()],
-                        [(int(c[0].start), int(c[0].stop), int(c[1].start), int(c[1].stop))
-                         for c in chunks],
-                    )
-                )
-        except Exception:
-            pass
         return chunks
 
     def build(
@@ -1387,17 +1373,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     _rep >= 0, _expanded, torch.full_like(_expanded, -1)
                 ).to(torch.int32)
                 indexer_block_table = _expanded.contiguous()
-                try:
-                    with open("/tmp/glm_btfix.log", "a") as _f:
-                        _f.write(
-                            "EXPANDED K=%d main_bs=%d cr=%d pools_main=%d bt=%s -> %s max=%d\n"
-                            % (_K, self.kv_cache_spec.block_size, self.compress_ratio,
-                               _pools_per_main, tuple(block_table.shape),
-                               tuple(indexer_block_table.shape),
-                               int(indexer_block_table.max()) if indexer_block_table.numel() else -1)
-                        )
-                except Exception:
-                    pass
             padded_num_tokens = num_tokens
             local_slot_mapping = slot_mapping
             if self.use_pcp:

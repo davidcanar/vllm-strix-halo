@@ -2199,3 +2199,40 @@ needles 3/3 at 6.8K and 13K; opencode replay 3/3; image input fine (9.1 s for th
 while Triton JIT-compiles graph-mode kernel variants (rank 1 logged
 `FusedQKVRMSNormKernel`, `rotary_kernel`); later requests and later boots hit the
 cache. Revert: `glm53_enforce_eager: 1`.
+
+## 34. Cleanup: debug log writers removed; spec-off boots and runs (2026-10-03)
+
+1. **Debug leftovers removed.** The long-context hunt (sections 22-27) left nine ungated
+   `try: open("/tmp/glm_*.log", "a") ... except: pass` blocks on the prefill
+   path -- every one with host syncs (`.item()`, `int(tensor)`, `.tolist()`,
+   `kthvalue`): `models/glm5next/amd/sparse_indexer.py` (kpool, map, scores x2,
+   topk), `v1/attention/backends/mla/indexer.py` (idxplan, btfix) and
+   `v1/attention/ops/rocm_aiter_mla_sparse.py` (gather, btfix); 122 lines. They
+   were still writing (~15 MB of logs). Removed from both containers and
+   `container/pinned-vllm/` (the patch-history reference copies and
+   `container/patches/debug/` are left as history); stale `/tmp/glm_*.log` deleted.
+2. **Spec-off boot fix** (`host/vsh-manual-serve.sh`). With no drafter the
+   attention / scheduler block is 2176 tokens (no drafter KV group to pad for),
+   and the hard-coded `--prefix-cache-retention-interval 2304` failed engine
+   init (`must be ... a multiple of scheduler_block_size (2176)`). When
+   speculative decoding is off and the interval is the 2304 default, the serve
+   script now passes `VSH_GLM53_APC_RETENTION_NOSPEC` (default 2176).
+3. **MTP-off validated -- the section 26 rank-1 crash is gone** (the page aliasing
+   fixed in section 27 was the likely cause). Spec decoding off
+   (`glm53_spec_method: glm5_next_mtp`, `glm53_mtp_tokens: 0`):
+
+| | CUDA graphs (PIECEWISE) | eager |
+|---|---|---|
+| boot + first generation | OK | OK |
+| NLL (patches / agents / pyfile) | 2.1979 / 1.8059 / 0.9644 | 2.1984 / 1.8052 / 0.9640 |
+| needles 6.8K / 13K | 3/3, 3/3 | 3/3, 3/3 |
+| opencode replay | 3/3 | 3/3 |
+| decode, JSON / prose | 17.0 / 16.8 tok/s | 16.5 / 16.3 tok/s |
+
+   No new errors in either run. Spec-off graphs were 8.8 tok/s on 2026-10-02;
+   production stays DFlash2 k=3 (20-28 tok/s).
+4. **Production re-check after the cleanup** (DFlash2 k=3, graphs): JSON 96 ms/step,
+   23.4 tok/s (tokens/step 2.27); prefill 285-296 tok/s cold at 4.8K-16.7K
+   (283 before) -- the removed writers cost nothing measurable at these sizes,
+   they were host syncs per layer per chunk. The first large prefill after a
+   boot stalled on Triton JIT (11.5K tokens: 183 s, then 40 s on a repeat).

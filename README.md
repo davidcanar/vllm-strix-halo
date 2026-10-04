@@ -3,20 +3,22 @@
 > **STATUS 2026-10-03 — working end to end.** GLM-5.3-Flash serves correctly:
 > long-context retrieval passes at every tested length (mid-context and tail,
 > 6.8K–255K, including adversarial), tool calling works (8/8 on the captured
-> opencode request), prefix caching works, and decode is **~22 tok/s** after
-> the §28 decode round. DS4 (DeepSeek-V4-Flash) runs on the June 2026 stack
-> (`delegate` mode, 19–24 tok/s); the native 0.31 port is still open.
+> opencode request), image input works, prefix caching works, and decode is
+> **20–28 tok/s** (DFlash2 k=3, CUDA graphs) after the §28–§33 decode rounds.
+> DS4 (DeepSeek-V4-Flash) runs on the June 2026 stack (`ds4_engine: delegate`,
+> 19–24 tok/s); the native 0.31 port is still open (§ Known issues).
 
-| metric (GLM-5.3-Flash AWQ W4A16, TP=2, MTP k=3) | value |
+| metric (GLM-5.3-Flash AWQ W4A16, TP=2, DFlash2 k=3, CUDA graphs) | value |
 |---|---|
-| decode | **~22 tok/s** (stepbench; engine gauge 22–26) — was 12.0 before §28 |
-| prefill | ~283 tok/s at 9.6K; 250–270 tok/s cold at 4K–13.9K |
-| TTFT, 13.9K context | 52 s cold → **0.95 s cached** |
+| decode | **26.5 / 28.5 / 19.9 tok/s** JSON / tools / prose (`vsh_ab.py`), 96–100 ms/step — was 12.0 tok/s before §28 |
+| prefill | 285–296 tok/s cold at 4.8K–16.7K (the first large prefill after a boot can stall on Triton JIT) |
+| TTFT, 13.9K context | ~50 s cold → **0.95 s cached** (§20) |
 | long-context retrieval | ✅ 3/3 mid-context at 6.8K/13K/32K; tail needles PASS to 255K; adversarial PASS |
-| tool calling | ✅ 8/8 on the captured opencode request |
+| tool calling | ✅ 8/8 on the captured opencode request; opencode replay 3/3 |
+| image input | ✅ (vision encoder in BF16; 448×448 probe answered correctly, 9.1 s) |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§28). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§34). This README is the current state only.
 
 ---
 
@@ -40,12 +42,15 @@ plumbing plus the gfx1151 fixes below.
 
 ```bash
 ~/vllm-strix-halo.sh glm53 start     # GLM-5.3-Flash on :1234
-~/vllm-strix-halo.sh ds4 start       # DS4 via the June stack (delegate)
+~/vllm-strix-halo.sh ds4 start       # DS4 (engine per ds4_engine, see below)
 ~/vllm-strix-halo.sh glm53 stop      # ... etc
 ```
 
 Both models share the `vllm-glm` container and API port 1234 — either/or at
-runtime. Site config: `~/vsh-config.yaml` (flat keys → `VSH_*` env vars).
+runtime. Site config: `~/vsh-config.yaml` (flat keys → `VSH_*` env vars;
+template in `host/vsh-config.yaml`). The template ships `ds4_engine: native`
+(the 0.31 port, not production-ready); set `ds4_engine: delegate` for the
+June stack.
 
 ## Patch set (current)
 
@@ -65,14 +70,26 @@ pool past ~4K aliased onto one page:
 | patch | what it does |
 |---|---|
 | `vsh-glm53-apc-align.py` | EAGLE last-block drop resolved to pure-drafter groups (upstream flags every group) — prefix hits stop losing a 2304-token page per lookup. Env `VSH_GLM53_APC_ALIGN` (on). §18 |
-| `vsh-apc-retention.py` | `--prefix-cache-retention-interval 2304` (stock flag): keeps KDA/Mamba state checkpoints so the *first* repeat hits. Env `VSH_GLM53_APC_RETENTION` (on). §20 |
+| `vsh-apc-retention.py` | `--prefix-cache-retention-interval 2304` (stock flag; 2176 when speculative decoding is off — the scheduler block shrinks): keeps KDA/Mamba state checkpoints so the *first* repeat hits. Env `VSH_GLM53_APC_RETENTION` (on). §20, §34 |
 | `vsh-adaptive-k.py` | EMA policy for the verified draft length, wired for async scheduling + live override. Installed, instrumented, **off** — step time is draft-length independent here. §17 |
 | `vsh-triton-ptr-cache.py` | Memoises Triton's per-pointer `hipPointerGetAttribute`. Validated bit-exact, **off** — worth ~0.3 % of a step. §21 |
 | `host/moe-configs/E=288,N=1024,...json` | Tuned MoE tiles under the filename the runtime actually asks for |
 
-**Perf (§28, 2026-10-03):** GPU clock cap (power budget), bf16 MLA BMM,
-packed-key router, split-KV attention, and the **HIP int4 MoE decode GEMV**
-(§28.5: routed MoE 90 → 37 ms/step; gate `VSH_MOE_INT4_HIP`).
+**Decode speed (§28–§33, 2026-10-03):**
+
+| patch | what it does |
+|---|---|
+| `host/vsh-gpu-sclk.sh` (`glm53_gpu_sclk_max: 2100`) | iGPU clock cap so the shared power budget stops clamping the CPU. §28 |
+| `vsh-router-packed-topk.py`, bf16 MLA BMM (`VLLM_ROCM_USE_AITER_FP8BMM=0`) | Cheaper deterministic router top-k; no fp8 BMM round trip. §28 |
+| `vsh-sparse-attn-split.py` | Split-KV sparse decode attention. §28 |
+| `vsh-moe-int4-hip.py` + `vsh_moe_int4.hip` | HIP int4 MoE decode GEMV (routed MoE 90 → 37 ms/step). Env `VSH_MOE_INT4_HIP`. §28.5 |
+| `vsh-w8a16-linear.py` + `vsh_w8a16.hip` | Load-time int8 (group 128) for the checkpoint's BF16 linears + W8A16 decode GEMV. Env `VSH_W8A16`. §28 |
+| DFlash2 k=3 (`glm53_spec_method: dflash`) | Default drafter; its attention on `TRITON_ATTN` (`VSH_GLM53_DRAFT_ATTN`). §28.7, §30 |
+| `vsh-gate-lmhead.py` | int8 `lm_head` copy for target + drafter logits. Env `VSH_W8A16_LMHEAD`. §30 |
+| `vsh-fused-router.py` | One HIP kernel for sigmoid + bias + top-8 + renorm routing. Env `VSH_FUSED_ROUTER`. §31, §33 |
+| `vsh-moe-direct.py` | Decode MoE straight to HIP (no modular kernel / `moe_align`). Env `VSH_MOE_DIRECT`. §31 |
+| `vsh-gate-bf16.py` | bf16-weight / fp32-out router-gate GEMV (replaces hipBLASLt tier 4). Env `VSH_ROUTER_GEMV`. §32 |
+| `vsh-cg-eager-collectives.py` (`glm53_cg_mode: PIECEWISE`) | CUDA graphs: breakable piecewise capture with every TP collective eager. Env `VSH_CG_EAGER_COLLECTIVES`. §33 |
 
 **Still carried from earlier rounds:** #55222 workspace-units ports (indexer +
 GLM attention), #57979 KDA stride fix, upstream ragged-index rewrite, the
@@ -82,7 +99,7 @@ The older gather-site block-table expansion (`vsh-idx-bt-gather-v4-ops.py`)
 and column-overwrite force-tail are superseded by §27 and are inert.
 
 **DS4 native port** (`container/patches/ds4-native-fixed-refs/`): boots and
-serves; decode quality/speed unresolved (§ Known issues 7).
+serves; decode quality/speed unresolved (Known issues 5).
 
 ## Architecture
 
@@ -102,13 +119,20 @@ serves; decode quality/speed unresolved (§ Known issues 7).
 - **Image**: `vllm-strix-halo:local` from `container/Dockerfile` (base
   `kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.30.0`; vLLM pinned
   at `73859fec`; `container/pinned-vllm/` + `container/pinned-triton/` carry
-  the byte-exact patched files for reproducible rebuilds)
+  the byte-exact patched files for reproducible rebuilds). Snapshot of the
+  running stack on both boxes: `vllm-strix-halo:glm-perf33-20261003`
+  (`:local` points at it)
 - **KV cache**: 16 GiB pinned, 256K max context
-- **Speculative decoding**: MTP k=3. DFlash2 k=7 is one config line away
-  (`glm53_spec_method: dflash`) but is a wash on prose and slower on JSON in
-  a matched A/B (§25–§26)
-- **Quantization**: AWQ W4A16 for MoE experts; bf16 for KDA projections, MLA,
-  and lm_head (checkpoint `ignore` list)
+- **Speculative decoding**: DFlash2 drafter, k=3 (`glm53_spec_method: dflash`,
+  `glm53_mtp_tokens: 3`); MTP (`glm5_next_mtp`) is the fallback and spec-off
+  works too (§34)
+- **Execution**: CUDA graphs, PIECEWISE breakable capture, sizes 1/2/4/8;
+  `glm53_enforce_eager: 1` reverts to eager (§33)
+- **Quantization**: AWQ W4A16 for MoE experts (checkpoint). The checkpoint's
+  BF16 linears (KDA/MLA projections, shared experts, dense MLPs) are
+  re-quantized to int8 group-128 at load (§28); `lm_head` gets an int8 copy
+  (§30); the router gate, `kv_b_proj`, `wk_weights_proj`, embeddings and the
+  vision encoder stay BF16
 
 ## Measured performance (2026-10-03)
 
@@ -125,15 +149,17 @@ medians of ≥2 boots or ≥5 repetitions.
 ```
 vllm-strix-halo/
 ├── vllm-strix-halo.sh       # supervisor launcher (glm53 | ds4)
-├── vsh-config.yaml          # site config template
-├── host/                    # host-side scripts (restart, serve, heal, moe-configs)
+├── host/                    # host-side scripts (restart, serve, env, heal, sclk, moe-configs)
+│   └── vsh-config.yaml      # site config template
 ├── container/
 │   ├── Dockerfile           # image build (base + patches)
-│   ├── patches/             # reference copies of patched files (+ debug/, ds4 refs)
-│   ├── pinned-vllm/         # byte-exact patched vllm files (rebuild input)
+│   ├── patches/             # patch scripts, HIP kernels + reference copies (+ debug/, ds4 refs)
+│   ├── pinned-vllm/         # byte-exact patched vllm files (authoritative rebuild input)
 │   └── pinned-triton/       # pinned Triton AMD driver
-├── scripts/                 # measurement harnesses (vsh_ab, vsh_bench, stepbench, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§28)
+├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
+├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, test_*, trace_*)
+├── PATCHES.md               # detailed patch history and lessons (§1–§34)
+├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
 
@@ -151,20 +177,12 @@ vllm-strix-halo/
    mode). FULL modes still hang on the first replay (RCCL inside the graph,
    §29); root cause not isolated. The first request after a boot can stall
    ~2 min on Triton JIT. Revert with `glm53_enforce_eager: 1`.
-3. **MTP-off crashes rank 1** on first generation (§26) — likely the §27
-   page-aliasing bug at the changed block geometry; retest now that #59412 is
-   ported. Gates the MTP-off graph bench.
-4. **Prefill MoE is untuned** — 41.5 % of prefill GPU time runs at 12–18 % of
+3. **Prefill MoE is untuned** — 41.5 % of prefill GPU time runs at 12–18 % of
    achievable FLOPS (tuned tiles cover M≤512; prefill chunks run M~65k).
-5. **Debug leftovers** — the long-context hunt leaves six ungated
-   `/tmp/glm_*.log` writers (with host syncs) on the prefill path. Remove.
-6. **Upstream** — drop `59412-*` (and the inert gather-site expansion) at the
+4. **Upstream** — drop `59412-*` (and the inert gather-site expansion) at the
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-7. **DS4 native decode** — repetition loops, 2–6 t/s. New lead: DS4's ratio-1/2
+5. **DS4 native decode** — repetition loops, 2–6 t/s. New lead: DS4's ratio-1/2
    indexer caches hit the same broken `stage1` fallback §27 fixed; the new
    reader covers that path — retest DS4 native before further bisection.
-8. **Image snapshots** — done 2026-10-03: `vllm-strix-halo:glm-perf33-20261003`
-   on both boxes (everything through §33; `:local` now points at it, so a
-   recreated container gets the current stack).

@@ -107,14 +107,6 @@ def _kpool_compress_insert(
     write_mask = valid & (pos >= kpool - 1)
     offs = torch.arange(kpool, device=k.device)
     idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
-    try:
-        with open("/tmp/glm_kpool.log", "a") as _f:
-            _f.write(
-                "insert n=%d kpool=%d valid=%d write=%d\n"
-                % (n, kpool, int(valid.sum().item()), int(write_mask.sum().item()))
-            )
-    except Exception:
-        pass
     kpool_ops.kpool_compress_and_write_cache(
         kv_cache,
         k[idx],  # [n, kpool, head_dim]
@@ -237,23 +229,6 @@ def sparse_attn_indexer_kpool(
             if n_prefill > 0:
                 # decode tokens are batched first; prefill tokens follow.
                 prefill_slice = slice(num_decode_tokens, num_tokens)
-                try:
-                    _sm = slot_mapping[prefill_slice]
-                    _valid = _sm >= 0
-                    _vnz = _valid.nonzero().flatten()
-                    if _vnz.numel() > 0:
-                        _first = [int(_vnz[i]) for i in range(min(6, _vnz.numel()))]
-                        _slots = [int(_sm[i]) for i in _first]
-                        _last_n = min(6, _vnz.numel())
-                        _last_i = [int(_vnz[-i-1]) for i in range(_last_n)]
-                        _last_s = [int(_sm[i]) for i in _last_i]
-                        with open("/tmp/glm_map.log", "a") as _f:
-                            _f.write(
-                                "map nvalid=%d first_pos=%s first_slot=%s last_pos=%s last_slot=%s\n"
-                                % (int(_vnz.numel()), _first, _slots, _last_i, _last_s)
-                            )
-                except Exception:
-                    pass
                 _kpool_compress_insert(
                     k[prefill_slice],
                     gate_score[prefill_slice],
@@ -395,33 +370,6 @@ def sparse_attn_indexer_kpool(
             # so topk selects pools. We pick topk_tokens // kpool pools then
             # expand each pool back to its kpool constituent tokens.
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
-            try:
-                with open("/tmp/glm_scores.log", "a") as _f:
-                    _tot = int(getattr(chunk, "total_seq_lens", -1))
-                    for _ri in range(max(0, num_rows - 3), num_rows):
-                        _ks = int(chunk.cu_seqlen_ks[_ri])
-                        _ke = int(chunk.cu_seqlen_ke[_ri])
-                        _w = logits[_ri, _ks:_ke]
-                        if _w.numel() == 0:
-                            continue
-                        _kth = max(1, _w.numel() - select_k + 1)
-                        _th = float(torch.kthvalue(_w, _kth).values)
-                        _mx = float(_w.max())
-                        _nzmask = _w.abs() > 1e-6
-                        _nz = _nzmask.nonzero().flatten()
-                        _lastnz = int(_nz[-1]) + _ks if _nz.numel() else -1
-                        _ztail = (_ke - _ks) - (int(_nz.numel())) if False else (_ke - 1 - _lastnz) if _lastnz >= 0 else -1
-                        _zcount = int((~_nzmask).sum())
-                        _f.write(
-                            "sc2 row=%d ke=%d total=%d npools=%d selk=%d th=%.4f max=%.4f lastnz=%d ztail=%d zcount=%d\n"
-                            % (_ri, _ke, _tot, _ke - _ks, select_k, _th, _mx, _lastnz, _ztail, _zcount)
-                        )
-            except Exception as _e:
-                try:
-                    with open("/tmp/glm_scores.log", "a") as _f:
-                        _f.write("sc2-ERR %r\n" % (_e,))
-                except Exception:
-                    pass
             if index_kpool > 1:
                 pool_topk = torch.empty(
                     (num_rows, select_k), dtype=torch.int32, device=logits.device
@@ -468,23 +416,6 @@ def sparse_attn_indexer_kpool(
                 topk_indices_buffer[
                     chunk.token_start : chunk.token_end, : expanded.shape[-1]
                 ] = expanded
-                try:
-                    _rows = expanded.shape[0]
-                    if _rows > 1:
-                        _seqs = positions[chunk.token_start : chunk.token_end]
-                        with open("/tmp/glm_topk.log", "a") as _f:
-                            for _r in (0, _rows // 2, _rows - 1):
-                                _sq = int(_seqs[_r]) + 1
-                                _nz = expanded[_r][expanded[_r] >= 0]
-                                _cnt = int(_nz.numel())
-                                _near = int(((_nz >= _sq - 48) & (_nz < _sq)).sum())
-                                _mx = int(_nz.max()) if _cnt else -1
-                                _f.write(
-                                    "topk row=%d/%d seq=%d n_sel=%d near48=%d max_sel=%d\n"
-                                    % (_r, _rows, _sq, _cnt, _near, _mx)
-                                )
-                except Exception:
-                    pass
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

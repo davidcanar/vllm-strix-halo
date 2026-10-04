@@ -87,8 +87,16 @@ fi
 # block size (2304) keeps one checkpoint per segment. Env-gated: unset = stock.
 APCR=()
 if [ -n "${VSH_GLM53_APC_RETENTION:-}" ]; then
-  APCR=(--prefix-cache-retention-interval "${VSH_GLM53_APC_RETENTION}")
-  echo "[vsh-serve] prefix-cache retention interval: ${VSH_GLM53_APC_RETENTION}"
+  APCR_V=$VSH_GLM53_APC_RETENTION
+  # Without a drafter the attention block (= scheduler block) is 2176, not 2304
+  # (no drafter KV group to pad for), and vLLM rejects an interval that is not a
+  # multiple of it at engine init. 2026-10-03: this, not a decode bug, was what
+  # stopped spec-off boots.
+  if [ ${#SPEC[@]} -eq 0 ] && [ "$APCR_V" = "2304" ]; then
+    APCR_V=${VSH_GLM53_APC_RETENTION_NOSPEC:-2176}
+  fi
+  APCR=(--prefix-cache-retention-interval "${APCR_V}")
+  echo "[vsh-serve] prefix-cache retention interval: ${APCR_V}"
 fi
 
 KVD=()

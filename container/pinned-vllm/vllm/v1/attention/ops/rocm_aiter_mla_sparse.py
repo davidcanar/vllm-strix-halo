@@ -475,24 +475,6 @@ def cp_gather_indexer_k_quant_cache_triton(
     k_cache_value = k_cache[:, : block_size * head_dim].view(FP8_DTYPE)
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
     grid = (num_tokens,)
-    try:
-        _bt = block_table
-        _row = _bt[_bt.shape[0] - 1] if _bt.numel() else None
-        if _row is not None:
-            _negm = _row < 0
-            _neg = int(_negm.sum())
-            _fn = int(_negm.nonzero().flatten()[0]) if _neg > 0 else -1
-            _rl = int(_row.numel())
-            _mx = int(_row.max())
-        else:
-            _neg = _fn = _rl = _mx = -1
-        with open("/tmp/glm_gather.log", "a") as _f:
-            _f.write(
-                "gather nt=%d kvblk=%d bsize=%d bt=%s rowlen=%d neg=%d firstneg=%d maxblk=%d\n"
-                % (num_tokens, num_blocks, block_size, tuple(_bt.shape), _rl, _neg, _fn, _mx)
-            )
-    except Exception:
-        pass
     k_fp8_scale = k_fp8_scale.view(torch.float32)
     if cache_layout is None:
         layout = "NORMAL" if block_size == 1 else "SHUFFLE"
@@ -535,16 +517,6 @@ def cp_gather_indexer_k_quant_cache_triton(
         ).to(block_table.dtype)
         block_table = _expanded[:, :_needed_cols].contiguous()
         block_table_stride = block_table.stride(0)
-        try:
-            with open("/tmp/glm_btfix.log", "a") as _f:
-                _f.write(
-                    "EXPAND nt=%d bs=%d K=%d have=%d need=%d new_cols=%d max=%d\n"
-                    % (num_tokens, block_size, _K, _have_cols, _needed_cols,
-                       block_table.shape[1],
-                       int(block_table.max()) if block_table.numel() else -1)
-                )
-        except Exception:
-            pass
 
     if _ON_GFX950:
         _cp_gather_indexer_quant_cache_gfx950_kernel[grid](
