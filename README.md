@@ -183,6 +183,16 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-5. **DS4 native decode** — repetition loops, 2–6 t/s. New lead: DS4's ratio-1/2
-   indexer caches hit the same broken `stage1` fallback §27 fixed; the new
-   reader covers that path — retest DS4 native before further bisection.
+7. **DS4 native decode** — repetition loops, 2–6 t/s (last boot 09-30). The
+   ratio-1/2-indexer lead is wrong for this model: DS4-Flash only has ratio-4
+   indexer caches, already routed to a correct reader. Phase-0 diagnosis
+   (2026-10-05) found the boot itself now fails on rank 1: the C4 compressor
+   `fused_wkv_wgate` weight loads as an empty 1-D tensor (rank 0 is fine and
+   fuses 21 layers; the compressor GEMM fusion is now fail-soft, marker
+   `vsh-cgfusion-soft`). Prime suspect: a shared loader change in the §28–§34
+   rounds — DS4's own files are byte-identical to 09-30; the delta is the
+   full-file `linear.py` overlay (05410c9) and `fused_moe.py` (b521be0).
+   The W8A16 hazard is real but separate: `VSH_W8A16=1` int8-converts DS4's
+   compressor/indexer/vision-aligner linears — keep it 0 for DS4 boots
+   (env default flipped for the window). Next: bisect `linear.py`'s
+   weight_loader for the rank-1 shard miss, then the original §34 plan.
