@@ -2236,3 +2236,37 @@ cache. Revert: `glm53_enforce_eager: 1`.
    (283 before) -- the removed writers cost nothing measurable at these sizes,
    they were host syncs per layer per chunk. The first large prefill after a
    boot stalled on Triton JIT (11.5K tokens: 183 s, then 40 s on a repeat).
+
+
+## 35. DS4 native Phase 0 (2026-10-05): template bug found, profile solved, two boot blockers fixed
+
+Boot: `DS4OV_MTP=0 ~/vsh-ds4-reserve.sh` (no spec). Probes: `scripts/ds4probe.py`,
+`scripts/ds4-gen.py`; trace aggregation: `scripts/ds4-trace-agg.py`.
+
+1. **Chat-template bug (the "degenerate output").** The serve default
+   `--default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}'`
+   renders a corrupt prompt on this build: deterministic prompt-blind garbage
+   (' \n * * **'), all needles FAIL. With `thinking:false` the model is
+   correct ('Paris', 1.3 s TTFT). Every kernel A/B only "mattered" through
+   this bug. Fix for now: thinking:false for DS4 chat requests.
+2. **Speed is a separate, profiled problem.** No-spec decode ~580 ms/step:
+   `_w8a8_triton_block_scaled_mm` = 10 320 invocations x 2.36 ms = ~507 ms/step
+   (~87 %) — the dense FP8 linears on the stock Triton block kernel at decode
+   sizes; `_matmul_NNT_bf16xbf16xmxfp4` (MXFP4 MoE) ~99 ms/step; odl wait ~20 ms.
+   Phase 1-2 (June's `ds4_fp8_gemv_hip.cpp` / `ds4_moe_mxfp4.cpp` ports) target
+   exactly these two.
+3. **MoE backend exonerated** for correctness: `moe_backend:"emulation"` via
+   the new `VSH_DS4_MOE_KC` kernel-config hook produces the same (correct,
+   with thinking:false) output as TRITON_UNFUSED.
+4. **Boot blockers:** (a) upstream `prepare_compressor_gemm_fusion` raises on
+   the Vision-Exp compressor weights — now fail-soft
+   (`container/patches/cgfusion-soft.py`, marker `vsh-cgfusion-soft`; the
+   unfused path is pre-fusion behavior); (b) **per-box env divergence**:
+   `vsh-cluster-env.odl.sh` is per-box; box2 kept `VSH_W8A16=1` while box1
+   was 0 → rank 1 int8-converted its linears (bf16 freed to shape (0,)) and
+   rank 0 did not → rank-divergent weights. Keep `VSH_W8A16=0` and
+   `VSH_W8A16_LMHEAD=0` (the lm_head int8 sub-hook defaults ON and also
+   corrupts DS4 logits) for DS4 boots; SYNC THE ENV FILES ACROSS BOXES.
+5. Serve-script hooks added (env-gated, inert by default): `VSH_DS4_MOE_KC`
+   (kernel-config JSON fragment) and `VSH_DS4_PROFILER_DIR` (torch profiler),
+   both read AFTER the cluster-env source.

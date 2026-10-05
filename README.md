@@ -183,16 +183,22 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-7. **DS4 native decode** — repetition loops, 2–6 t/s (last boot 09-30). The
-   ratio-1/2-indexer lead is wrong for this model: DS4-Flash only has ratio-4
-   indexer caches, already routed to a correct reader. Phase-0 diagnosis
-   (2026-10-05) found the boot itself now fails on rank 1: the C4 compressor
-   `fused_wkv_wgate` weight loads as an empty 1-D tensor (rank 0 is fine and
-   fuses 21 layers; the compressor GEMM fusion is now fail-soft, marker
-   `vsh-cgfusion-soft`). Prime suspect: a shared loader change in the §28–§34
-   rounds — DS4's own files are byte-identical to 09-30; the delta is the
-   full-file `linear.py` overlay (05410c9) and `fused_moe.py` (b521be0).
-   The W8A16 hazard is real but separate: `VSH_W8A16=1` int8-converts DS4's
-   compressor/indexer/vision-aligner linears — keep it 0 for DS4 boots
-   (env default flipped for the window). Next: bisect `linear.py`'s
-   weight_loader for the rank-1 shard miss, then the original §34 plan.
+5. **DS4 native decode** — Phase 0 complete (2026-10-05). Findings:
+   (a) the "degenerate output" was a **chat-template bug**: the serve default
+   `--default-chat-template-kwargs '{"thinking":true,...}'` renders a corrupt
+   prompt on this build — with `thinking:false` the model is correct
+   ('Paris' at 1.3 s TTFT) and every kernel A/B (emulation MoE, split-KV off,
+   int8 lm_head off) only mattered through it; (b) decode is still
+   **~1.7-1.8 tok/s (~580 ms/step)** and the profile is unambiguous:
+   **~87 % of the step is `_w8a8_triton_block_scaled_mm`** (215 calls/step x
+   2.36 ms on decode-sized batches) plus ~17 % `_matmul_NNT_bf16xbf16xmxfp4`
+   (the MXFP4 MoE) — exactly the two seams June replaced with hand-written
+   GEMV kernels (ds4_fp8_gemv_hip.cpp, ds4_moe_mxfp4.cpp); (c) two boot
+   blockers found and fixed: the C4 compressor GEMM fusion now fails soft
+   (`vsh-cgfusion-soft`, the unfused path is pre-fusion behavior), and the
+   **per-box env files diverge silently** — box2 kept `VSH_W8A16=1` while
+   box1 was 0, so rank 1 int8-converted its linears (weights freed to (0,))
+   while rank 0 did not. Keep `VSH_W8A16=0` and `VSH_W8A16_LMHEAD=0` for DS4
+   boots; sync `vsh-cluster-env.*.sh` across boxes after ANY edit.
+   Next: Phase 1-2 (port June's fp8 GEMV + MXFP4 decode kernels) — projected
+   ~100-120 ms/step, then DSpark.
