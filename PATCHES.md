@@ -2240,6 +2240,10 @@ cache. Revert: `glm53_enforce_eager: 1`.
 
 ## 35. DS4 native Phase 0 (2026-10-05): template bug found, profile solved, two boot blockers fixed
 
+> **Corrected by §36:** the "chat-template bug" is a decode-path bug (prompts are rendered
+> correctly; every prefill is right, decode steps degrade); the compressor-fusion error was W8A16's
+> freed weight; the int8 lm_head is numerically fine; "MoE exonerated" held only with MTP off.
+
 Boot: `DS4OV_MTP=0 ~/vsh-ds4-reserve.sh` (no spec). Probes: `scripts/ds4probe.py`,
 `scripts/ds4-gen.py`; trace aggregation: `scripts/ds4-trace-agg.py`.
 
@@ -2270,3 +2274,57 @@ Boot: `DS4OV_MTP=0 ~/vsh-ds4-reserve.sh` (no spec). Probes: `scripts/ds4probe.py
 5. Serve-script hooks added (env-gated, inert by default): `VSH_DS4_MOE_KC`
    (kernel-config JSON fragment) and `VSH_DS4_PROFILER_DIR` (torch profiler),
    both read AFTER the cluster-env source.
+
+
+## 36. Phase 0 review fixes, the real DS4 failure, and the FP8 GEMV (2026-10-05)
+
+1. **Per-box env divergence, live GLM regression.** After §35, box2's
+   `vsh-cluster-env.odl.sh` still defaulted `VSH_W8A16` to 0 (box1: 1), and GLM was
+   restarted that way: rank 0 int8 linears, rank 1 bf16 — 106 / 108 ms/step vs 96 / 98.
+   Fixed: env files synced; the restart scripts now pass each model's values to *both*
+   boxes through `ENVPASS` (GLM `VSH_GLM53_W8A16=1 VSH_W8A16_LMHEAD=1`; DS4 `0 0`, plus
+   `VSH_FP8_GEMV` / `VSH_SPARSE_ATTN_SPLIT` knobs), and refuse to start when the two
+   boxes' copies of the env file differ (md5). GLM back to 96 / 101 / 98 ms/step.
+2. **DS4 debug leftovers / rank-divergent code.** box1's — and `pinned-vllm`'s —
+   `models/deepseek_v4/amd/{model.py,rocm.py}` still carried 09-30 diagnostics (a
+   `/tmp/pfbeat` writer with a host sync on prefill; per-layer `DS4_LAYER_DUMP` hooks,
+   armed by the DS4 `ENVPASS`) that box2 did not. Removed everywhere (both boxes and
+   `pinned-vllm` now identical: rocm.py `1b2d260a`, model.py `80910c3e`); the
+   `vsh-cgdiag` instrumentation dropped, `vsh-cgfusion-soft` kept. The DS4 serve /
+   restart / reserve scripts are now tracked in `host/`.
+3. **Corrections to §35.** The compressor-fusion error was W8A16's freed `(0,)` weight
+   on rank 1 (§35's own diagnostic checks `vsh_w8_q`), not an upstream bug. The int8
+   lm_head is numerically fine on DS4's real head (rel 6.7e-3, top-1 agreement 100 %);
+   it stays off for DS4 only as a precaution. "MoE exonerated" held only with MTP off —
+   upstream's `TRITON_UNFUSED` gate is MTP-specific and still untested here.
+4. **The real DS4 failure: decode, not the template.** The 0.31 renderer output is
+   well-formed (thinking: effort preamble + `<｜User｜>…<｜Assistant｜><think>`, 95
+   tokens; non-thinking: 16 tokens ending `</think>`; `scripts/ds4_render_prompt.py`).
+   Battery `scripts/ds4len.py`, spec off, thinking off:
+
+   | probe | result |
+   |---|---|
+   | chat, prompt 16 / 94 / 238 / 450 / 1102 tokens | first token right every time ('Paris') |
+   | raw completion, prompt 22 … 548 tokens | first token ' Paris' every time |
+   | raw continuation after it | coherent at 22-81 tokens; degrades ~120 ('Paris. (3) The The the'); debris from token 2 past ~150 |
+   | chat "count 1..100" | '1, 2, 3, 4, 5, 5, 5, 6, 6, 6' |
+   | 8K needle | stops after 'AM' |
+   | thinking on, short prompt (95 tokens) | degenerate ('We need just answer1 answer…') |
+
+   **Prefill is correct; every decode step degrades, faster the longer the context.**
+   The thinking template only "mattered" by adding 79 tokens. The bug is pre-existing:
+   identical failures with split-KV attention off and with split-KV + FP8 GEMV both off
+   (the stock path). Prime suspect: the BF16-KV decode path — June served DS4 with FP8 KV;
+   native runs BF16 because FP8 KV asserts in aiter on this build — i.e. the decode-time
+   compressor / SWA cache updates and the decode attention over them.
+5. **FP8 GEMV** (`vsh-fp8-gemv.py`, `vsh_fp8_gemv` in `libvsh_w8a16.so`, `VSH_FP8_GEMV`):
+   on gfx1151 with M <= 8, `TritonFp8BlockScaledMMKernel.apply_weights` runs a HIP GEMV
+   on the bf16 activation (no fp8 activation round trip), and `apply_block_scaled_mm`
+   with pre-quantized fp8 activations (DS4's fused q-norm → `wq_b`) dequantizes the
+   1x128 groups first. One wave per output row, fp8 decoded in registers (e4m3fn and
+   e4m3fnuz, exact subnormals), 128x128 block scales, padded rows. Unit tests
+   (`scripts/test_fp8_gemv.py`, `test_fp8_preq.py`): max rel err 1.8e-3 vs exact (stock
+   W8A8 2.6e-2); 16-91x faster per call (16384x1024, M=1: 54 us vs 1.51 ms). DS4, spec
+   off: decode ~150 ms/token vs ~580 (5.6-6.4 vs 1.68 tok/s incl. prefill), same outputs
+   as stock on the battery (the decode bug is unchanged). GLM has no FP8 linears.
+   Next: fix the decode bug; then the MXFP4 MoE port (~99 ms/step) and DSpark.

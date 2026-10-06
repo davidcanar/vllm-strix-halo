@@ -195,3 +195,72 @@ def sigmoid_bias_topk(router_logits, bias, top_k, renormalize, scale):
     if rc != 0:
         raise RuntimeError(f"vsh_sigmoid_bias_topk failed: {rc}")
     return w, ids
+
+
+# ---- FP8 block-scaled linear GEMV (DeepSeek-V4 dense linears on gfx1151) --------
+# The stock path (TritonFp8BlockScaledMMKernel) quantises the activation to fp8
+# and runs the Triton block GEMM, which has no fp8 dot on gfx1151 and reaches
+# 3-11 GB/s at decode sizes (1.4-2.7 ms per call, ~87 % of the DS4 step;
+# PATCHES 35). vsh_fp8_gemv streams the fp8 weight with in-register decode and
+# takes the bf16 activation directly.
+_FP8_K = (512, 1024, 1536, 2048, 3072, 4096, 6144, 7168, 8192)
+_FP8_SCALES: dict = {}
+
+
+def fp8_weight_ok(weight: torch.Tensor, block_scale, group_shape, k: int) -> bool:
+    return (os.environ.get("VSH_FP8_GEMV", "1") not in ("", "0", "off")
+            and weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and weight.dim() == 2
+            and weight.stride(1) == 1 and weight.stride(0) >= weight.shape[1]
+            and weight.stride(0) % 16 == 0 and weight.data_ptr() % 16 == 0
+            and weight.shape[1] in _FP8_K and k == weight.shape[1]
+            and list(group_shape) == [128, 128]
+            and block_scale is not None and block_scale.dim() == 2
+            and block_scale.shape[0] * 128 >= weight.shape[0]
+            and block_scale.shape[1] * 128 >= weight.shape[1])
+
+
+def fp8_gemv_ok(x2d: torch.Tensor, weight: torch.Tensor, block_scale, group_shape) -> bool:
+    return (x2d.dtype == torch.bfloat16 and x2d.dim() == 2 and 0 < x2d.shape[0] <= MAX_ROWS
+            and x2d.stride(1) == 1
+            and fp8_weight_ok(weight, block_scale, group_shape, x2d.shape[1]))
+
+
+def dequant_act_fp8(a: torch.Tensor, a_scale: torch.Tensor) -> torch.Tensor | None:
+    """fp8 activations [M, K] with per-1x128 scales [M, K/128] -> bf16 (or None)."""
+    m, k = a.shape
+    nk = k // 128
+    if k % 128 or a_scale.dim() != 2 or a_scale.shape[0] != m or a_scale.shape[1] < nk:
+        return None
+    return (a.float().view(m, nk, 128) * a_scale[:, :nk].float().unsqueeze(-1)).view(m, k).to(torch.bfloat16)
+
+
+def _fp8_scales(block_scale: torch.Tensor) -> torch.Tensor:
+    if block_scale.dtype == torch.float32 and block_scale.stride(1) == 1:
+        return block_scale
+    key = (block_scale.data_ptr(), block_scale.dtype, tuple(block_scale.shape))
+    s = _FP8_SCALES.get(key)
+    if s is None:   # serve weights are immortal, so keying on data_ptr is safe
+        s = _FP8_SCALES[key] = block_scale.to(torch.float32).contiguous()
+    return s
+
+
+def fp8_gemv(x2d: torch.Tensor, weight: torch.Tensor, block_scale: torch.Tensor) -> torch.Tensor:
+    m, k = x2d.shape
+    n = weight.shape[0]
+    if x2d.data_ptr() % 16 or x2d.stride(0) % 8:
+        x2d = x2d.contiguous()
+    s = _fp8_scales(block_scale)
+    y = torch.empty((m, n), dtype=torch.bfloat16, device=x2d.device)
+    lib = _lib()
+    if not getattr(lib, "_fp8_init", False):
+        lib.vsh_fp8_gemv.restype = ctypes.c_int
+        lib.vsh_fp8_gemv.argtypes = ([ctypes.c_void_p] * 6 + [ctypes.c_int] * 3
+                                     + [ctypes.c_long] * 4 + [ctypes.c_int])
+        lib._fp8_init = True
+    rc = lib.vsh_fp8_gemv(torch.cuda.current_stream().cuda_stream, weight.data_ptr(), s.data_ptr(),
+                          x2d.data_ptr(), y.data_ptr(), None, n, k, m, weight.stride(0),
+                          s.stride(0), x2d.stride(0), y.stride(0),
+                          int(weight.dtype == torch.float8_e4m3fnuz))
+    if rc != 0:
+        raise RuntimeError(f"vsh_fp8_gemv failed: {rc}")
+    return y

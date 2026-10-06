@@ -36,12 +36,22 @@ MODEL_DIR=${VSH_DS4_MODEL_DIR:?vsh-config.yaml: ds4_model_dir missing}
 # VSH_ODL_RANK1_IP: the odl_ar2 rendezvous target — rank 1 is the box2 worker.
 # VSH_GLM53_AITER / VSH_GLM53_ODL_AR2 are the NAMES the shared env files read;
 # we feed them the ds4 profile's values.
-ENVPASS="export VSH_ODL_RANK1_IP=${WORKER_IP:?} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_DS4_AITER:-1} VSH_GLM53_ODL_AR2=${VSH_DS4_ODL_AR2:-1} VLLM_ROCM_USE_AITER_LINEAR=0 DS4_IDX_OFFICIAL=${VSH_DS4_IDX_OFFICIAL:-1};"  # ds4/gfx1151: aiter linear fp8 (GEMM+quant) is MI300-only; stock Triton paths work here
+ENVPASS="export VSH_ODL_RANK1_IP=${WORKER_IP:?} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_DS4_AITER:-1} VSH_GLM53_ODL_AR2=${VSH_DS4_ODL_AR2:-1} VLLM_ROCM_USE_AITER_LINEAR=0 DS4_IDX_OFFICIAL=${VSH_DS4_IDX_OFFICIAL:-1} VSH_GLM53_W8A16=0 VSH_W8A16_LMHEAD=0 VSH_FP8_GEMV=${VSH_FP8_GEMV:-1} VSH_SPARSE_ATTN_SPLIT=${VSH_SPARSE_ATTN_SPLIT:-1};"  # ds4/gfx1151: aiter linear fp8 (GEMM+quant) is MI300-only; stock Triton paths work here
 
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 
 box2() { timeout "${2:-120}" ssh -o BatchMode=yes "$WORKER_IP" "$1"; }
 inbox() { timeout "${2:-120}" podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc "$1"; }
+
+# Both boxes source their OWN copy of $CENV at ray start, so a divergent copy
+# silently gives the two TP ranks different settings (2026-10-05: box2 defaulted
+# VSH_W8A16 to 0 -> rank 0 ran int8 linears, rank 1 bf16). Refuse to start.
+_cenv1=$(md5sum < "$CENV" | cut -c1-32)
+_cenv2=$(box2 "md5sum < $CENV" 30 2>/dev/null | cut -c1-32)
+if [ -z "$_cenv2" ] || [ "$_cenv1" != "$_cenv2" ]; then
+  echo "!! $CENV differs between box1 ($_cenv1) and box2 (${_cenv2:-unreadable}); sync it: scp $CENV $WORKER_IP:"
+  exit 1
+fi
 
 echo "== teardown =="
 systemctl --user stop "$UNIT.service" 2>/dev/null
@@ -118,6 +128,7 @@ done
 # Backgrounded transient unit; best-effort.
 systemctl --user reset-failed vsh-warmup.service 2>/dev/null
 systemd-run --user --collect --unit=vsh-warmup \
+  --setenv=VSH_WARMUP=0 \
   --setenv=VSH_WARMUP_PORT=$PORT --setenv=VSH_WARMUP_MODEL=deepseek-v4-flash \
   --setenv=VSH_WARMUP_CTX=${VSH_DS4_WARMUP_CTX:-32768} \
   /usr/bin/python3 "$HOME/vsh-warmup.py" >/dev/null 2>&1 \

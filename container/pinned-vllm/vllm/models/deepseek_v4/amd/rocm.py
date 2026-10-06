@@ -1013,10 +1013,14 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         main_weight = compressor.fused_wkv_wgate.weight
         indexer_weight = indexer.compressor.fused_wkv_wgate.weight
-        if main_weight.ndim != 2 or indexer_weight.ndim != 2:
-            raise ValueError("DeepSeek V4 compressor weights must be matrices")
-        if main_weight.shape[1] != indexer_weight.shape[1]:
-            raise ValueError("DeepSeek V4 compressor weights must share K")
+        if main_weight.ndim != 2 or indexer_weight.ndim != 2 or main_weight.shape[1] != indexer_weight.shape[1]:  # vsh-cgfusion-soft
+            logger.warning_once(
+                "DeepSeek V4 compressor GEMM fusion skipped: weights are not "
+                "fusible matrices (ndim %d/%d, K %s/%s) - using the unfused path",
+                main_weight.ndim, indexer_weight.ndim,
+                main_weight.shape[1:], indexer_weight.shape[1:],
+            )
+            return False
         if main_weight.dtype != indexer_weight.dtype:
             raise ValueError("DeepSeek V4 compressor weights must share dtype")
         if main_weight.device != indexer_weight.device:
@@ -1396,12 +1400,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         num_decode_tokens = swa_metadata.num_decode_tokens
 
         seq_lens = swa_metadata.prefill_seq_lens
-        try:
-            _s0 = int(seq_lens[0].item()) if seq_lens.numel() else -1
-            open("/tmp/pfbeat", "a").write(f"np={num_prefills} sl0={_s0}\n")
-        except Exception:
-            pass
-
         gather_lens = swa_metadata.prefill_gather_lens
         assert seq_lens is not None
         assert gather_lens is not None
@@ -1507,26 +1505,6 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     else None
                 ),
             )
-            try:
-                _ld = __import__("os").environ.get("DS4_LAYER_DUMP")
-                if _ld and __import__("os").path.exists(_ld + "/ARM"):
-                    import pathlib as _pl
-                    import torch as _t
-                    _p = _pl.Path(_ld)
-                    _t.save(
-                        {
-                            "kv": kv[:1, :16, :].detach().float().cpu(),
-                            "ci": combined_indices.detach().cpu(),
-                            "cl": combined_lens.detach().cpu(),
-                            "q": q[query_start:query_end].detach()[:8].float().cpu(),
-                        },
-                        str(_p / ("attn_new.pt")),
-                    )
-            except Exception as _e:
-                try:
-                    open("/tmp/attnerr_new", "a").write(repr(_e)[:500] + "\n")
-                except Exception:
-                    pass
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),

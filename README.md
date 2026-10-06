@@ -183,22 +183,14 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-5. **DS4 native decode** — Phase 0 complete (2026-10-05). Findings:
-   (a) the "degenerate output" was a **chat-template bug**: the serve default
-   `--default-chat-template-kwargs '{"thinking":true,...}'` renders a corrupt
-   prompt on this build — with `thinking:false` the model is correct
-   ('Paris' at 1.3 s TTFT) and every kernel A/B (emulation MoE, split-KV off,
-   int8 lm_head off) only mattered through it; (b) decode is still
-   **~1.7-1.8 tok/s (~580 ms/step)** and the profile is unambiguous:
-   **~87 % of the step is `_w8a8_triton_block_scaled_mm`** (215 calls/step x
-   2.36 ms on decode-sized batches) plus ~17 % `_matmul_NNT_bf16xbf16xmxfp4`
-   (the MXFP4 MoE) — exactly the two seams June replaced with hand-written
-   GEMV kernels (ds4_fp8_gemv_hip.cpp, ds4_moe_mxfp4.cpp); (c) two boot
-   blockers found and fixed: the C4 compressor GEMM fusion now fails soft
-   (`vsh-cgfusion-soft`, the unfused path is pre-fusion behavior), and the
-   **per-box env files diverge silently** — box2 kept `VSH_W8A16=1` while
-   box1 was 0, so rank 1 int8-converted its linears (weights freed to (0,))
-   while rank 0 did not. Keep `VSH_W8A16=0` and `VSH_W8A16_LMHEAD=0` for DS4
-   boots; sync `vsh-cluster-env.*.sh` across boxes after ANY edit.
-   Next: Phase 1-2 (port June's fp8 GEMV + MXFP4 decode kernels) — projected
-   ~100-120 ms/step, then DSpark.
+5. **DS4 native decode** — §35-§36. Prompts are read correctly at every
+   length (first token right from 16 to 1,102-token prompts), but **every decode
+   step degrades**, sooner the longer the context (coherent below ~100 positions,
+   debris past ~150; the 8K needle stops after 2 tokens). The earlier
+   "chat-template bug" was this: thinking mode adds 79 prompt tokens. Pre-existing
+   (identical with our split-KV and FP8 GEMV off); prime suspect is the BF16-KV
+   decode path (June ran FP8 KV, which asserts in aiter here). Speed: the FP8 GEMV
+   (§36) cut decode from ~580 to ~150 ms/token; the MXFP4 MoE (~99 ms) is next.
+   DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both ranks — the DS4
+   restart/reserve scripts pass them, and every restart script refuses to start
+   when the two boxes' env files differ.

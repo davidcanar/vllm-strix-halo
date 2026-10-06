@@ -30,7 +30,18 @@
 # Do not add comments inside the backslash-continued `vllm serve` command
 # below: a '#' there silently comments out every remaining argument.
 set -u
+
 source "$HOME/vsh-cluster-env.${VSH_TRANSPORT:-tcp}.sh"
+
+# TEMP phase-0: VSH_DS4_MOE_KC is a pre-built JSON fragment for kernel-config,
+# e.g. ',"moe_backend":"emulation"' (set in vsh-cluster-env or the caller).
+VSH_DS4_MOE_KC=${VSH_DS4_MOE_KC:-}
+PROF=()
+if [ -n "${VSH_DS4_PROFILER_DIR:-}" ]; then
+  mkdir -p "$VSH_DS4_PROFILER_DIR"
+  PROF=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$VSH_DS4_PROFILER_DIR\",\"torch_profiler_with_stack\":false,\"delay_iterations\":0,\"active_iterations\":12}")
+  echo "[vsh-ds4-serve] torch profiler ENABLED dir=$VSH_DS4_PROFILER_DIR"
+fi
 # gfx1151: aiter linear fp8 (GEMM + activation quant) is MI300-only on this
 # build (no fp8 tensors in its pybind dtype table; Triton fp8 dot unsupported).
 # VLLM_ROCM_USE_AITER stays 1 for the sparse-attention/indexer aiter ops.
@@ -121,7 +132,7 @@ exec vllm serve "$MODEL_DIR" \
   "${HF_OVERRIDE_ARGS[@]}" \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
-  "${EAGER[@]}" \
+  "${EAGER[@]}" "${PROF[@]}" \
   "${KVD[@]}" \
   --gpu-memory-utilization ${VSH_DS4_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${VSH_DS4_KV_BYTES:-6442450944} \
@@ -132,5 +143,5 @@ exec vllm serve "$MODEL_DIR" \
   --override-generation-config '{"temperature":0.0,"top_p":1.0}' \
   "${TOOLS[@]}" \
   "${SPEC[@]}" \
-  --kernel-config '{"linear_backend":"triton"}' \
+  --kernel-config "{\"linear_backend\":\"triton\"${VSH_DS4_MOE_KC}}" \
   --host 0.0.0.0 --port "$PORT"

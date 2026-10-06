@@ -129,6 +129,116 @@ extern "C" int vsh_w8_dequant(void* stream, const void* W, const void* S, void* 
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
+// ---- FP8 (e4m3) block-scaled weight GEMV, bf16 activations (DeepSeek-V4 linears) ----
+// W fp8 [N][ldw] (rows may be padded: ldw >= K, 16 B aligned), block scales
+// S fp32 [ceil(N/128)][ss] (one per 128x128 block), X bf16 [M][K], Y bf16 [M][N].
+// Same skeleton as the W8A16 kernel (one wave per output row, 16*VEC contiguous
+// bytes per lane per step); each weight byte is decoded once and reused for all
+// M rows. The activation is used as bf16 directly: no fp8 activation round trip
+// (the stock W8A8 path quantises x per 128-group first), so this is the more
+// exact of the two. FNUZ=1 decodes e4m3fnuz (exponent bias 8) instead of e4m3fn.
+template <int FNUZ>
+__device__ __forceinline__ float fp8_to_f32(uint32_t b) {
+  const uint32_t e = (b >> 3) & 0xF, m = b & 0x7;
+  // normal: exponent rebias by bits; subnormal: m * 2^(1 - bias - 3)
+  const float nrm = __uint_as_float(((b & 0x7Fu) << 20) + ((FNUZ ? 119u : 120u) << 23));
+  const float sub = (float)m * (FNUZ ? 0x1p-10f : 0x1p-9f);
+  const float v = e ? nrm : sub;
+  return (b & 0x80u) ? -v : v;
+}
+
+template <int K, int MT, int VEC, int FNUZ>
+__global__ __launch_bounds__(WAVES * WS) void fp8_gemv_kernel(
+    const uint8_t* __restrict__ W, const float* __restrict__ S, const uint16_t* __restrict__ X,
+    uint16_t* __restrict__ Y, const uint16_t* __restrict__ bias, int N, int M, long ldw, long ss,
+    long sx, long sy) {
+  constexpr int STEP = WS * 16 * VEC;
+  static_assert(K % STEP == 0 && 16 * VEC <= 128, "tile");
+  const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
+  const int n = blockIdx.x * WAVES + wave;
+  if (n >= N) return;
+  float acc[MT];
+#pragma unroll
+  for (int t = 0; t < MT; ++t) acc[t] = 0.f;
+  const uint8_t* wrow = W + (long)n * ldw;
+  const float* srow = S + (long)(n >> 7) * ss;
+  for (int it = 0; it < K / STEP; ++it) {
+    const int k0 = it * STEP + lane * 16 * VEC;
+    uint4 w[VEC];
+    const uint4* p = (const uint4*)(wrow + k0);
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) w[v] = p[v];
+    const float sc = srow[k0 >> 7];
+    float part[MT];
+#pragma unroll
+    for (int t = 0; t < MT; ++t) part[t] = 0.f;
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) {
+      const uint32_t wu[4] = {w[v].x, w[v].y, w[v].z, w[v].w};
+      float wf[16];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int b = 0; b < 4; ++b) wf[4 * j + b] = fp8_to_f32<FNUZ>((wu[j] >> (8 * b)) & 0xFF);
+#pragma unroll
+      for (int t = 0; t < MT; ++t) {
+        if (t >= M) break;
+        const uint4* xp = (const uint4*)(X + (long)t * sx + k0 + v * 16);
+        const uint4 xa = xp[0], xb = xp[1];
+        const uint32_t xu[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          s += wf[2 * j] * __uint_as_float(xu[j] << 16);
+          s += wf[2 * j + 1] * __uint_as_float(xu[j] & 0xFFFF0000u);
+        }
+        part[t] += s;
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[t] += part[t] * sc;
+  }
+#pragma unroll
+  for (int t = 0; t < MT; ++t)
+#pragma unroll
+    for (int off = WS / 2; off > 0; off >>= 1) acc[t] += __shfl_xor(acc[t], off, WS);
+  if (lane == 0) {
+    const float b = bias ? bf2f(bias[n]) : 0.f;
+    for (int t = 0; t < M; ++t) Y[(long)t * sy + n] = f2bf(acc[t] + b);
+  }
+}
+
+extern "C" int vsh_fp8_gemv(void* stream, const void* W, const void* S, const void* X, void* Y,
+                            const void* bias, int N, int K, int M, long ldw, long ss, long sx,
+                            long sy, int fnuz) {
+  if (M < 1 || M > MMAX) return -1;
+  if (ldw < K || (ldw & 15)) return -4;
+  dim3 grid((N + WAVES - 1) / WAVES), block(WAVES * WS);
+  hipStream_t st = (hipStream_t)stream;
+#define LF(KK, MM, VV, FZ) hipLaunchKernelGGL((fp8_gemv_kernel<KK, MM, VV, FZ>), grid, block, 0, st, \
+      (const uint8_t*)W, (const float*)S, (const uint16_t*)X, (uint16_t*)Y, (const uint16_t*)bias, \
+      N, M, ldw, ss, sx, sy)
+#define LFM(KK, VV, FZ) do { if (M == 1) LF(KK, 1, VV, FZ); else if (M <= 4) LF(KK, 4, VV, FZ); \
+      else LF(KK, 8, VV, FZ); } while (0)
+#define LFK(KK, VV) do { if (fnuz) LFM(KK, VV, 1); else LFM(KK, VV, 0); } while (0)
+  switch (K) {
+    case 512: LFK(512, 1); break;
+    case 1024: LFK(1024, 2); break;
+    case 1536: LFK(1536, 1); break;
+    case 2048: LFK(2048, 4); break;
+    case 3072: LFK(3072, 2); break;
+    case 4096: LFK(4096, 4); break;
+    case 6144: LFK(6144, 4); break;
+    case 7168: LFK(7168, 1); break;
+    case 8192: LFK(8192, 4); break;
+    default: return -2;
+  }
+#undef LFK
+#undef LFM
+#undef LF
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
 // ---- fp32-weight GEMV for the MoE router gate (fp32 weights, bf16 x, fp32 out) ----
 // One wave per output row; each lane reads 16 contiguous fp32 weights (4 x 16 B)
 // and 16 bf16 activations per step.

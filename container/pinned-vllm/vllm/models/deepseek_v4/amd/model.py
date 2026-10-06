@@ -7,7 +7,6 @@ from dataclasses import replace
 from itertools import islice
 
 import regex as re
-import pathlib
 import torch
 import torch.nn as nn
 
@@ -1123,22 +1122,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
-            # --- ds4 layer dump (env-gated diagnostic; inert unless DS4_LAYER_DUMP set)
-            try:
-                _ld = __import__("os").environ.get("DS4_LAYER_DUMP")
-                if _ld and __import__("os").path.exists(_ld + "/ARM") and __import__("vllm.distributed", fromlist=["get_tensor_model_parallel_rank"]).get_tensor_model_parallel_rank() == 0:
-                    import pathlib as _pl
-                    import torch as _t
-                    _p = _pl.Path(_ld)
-                    _p.mkdir(parents=True, exist_ok=True)
-                    _t.save({"h": hidden_states.detach()[:8].float().cpu()}, str(_p / ("new_l%02d.pt" % idx)))
-            except Exception as _e:
-                try:
-                    import pathlib as _pl2
-                    _pl2.Path(_ld, "ERR").write_text(repr(_e)[:500])
-                except Exception:
-                    pass
-
             if (idx + 1) in self.aux_hidden_state_layers:
                 # On the unfused path the layer already applied hc_post,
                 # so hidden_states is the reconstructed stream; on the fused

@@ -34,12 +34,22 @@ UNIT=vsh-glm-manual
 MODEL_DIR=${VSH_GLM53_MODEL_DIR:?vsh-config.yaml: glm53_model_dir missing}
 # Exports that must reach the env files on BOTH boxes (sourced at ray start).
 # VSH_ODL_RANK1_IP: the odl_ar2 rendezvous target — rank 1 is the box2 worker.
-ENVPASS="export VSH_ODL_RANK1_IP=${WORKER_IP:?} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-1} VSH_GLM53_ODL_AR2=${VSH_GLM53_ODL_AR2:-1};"
+ENVPASS="export VSH_ODL_RANK1_IP=${WORKER_IP:?} VLLM_HOST_IP=${HEAD_IP:?} VSH_GLM53_AITER=${VSH_GLM53_AITER:-1} VSH_GLM53_ODL_AR2=${VSH_GLM53_ODL_AR2:-1} VSH_KDA_QUANT=${VSH_KDA_QUANT:-0} VLLM_ROCM_USE_AITER_LINEAR=${VLLM_ROCM_USE_AITER_LINEAR:-0} VLLM_ROCM_USE_AITER_LINEAR_HIPBMM=${VLLM_ROCM_USE_AITER_LINEAR_HIPBMM:-0} VSH_GLM53_W8A16=${VSH_GLM53_W8A16:-1} VSH_W8A16_LMHEAD=${VSH_W8A16_LMHEAD:-1};"
 
 [ -f "$CENV" ] || { echo "!! $CENV missing (transport=$TRANSPORT)"; exit 1; }
 
 box2() { timeout "${2:-120}" ssh -o BatchMode=yes "$WORKER_IP" "$1"; }
 inbox() { timeout "${2:-120}" podman exec -u 1000:1000 -w "$HOME" "$CTR" bash -lc "$1"; }
+
+# Both boxes source their OWN copy of $CENV at ray start, so a divergent copy
+# silently gives the two TP ranks different settings (2026-10-05: box2 defaulted
+# VSH_W8A16 to 0 -> rank 0 ran int8 linears, rank 1 bf16). Refuse to start.
+_cenv1=$(md5sum < "$CENV" | cut -c1-32)
+_cenv2=$(box2 "md5sum < $CENV" 30 2>/dev/null | cut -c1-32)
+if [ -z "$_cenv2" ] || [ "$_cenv1" != "$_cenv2" ]; then
+  echo "!! $CENV differs between box1 ($_cenv1) and box2 (${_cenv2:-unreadable}); sync it: scp $CENV $WORKER_IP:"
+  exit 1
+fi
 
 echo "== teardown =="
 systemctl --user stop "$UNIT.service" 2>/dev/null
