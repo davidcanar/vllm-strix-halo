@@ -19,8 +19,11 @@
 #     it is set. The pool is a fixed-size LRU and does not grow with
 #     --max-model-len. DS4 always runs DeepSeek's fp8_ds_mla KV format on this
 #     build: the 6 GiB pin holds 1,353,463 tokens (2.58 sessions at 512K).
-#   --max-num-batched-tokens 512  NOT 2048; the indexer/top-k workspace scales
-#     with batch x context and 2048 costs ~10 GiB more at 256K.
+#   --max-num-batched-tokens  2048 (ds4_max_batched) since PATCHES 42. The old
+#     "512, 2048 costs ~10 GiB more" lesson was the decode-logits workspace
+#     (heads x rows x max_model_len fp32), which grew with the batch because the
+#     row bound could not read max_num_seqs in the worker; ds4_max_seqs plus
+#     VSH_DS4_DECODE_ROWS (vsh-ds4-decode-rows) bound it at 16 x (1+k) rows.
 #
 # KV dtype: leave auto. vLLM selects DeepSeek's fp8_ds_mla cache format for
 # this model by itself (boot log: "Using DeepSeek's fp8_ds_mla KV cache
@@ -102,6 +105,16 @@ fi
 TOOLS=(--enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}')
 echo "[vsh-ds4-serve] tool-call + reasoning parsers ON (deepseek_v4)"
 
+# max_num_seqs knob: vLLM picks 1024 on a >70 GiB device, and on gfx1151 the
+# paged-MQA decode logits workspace is (64 heads x min(batch, max_num_seqs x 6)
+# x max_model_len) fp32 -- 64 GiB at a 2048-token prefill chunk and 512K
+# context. ds4_max_seqs: 16 bounds it at 96 rows = 12 GiB (PATCHES 42).
+MAXSEQS=()
+if [ -n "${VSH_DS4_MAX_SEQS:-}" ]; then
+  MAXSEQS=(--max-num-seqs "$VSH_DS4_MAX_SEQS")
+  echo "[vsh-ds4-serve] max-num-seqs $VSH_DS4_MAX_SEQS"
+fi
+
 # KV cache dtype knob (see header).
 KVD=()
 if [ -n "${VSH_DS4_KV_DTYPE:-}" ] && [ "${VSH_DS4_KV_DTYPE}" != "auto" ]; then
@@ -146,6 +159,7 @@ exec vllm serve "$MODEL_DIR" \
   --kv-cache-memory-bytes ${VSH_DS4_KV_BYTES:-6442450944} \
   --max-model-len "${VSH_DS4_MAX_CTX:-524288}" \
   --max-num-batched-tokens ${VSH_DS4_MAX_BATCHED:-512} \
+  "${MAXSEQS[@]}" \
   --trust-remote-code \
   --tokenizer-mode deepseek_v4 \
   --override-generation-config '{"temperature":0.0,"top_p":1.0}' \

@@ -48,7 +48,8 @@ ds4_kv_dtype: auto                   # leave auto: DS4 always uses DeepSeek's fp
 ds4_kv_bytes: 6442450944             # 6 GiB pin = 1,353,463 tokens of fp8_ds_mla KV (2.58 sessions at 512K)
 ds4_gpu_util: 0.83                   # inert while kv_bytes is pinned
 ds4_max_ctx: 524288                  # 512K, as the June stack (needle-tested, PATCHES 41)
-ds4_max_batched: 512                 # indexer workspace lesson -- do not raise
+ds4_max_batched: 2048                # prefill chunk; 512 -> 2048 = 1.2-1.3x prefill (PATCHES 42); needs ds4_max_seqs
+ds4_max_seqs: 16                     # caps the gfx1151 decode-logits workspace at 16 x (1+k) rows (12 GiB at 512K)
 ds4_warmup_ctx: 32768
 
 # ---------------- site ------------------------------------------------------

@@ -6,9 +6,10 @@
 > opencode request), image input works, prefix caching works, and decode is
 > **20–28 tok/s** (DFlash2 k=3, CUDA graphs) after the §28–§33 decode rounds.
 > DS4 (DeepSeek-V4-Flash-Vision-Exp) runs on the native 0.31 port: correct
-> since §37, **25–26 tok/s** with DSpark since §41 (the June stack via
-> `ds4_engine: delegate` measures 17–24), image input works, and 512K context
-> fits (needles pass at the full 512K window). Table below.
+> since §37, **25–27 tok/s** with DSpark (§41; the June stack via
+> `ds4_engine: delegate` measures 17–24), image input works, 512K context fits
+> (needles pass at the full 512K window), and prefill runs ~330–460 tok/s up to
+> 128K (§42). Table below.
 
 | metric (GLM-5.3-Flash AWQ W4A16, TP=2, DFlash2 k=3, CUDA graphs) | value |
 |---|---|
@@ -21,17 +22,17 @@
 
 | metric (DeepSeek-V4-Flash-Vision-Exp, TP=2, DSpark k=5, eager) | value |
 |---|---|
-| decode | **25.4–26.1 / 23.2–25.7 tok/s** prose / JSON, counting 48–51 tok/s, acceptance 2.6–2.8 (110 ms step) — was 2.2 tok/s at the start of §35 |
+| decode | **25.4–27.3 / 23.1–25.7 tok/s** prose / JSON, counting 48–52 tok/s, acceptance 2.6–2.8 (110 ms step) — was 2.2 tok/s at the start of §35 |
 | decode, spec off | 15.4 tok/s eager, 16.7 with PIECEWISE graphs |
 | CUDA graphs | work, but with DSpark they are slower (20.8 / 21.6 tok/s), so DS4 runs eager (§39, §41) |
-| prefill | ~300 tok/s at 8K, 263 at 32K, 232 at 64K; slower beyond (quadratic indexer) |
-| time to first token | 0.4 s for a short prompt, 23 s at 8K, 2.1 min at 32K, 4.7 min at 64K, 11.6 min at 128K, 32.0 min at 256K, 96.7 min at the full 512K window (thinking off) |
-| context | 512K max (`ds4_max_ctx`); KV pool 1.35M tokens (fp8_ds_mla, 2.58 × 512K); needles 3/3 at 32K–512K (§41 table) |
+| prefill | ~460 tok/s at 8K, 408 at 32K, 378 at 64K, 331 at 128K (§42: indexer kernel, mHC tiles, 2048-token chunks) |
+| time to first token | 0.4 s for a short prompt, 15 s at 8K, 80 s at 32K, 2.9 min at 64K, 6.6 min at 128K (§42); predicted ~17 min at 256K and ~46 min at 512K (§41 measured 32 / 97 min before §42) |
+| context | 512K max (`ds4_max_ctx`); KV pool 901,584 tokens with 2048-token chunks (fp8_ds_mla in the 6 GiB pin, 1.72 × 512K); needles 3/3 at 32K–512K (§41, §42) |
 | image input | ✅ OCR, colours/shapes, a table cell, a 1920×1080 image; 1.5–3.4 s per image request; counting slips (7 discs → 6) |
 | thinking / tools | thinking mode ✅ (`chat_template_kwargs.thinking`); `deepseek_v4` tool + reasoning parsers |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§41). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§42). This README is the current state only.
 
 ---
 
@@ -117,8 +118,10 @@ serves correctly since §37. On top of the 09-30 gfx1151 port: `vsh-ds4-decode-i
 block-FP8 linears at decode sizes, §36/§38), `vsh-fp8-prefill.py` (the same linears at
 prefill sizes: exact bf16 weight + hipBLASLt, §41), `vsh-mxfp4-direct.py` + `vsh_moe_int4.hip`
 (direct MXFP4 MoE, v5 kernel tuned on real routing, §38–§41), `vsh-ds4-mmf32.py` (compressor
-scores on the bf16 GEMV, §40), `cgfusion-soft.py` (§35); speed and remaining work in Known
-issues 5.
+scores on the bf16 GEMV, §40), `vsh-ds4-idx-logits.py` (prefill indexer on fp16 WMMA, §42),
+`vsh-ds4-mhc-cfg.py` (gfx1151 mHC tiles, §42), `vsh-ds4-decode-rows.py` (bounded
+decode-logits workspace for 2048-token chunks, §42), `cgfusion-soft.py` (§35); speed and
+remaining work in Known issues 5.
 
 ## Architecture
 
@@ -139,10 +142,11 @@ issues 5.
   `kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.30.0`; vLLM pinned
   at `73859fec`; `container/pinned-vllm/` + `container/pinned-triton/` carry
   the byte-exact patched files for reproducible rebuilds). Snapshot of the
-  running stack on both boxes: `vllm-strix-halo:glm-perf41-20261006`
-  (through §41; `:local` points at it)
-- **KV cache**: 16 GiB pinned, 256K max context (GLM); DS4: 6 GiB pinned = 1.35M
-  tokens of fp8_ds_mla, 512K max context
+  stack on both boxes: `vllm-strix-halo:glm-perf41-20261006` (through §41;
+  `:local` points at it; §42's DS4 prefill work is live in the containers and in
+  `container/pinned-vllm/`, not yet in a snapshot)
+- **KV cache**: 16 GiB pinned, 256K max context (GLM); DS4: 6 GiB pinned = 901,584
+  tokens of fp8_ds_mla with 2048-token prefill chunks, 512K max context
 - **Speculative decoding**: DFlash2 drafter, k=3 (`glm53_spec_method: dflash`,
   `glm53_mtp_tokens: 3`); MTP (`glm5_next_mtp`) is the fallback and spec-off
   works too (§34)
@@ -185,7 +189,7 @@ vllm-strix-halo/
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
 ├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, ds4*, moe_*, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§41)
+├── PATCHES.md               # detailed patch history and lessons (§1–§42)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
@@ -210,15 +214,15 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-5. **DS4 native** — correct since §37; with MoE v5 and the FP8 prefill path (§41)
-   25.4–26.1 / 23.2–25.7 tok/s prose / JSON with DSpark k=5 (eager), 15.4 tok/s
-   without spec. Needles, counting, thinking mode and image input pass; 512K context
-   fits (needles 3/3 up to the full 512K window, 97 min to the first token there).
-   CUDA graphs work but are slower with DSpark (+8 % without spec), so DS4 stays
-   eager. Remaining levers: prefill — the indexer logits kernel (one program per
-   query row, re-reading every earlier key: quadratic) dominates long prompts, then
-   the MoE prefill matmul, the all-reduce over Thunderbolt and mHC; decode — the
-   MoE (38 % of GPU time), the bf16 `wo_a` einsum (10.7 ms/step), ~8.6 ms/step of
-   GPU idle. DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both ranks — the
-   DS4 restart/reserve scripts pass them, and every restart script refuses to start
-   when the two boxes' env files differ.
+5. **DS4 native** — correct since §37; 25.4–27.3 / 23.1–25.7 tok/s prose / JSON with
+   DSpark k=5 (eager, §41), 15.4 tok/s without spec. Needles, counting, thinking mode
+   and image input pass; 512K context fits. Prefill ~330–460 tok/s up to 128K (§42);
+   it still slows with context because the indexer scores every earlier compressed
+   position (now on fp16 WMMA, ~9x aiter's kernel). CUDA graphs work but are slower
+   with DSpark (+8 % without spec), so DS4 stays eager. Remaining levers: a fused
+   indexer logits + top-k kernel (the [rows x context/4] logits matrix is the rest of
+   the quadratic term), the prefill MoE, the all-reduce over Thunderbolt; decode — the
+   MoE (38 % of GPU time), the bf16 `wo_a` einsum (10.7 ms/step). DS4 boots need
+   `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both ranks and `ds4_max_seqs` for the 2048-token
+   chunks — the DS4 restart/reserve scripts pass them, and every restart script refuses
+   to start when the two boxes' env files differ.

@@ -1024,6 +1024,23 @@ def mqa_logits_module():
     return None
 
 
+_VSH_IDX_ON = None
+
+
+def _vsh_idx_logits_on() -> bool:  # [vsh-ds4-idx-logits]
+    global _VSH_IDX_ON
+    if _VSH_IDX_ON is None:
+        import os
+
+        on = os.environ.get("VSH_IDX_LOGITS", "1") not in ("", "0", "off")
+        if on:
+            from vllm.platforms.rocm import on_gfx1151
+
+            on = on_gfx1151()
+        _VSH_IDX_ON = on
+    return _VSH_IDX_ON
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -1210,6 +1227,11 @@ def _max_decode_logits_rows(num_batched_tokens: int) -> int:
     smaller; the workspace is locked after profiling, so it must not be under-
     estimated.
     """
+    import os as _os
+
+    _cap = _os.environ.get("VSH_DS4_DECODE_ROWS", "")  # [vsh-ds4-decode-rows]
+    if _cap.isdigit() and int(_cap) > 0:
+        return min(num_batched_tokens, int(_cap))
     try:
         vllm_config = get_current_vllm_config()
     except Exception:
@@ -1382,13 +1404,26 @@ def rocm_aiter_sparse_attn_indexer(
                     "NORMAL" if _indexer_k_is_c4a_block_flat(compress_ratio) else None
                 ),
             )
-            logits = rocm_fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32)),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-            )
+            if compress_ratio > 1 and _vsh_idx_logits_on():
+                # [vsh-ds4-idx-logits] fp16 WMMA indexer logits (~9x aiter's on gfx1151)
+                from vllm.v1.attention.ops.vsh_idx_logits import vsh_idx_logits
+
+                logits = vsh_idx_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    k_fp8,
+                    k_scale.view(torch.float32),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+            else:
+                logits = rocm_fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32)),
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
             if candidate_blocks is not None:
                 from vllm.model_executor.layers.sparse_attn_indexer import (
                     _apply_candidate_mask,

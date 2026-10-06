@@ -2601,3 +2601,78 @@ per query row re-reading every earlier compressed key, fp16 WMMA at 256 VGPRs; a
 version would cut the quadratic term), the MoE prefill (triton_kernels MXFP4 matmul), the
 all-reduce over Thunderbolt, mHC; decode — the MoE (38 % of GPU time), the bf16 `wo_a` einsum
 (10.7 ms/step), ~8.6 ms/step GPU idle.
+
+
+## 42. DS4 prefill: the quadratic indexer, mHC tiles, 2048-token chunks (2026-10-06)
+
+**Why prefill slowed with context.** DeepSeek-V4's sparse attention reads 512 selected
+compressed positions plus a 128-token window per token. Choosing those 512 needs the
+"lightning indexer", which scores **every** earlier compressed position (one per 4 tokens,
+64 heads x 128 dims, in the ~21 C4A layers), so each new token costs more than the last.
+§41's TTFTs fit T(L) = 3.3 ms x L + 3.1e-8 s x L^2/2 to within 1 % up to 512K. There the
+position-dependent part was 70 % of the 97-minute TTFT. Per call the indexer logits kernel
+took 93 ms per layer per 512-token chunk at 128K (`scripts/idx_bench.py`); top-k took 0.4 ms.
+
+1. **Indexer logits** (`vsh_idx_logits.py` + `vsh-ds4-idx-logits.py`, env `VSH_IDX_LOGITS`).
+   aiter's Triton `_fp8_mqa_logits_kernel` runs one program per query row and feeds fp8
+   operands to `tl.dot`. gfx1151 has no fp8 WMMA, so they are converted to fp16 inside the
+   key loop for every query, giving 2.7-3.0 TFLOPS. The replacement converts Q and K to fp16
+   once per call and runs one fp16 WMMA dot per [64 heads x 128] x [128 x 64 keys] tile:
+   about 25 TFLOPS, **8.7-8.9x**. The -inf masks are identical, the logits differ by rel 1e-7,
+   and the top-k selections are 100 % identical (`scripts/test_idx_logits.py`). Batching query
+   rows per program (BQ > 1) did not help. Only the DS4 call site switches (compress_ratio > 1);
+   GLM-5.3 keeps aiter.
+2. **mHC tiles** (`vsh-ds4-mhc-cfg.py`, env `VSH_MHC_CFG`). aiter's mHC tile table has no
+   gfx1151 entry. Its fallback runs the fused post+pre GEMM at 13-16 GB/s: 2.6 ms per call at
+   512 tokens (17 % of prefill), 38 us at decode. The sweeps (`scripts/mhc_aiter_sweep.py`,
+   `mhc_aiter_unfused.py`) chose:
+   - tiles (64,16,16,32) up to 32 rows and (32,16,16,32) above;
+   - aiter's own unfused post+pre path from 384 rows (aiter switches at 1024);
+   - mhc_pre split-k 64 / 16 / 1 by rows.
+
+   End to end, including the sinkhorn tail (`scripts/test_mhc_cfg.py`, `test_mhc_small.py`):
+   - **4.8x** at 512 rows (2.98 -> 0.62 ms);
+   - 2.1-2.5x at 128-384 rows and 1.3x at 2048;
+   - **1.7x** at decode sizes (42.6 -> 25.2 us of stream time, ~1.6 ms per DSpark step).
+
+   Outputs match aiter, except for the ~1e-3 rounding of aiter's fused GEMM where the unfused
+   path now runs; the unfused path is closer to fp32. Dead end: two Triton fused kernels, one
+   with an fp32 FMA dot and one with a bf16 hi/lo WMMA dot, reached only 10-20 GB/s. That is
+   slower than aiter's HIP kernel even before tuning, so they were dropped.
+3. **2048-token prefill chunks** (`ds4_max_batched: 2048`, `ds4_max_seqs: 16`,
+   `vsh-ds4-decode-rows.py`). At 512-token chunks the prefill MoE is weight-bound: each
+   chunk reads every expert. The old "512, not 2048" rule came from the gfx1151 decode-logits
+   workspace, which is (heads, rows, max_model_len) fp32, i.e. 128 MiB per row at 512K.
+   `_max_decode_logits_rows` caps the rows at max_num_seqs x (1 + k) only when it can read
+   the vLLM config. Inside the worker's custom op it cannot, so the cap fell back to the
+   batch's token count: 512 rows and 64 GiB at 2048-token chunks, which failed to boot.
+   vLLM also defaults max_num_seqs to 1024 on a device with more than 70 GiB. Now
+   `ds4_max_seqs: 16` caps the batch and the launch scripts export
+   `VSH_DS4_DECODE_ROWS` = 16 x (1 + k) = 96 rows (12 GiB). Free memory after boot went from
+   ~9-12 to 24-27 GB per box. The KV pool (still the 6 GiB pin) reports 901,584 tokens, down
+   from 1,353,463, which is 1.72 sessions at 512K; raise `ds4_kv_bytes` if more prefix cache
+   is wanted.
+
+Results (DSpark k=5, eager, battery all PASS, `scripts/ds4ctx.py`; needles 3/3 everywhere):
+
+| prompt | §41 (aiter indexer, 512 chunk) | + indexer + mHC | + 2048 chunks (production) |
+|---|---|---|---|
+| 8K (needle) | 23.1 s | 21.2 s | **14.9 s** (~460 tok/s) |
+| 32K | 124 s (263 tok/s) | 103 s (316) | **80 s (408)** |
+| 64K | 280 s (232) | 212 s (307) | **172 s (378)** |
+| 128K | 695 s (188) | 473 s (276) | **394 s (331)** |
+| 256K / 512K (fit) | 32 / 97 min (measured) | — | ~17 / ~46 min (predicted) |
+
+New fit: T(L) = 2.25 ms x L + 1.2e-8 s x L^2/2; it predicts the measured 128K within 1 %.
+Decode is unchanged or slightly better: prose 27.1-27.3 tok/s, JSON 23.1, counting 52,
+short-prompt TTFT 0.43 s. Images 4/5 as before.
+
+Next levers:
+- **Remaining quadratic part.** It is mostly the logits matrix itself: [rows x context/4]
+  fp32, filled with -inf, written, then read again by top-k. A fused logits + top-k kernel
+  would remove it.
+- **Fixed per-token part (2.25 ms per token).** The prefill MoE (triton_kernels; already
+  compute-bound at 2048), the RCCL all-reduce over Thunderbolt (~1-2 GB/s), FP8 linears
+  and sparse attention.
+- **GLM.** GLM-5.3 could take the same indexer kernel at its own call site after a GLM
+  validation run.
