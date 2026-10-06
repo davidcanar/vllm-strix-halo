@@ -16,8 +16,9 @@
 |---|---|
 | decode | **23–27 / 25–29 / 19.6–19.9 tok/s** JSON / tools / prose (`vsh_ab.py`; tok/s moves with draft acceptance), 95–99 ms/step (§44) — was 12.0 tok/s before §28 |
 | prefill | 278–294 tok/s cold at 5.8K–19.9K (§44); for ~2.5 min after a boot the warm-up prefill holds the engine |
-| TTFT, 13.9K context | ~50 s cold → **0.95 s cached** (§20); hits land on 2304-token boundaries, so a repeat recomputes the tail past the last one (16.1K prompt: 57 s → 8.4 s, §44) |
-| long-context retrieval | ✅ 3/3 mid-context at 6.8K/13K/32K/69K (§44); tail needles PASS to 255K; adversarial PASS |
+| TTFT, 13.9K context | ~50 s cold → **0.95 s cached** (§20); hits land on 2304-token boundaries, so a repeat recomputes the tail past the last one (16.1K prompt: 57 s → 8.4 s, §44). The template puts the reasoning effort first, so changing it between turns misses the whole cache (§45) |
+| context | 512K max (`glm53_max_ctx`, §45); KV pool 1,263,415 tokens (2.41 × 512K); cold TTFT 8.5 min at 128K, ~20 min at 256K, ~49 min at 512K (fit); a cached repeat of 128K: 9.5 s; decode at 128K context 21–22 tok/s |
+| long-context retrieval | ✅ 3/3 mid-context at 6.8K/13K/32K/69K/128K (§44, §45); tail needles PASS to 255K; adversarial PASS |
 | tool calling | ✅ 8/8 on the captured opencode request (§27.1, §44); opencode replay 3/3 |
 | greedy reproducibility | ⚠️ reproducible up to ~2K prompt tokens, not above (upstream kernel arithmetic, §15.8, §44) |
 | image input | ✅ vision encoder in BF16; 5/5 probes (OCR, colours, counting, a table cell, 1920×1080), 3.8–16.5 s (§44) |
@@ -35,7 +36,7 @@
 | thinking / tools | thinking mode ✅ (`chat_template_kwargs.thinking`); `deepseek_v4` tool + reasoning parsers |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§44). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§45). This README is the current state only.
 
 ---
 
@@ -147,7 +148,7 @@ remaining work in Known issues 5.
   the byte-exact patched files for reproducible rebuilds). Snapshot of the
   stack on both boxes: `vllm-strix-halo:glm-perf44-20261006` (through §44;
   `:local` points at it)
-- **KV cache**: 16 GiB pinned, 256K max context (GLM); DS4: 6 GiB pinned = 901,584
+- **KV cache**: 16 GiB pinned, 512K max context (GLM, §45); DS4: 6 GiB pinned = 901,584
   tokens of fp8_ds_mla with 2048-token prefill chunks, 512K max context
 - **Speculative decoding**: DFlash2 drafter, k=3 (`glm53_spec_method: dflash`,
   `glm53_mtp_tokens: 3`); MTP (`glm5_next_mtp`) is the fallback and spec-off
@@ -192,7 +193,7 @@ vllm-strix-halo/
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
 ├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, ds4*, moe_*, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§44)
+├── PATCHES.md               # detailed patch history and lessons (§1–§45)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```

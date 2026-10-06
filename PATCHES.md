@@ -2785,3 +2785,60 @@ Docs and config:
   matches production (256K, 8192), and the deployed `~/vsh-config.yaml` is
   byte-identical to it.
 - `scripts/ds4image.py` takes `VSH_MODEL`.
+
+
+## 45. GLM at 512K context (2026-10-06)
+
+`glm53_max_ctx: 262144 -> 524288` in both config copies, at the user's request. Nothing else
+changed: `max_num_seqs` stays 32, since it barely affects memory here.
+
+**Why it fits.**
+- **The KV pin already holds more than two 512K sessions.** GLM-5.3 keeps per-token KV only in
+  its 11 MLA layers; the 34 KDA layers hold a fixed-size state.
+- **The model allows it.** Its own limit is 1,048,576 positions, and its MLA is rope-free
+  (`qk_rope_head_dim: 0`).
+- **Only two buffers grow with `max_model_len`:**
+  - the indexer's prefill K-gather workspace (`get_max_prefill_buffer_size`, 40 entries of 132 B
+    per context token): +1.3 GiB per box;
+  - the kpool decode-logits workspace ((max_num_seqs x (k+1)) x max_model_len/4 fp32): +32 MiB.
+- **Other buffers stay bounded.** Prefill logits remain chunked under
+  `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` (512), and DS4's heads x rows x max_model_len decode
+  workspace (§42) is not on GLM's path.
+
+| | 256K (§44) | 512K |
+|---|---|---|
+| KV pool, as reported | 1,105,488 tokens, 4.22x at 262,144 | 1,263,415 tokens, 2.41x at 524,288 |
+| MemAvailable after warm-up, box1 / box2 | 13 / 16 GB | 12.5 / 15.8 GiB |
+| minimum during a cold 128K prefill | — | 12.3 / 15.6 GiB |
+
+The reported token count is concurrency x max_model_len. Each request also needs fixed KDA state
+blocks, worth roughly 87K tokens of pool, and that fixed cost weighs less at 512K. The pool and
+its 2304-token page layout are unchanged.
+
+**128K at the new limit:**
+- Mid-context needles 3/3 at 127,664 tokens.
+- TTFT 508 s cold (251 tok/s). Resending the same prompt took 9.5 s, with 125,568 tokens served
+  from cache.
+- Decode at 127.6K context: 21.0–22.0 tok/s, against 21.4 at 7.4K (`scripts/decode_at_ctx.py`,
+  400 tokens). The decode-side indexer is cheap at this length.
+- Short-context decode is unchanged: JSON 95 ms/step.
+
+**Cold prefill vs context.** The per-token cost rises slowly with context: 3.42 ms at 5.8K, 3.56
+at 11.5K, ~3.66 at 69K, 3.98 at 128K. The fit T(L) = 3.4 ms x L + 4.3e-9 s x L^2 is within 1 % at
+128K:
+
+| prompt | 128K | 256K | 384K | 512K |
+|---|---|---|---|---|
+| cold TTFT | 8.5 min (measured) | ~20 min | ~33 min | ~49 min |
+
+Later turns of a conversation hit the prefix cache. They only prefill their new tokens, plus at
+most 2.3K tail tokens past the last 2304-token boundary.
+
+**Prefix-cache caveat.** GLM's chat template renders the reasoning effort
+(`<|system|>Reasoning Effort: ...`) as the first tokens of the prompt. Changing
+`reasoning_effort` between turns therefore changes the whole prefix, so the next turn is a cold
+prefill: 8.5 min at 128K, ~49 min at 512K. Switching opencode's low/high/max variant mid-session
+does exactly this. The 128K resend first missed this way, because it was sent with a different
+effort than the original request.
+
+Quality past 255K is untested on this rig. Tail needles pass to 255K; mid-context needles to 128K.

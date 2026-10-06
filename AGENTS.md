@@ -143,7 +143,7 @@ data plane). With `NCCL_DEBUG=INFO` RCCL logs which net plugin it loaded.
 
 | key | default | meaning |
 |---|---|---|
-| `glm53_max_ctx` | 262144 | 256K context. Concurrency at that length is 4.22x with the 16 GiB pin below (DFlash2 k=3) |
+| `glm53_max_ctx` | 524288 | 512K context (the model's limit is 1M). 2.41 concurrent 512K sessions fit the 16 GiB pin below; a cold 512K prompt takes ~49 min to prefill (128K: 8.5 min) — PATCHES.md §45 |
 | `glm53_kv_bytes` | 17179869184 | pinned GPU KV pool (16 GiB = 1,105,488 tokens with the production DFlash2 k=3; 1,183,680 with MTP k=3). Leave ~20 GiB/box free; `gpu_memory_utilization` is inert while this is set |
 | `glm53_max_batched` | 8192 | prefill chunk (single-user profile; MiaAI ships 7168) — PATCHES.md §8 |
 | `glm53_mtp_tokens` | 3 | draft tokens for `glm53_spec_method`; 0 = off. k=3 is the measured best for DFlash2 (PATCHES.md §28.7) and was for MTP (k=1...4 within 3 %, §17). The live override (`VSH_ADAPTIVE_K_JSON`) sweeps it without a reboot |
@@ -210,7 +210,9 @@ DS4's numbers are in README.md.
 Prefix cache: a 16.1K-token prompt takes 57 s cold and 8.4 s on its first
 repeat. Hits land on the 2304-token retention boundaries, so 13,824 tokens were
 served from cache and the tail past the last boundary was recomputed. A prompt
-that ends just past a boundary repeats in under 1 s (PATCHES.md §20).
+that ends just past a boundary repeats in under 1 s (PATCHES.md §20). The chat
+template renders the reasoning effort first, so changing it between turns misses
+the whole cache (§45).
 
 Spec acceptance at k=3 is 1.9-2.5 tokens per step depending on the workload;
 read it from `vllm:spec_decode_num_accepted_tokens_per_pos_total`.

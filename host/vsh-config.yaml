@@ -9,7 +9,7 @@ glm53_container: vllm-glm            # toolbox/podman container name (both boxes
 glm53_image: vllm-strix-halo:local   # image the container is created from
 glm53_model_dir: /home/davidcanar/models/GLM-5.3-Flash-AWQ-W4A16
 glm53_api_port: 1234  # single testing port: whichever model is up serves :1234 (stacks are either/or)
-glm53_max_ctx: 262144                # 256K context (native limit is 1M; TTFT is the real cap)
+glm53_max_ctx: 524288                # 512K context (native limit is 1M; TTFT is the real cap: ~49 min cold at 512K, PATCHES 45)
 glm53_kv_bytes: 17179869184          # 16 GiB pinned GPU KV. The box ceiling is ~124 GiB GTT
                                      # with 82.4 GiB weights per rank; >20 GiB KV risks host OOM.
                                      # fp8 KV (below) fits ~2.05M tokens in this pin (7.8x at 256K).
