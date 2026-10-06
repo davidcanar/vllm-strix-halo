@@ -2520,3 +2520,84 @@ boxes, `shm_broadcast.py` joins `container/pinned-vllm/`, and `pinned-vllm`'s
 `vsh_kpool_paged_logits.py` now carries the running bytes (CRLF, plus the `_calls`
 counter that `debug/vsh-kpl-diag.py` reads). Both images match the 44-file overlay; the
 only remaining difference between the boxes is box1's aiter JIT build cache.
+
+
+## 41. DS4: MoE v5 tuned on real routing, FP8 prefill via hipBLASLt; graphs, images and 512K context checked (2026-10-06)
+
+1. **MXFP4 MoE v5** (`moe_mxfp4_v5_kernel<K, MT, R, RP>`, new default `VSH_MOE_MXFP4_V=5`). v4 at M=6
+   was LDS-bound (it staged 4 tokens x 4096 activations, 32 KB per block: 6 waves/SIMD; w2
+   VGPR-bound at 9) and spent ~7 ALU ops per e2m1 value at the 2100 MHz SCLK cap. v5:
+   activations staged per 1024-value K chunk, as fp16 (2 KB per token; 10-16 waves/SIMD); each
+   wave owns R consecutive rows (one 4-byte scale load per lane); e2m1 -> fp16 with one
+   `v_perm_b32` per value pair (the fp16 low byte of every e2m1 value is 0, so an 8-entry byte
+   LUT gives the high byte; the sign is OR-ed in) and `v_dot2_f32_f16` against fp16 activations
+   (exact: e2m1 and bf16 both fit fp16). **Grid order** is tile-major (the N tiles of one expert
+   in consecutive blocks): at full expert spread that alone takes w2 from 123 to 207 GB/s.
+   Tiles were picked on **real routing**: `scripts/moe_dump_ids.py` recorded 15,000 direct-path
+   calls in DSpark decode (`scripts/data/ds4_dspark_routing.pt`): M=6 calls hit 21.4 distinct
+   experts (7-36); 63 % of them get one token, 21 % two, 16 % three to six. Per-phase replay with
+   DRAM-cold experts (`scripts/moe_replay.py`):
+
+   | call | v4 | v5 |
+   |---|---|---|
+   | M=6 (DSpark verify), real routing | 1095 us | **848** (w13 590 + w2 258; 1.29x) |
+   | M=5 (drafter), real routing | 908 | **731** |
+   | M=1 (spec off), 6 random experts | 285 | **227** |
+
+   Defaults: w13 R=4 with token tile 8 above M=4 (R=1 at M <= 2: 4x more blocks, no tail round);
+   w2 R=4, token tile 4. A 1 GiB torch reduction reads at ~195 GB/s; on real routing v5's w2
+   moves ~185 GB/s and w13 ~162. SCLK 2900 vs 2100 MHz changes the MoE by 1 % (DS4 keeps the
+   cap). vs the stock pipeline rel err <= 6.2e-4 (as v3/v4); padding rows exactly 0.
+2. **FP8 linears at prefill sizes** (`vsh-fp8-prefill.py`, `vsh_fp8_dequant`, env
+   `VSH_FP8_PREFILL`). A prefill profile (3,658 tokens, 8 chunks of 512; `scripts/ds4prefill.py`)
+   put 49 % of GPU time in Triton's `_w8a8_triton_block_scaled_mm` (no fp8 dot on gfx1151;
+   2.5-9 ms per linear per chunk), 16 % in the MoE (triton_kernels `matmul_NNT_bf16xbf16xmxfp4`),
+   11 % in the RCCL all-reduce, 9 % mHC, 5 % sparse attention. Rows > 8 now dequantise the fp8
+   weight to bf16 in one HIP pass (bit-exact with e8m0 scales) and multiply with `torch.mm`
+   (hipBLASLt): 6-50x per linear, 8.5-17x at 512 rows (`scripts/test_fp8_prefill.py`), rel err
+   vs fp32 1.7e-3 against 2.6e-2 for the stock path (it quantises the activation to fp8 first).
+   Prefill 154-174 -> 263-305 tok/s at 4-32K. Decode rows keep the FP8 GEMV. Greedy outputs
+   differ slightly from before (the prefill math is more exact).
+3. **Decode** (battery all PASS in every mode; `scripts/ds4len.py`, `ds4speed.py`):
+
+   | DS4 mode | prose | JSON | counting |
+   |---|---|---|---|
+   | §40 (MoE v4), eager + DSpark k=5 | 22.0 tok/s | 20.3 | 43.5 |
+   | **eager + DSpark k=5 (default)** | **25.4-26.1** (38-39 ms/token) | **23.2-25.7** | **48-51** |
+   | PIECEWISE graphs + DSpark k=5 | 20.8 | 21.6 | 40.7 |
+   | PIECEWISE graphs, spec off | 16.7 | 16.5 | — |
+   | eager, spec off | 15.4 | 15.2 | — |
+
+   Profile (eager + DSpark): 110.5 ms wall / 101.9 ms GPU per step (was 124 / 114), MoE
+   38.7 ms (was 49.7). **CUDA graphs**: still slower than eager with DSpark, ~8 % faster without
+   speculative decoding, so DS4 stays eager (`ds4_enforce_eager: 1`, now an explicit key).
+4. **Image input** (Vision-Exp, multimodal wrapper; `scripts/ds4image.py`, synthetic images,
+   thinking off unless noted): reads the text and the three colour/shape pairs of a 768x512
+   card, a table cell (900x420), a sign and a colour in a 1920x1080 image, and the number with
+   thinking on — 4/5; it counts 7 discs as 6 (the model, not the pipeline). 227-393 prompt
+   tokens per image, 1.5-3.4 s per request. The DSpark drafter gets no image embeddings (vLLM
+   warns), so image turns draft from text only.
+5. **Context** (`ds4_max_ctx: 524288`; the 6 GiB pin holds 1,353,463 tokens of fp8_ds_mla KV =
+   2.58 sessions at 512K). `scripts/ds4ctx.py`: three watchwords at 25/50/75 %, then count to
+   40, thinking off, streamed:
+
+   | context | needles | count to 40 | TTFT | prefill | decode (counting) |
+   |---|---|---|---|---|---|
+   | 8K (battery) | 1/1 | — | 23 s | ~300 tok/s | — |
+   | 32K (32,533 tokens) | 3/3 | ok | 2.1 min | 263 tok/s | 42.1 tok/s |
+   | 64K (65,017 tokens) | 3/3 | ok | 4.7 min | 232 tok/s | 36.4 tok/s |
+   | 128K (130,375 tokens) | 3/3 | ok | 11.6 min | 188 tok/s | 33.2 tok/s |
+   | 256K (260,486 tokens) | 3/3 | ok | 32.0 min | 136 tok/s | 26.1 tok/s |
+   | 512K window (512,742 tokens) | 3/3 | ok | 96.7 min | 88 tok/s | 19.1 tok/s |
+   Prefill slows with context: the indexer scores every earlier compressed position, so the cost
+   is quadratic (fit to 32K/64K: T = 3.3 ms x L + 3.1e-8 s x L^2/2).
+6. **Housekeeping.** The serve script and both `vsh-config.yaml` copies described a bf16 KV of
+   ~650K tokens and native DS4 as "not production-ready"; they now give the fp8_ds_mla capacity
+   and the current status. The template's `ds4_async_sched: 1` was wrong (live: 0). The reserve
+   script passes `VSH_MOE_MXFP4_V` / `VSH_MX_DUMP_IDS` to both ranks when set.
+
+Next levers: prefill — the indexer logits kernel (aiter `_fp8_mqa_logits_kernel`: one program
+per query row re-reading every earlier compressed key, fp16 WMMA at 256 VGPRs; a Q-tiled
+version would cut the quadratic term), the MoE prefill (triton_kernels MXFP4 matmul), the
+all-reduce over Thunderbolt, mHC; decode — the MoE (38 % of GPU time), the bf16 `wo_a` einsum
+(10.7 ms/step), ~8.6 ms/step GPU idle.

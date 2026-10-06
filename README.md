@@ -5,9 +5,10 @@
 > 6.8K–255K, including adversarial), tool calling works (8/8 on the captured
 > opencode request), image input works, prefix caching works, and decode is
 > **20–28 tok/s** (DFlash2 k=3, CUDA graphs) after the §28–§33 decode rounds.
-> DS4 (DeepSeek-V4-Flash) runs correctly on the native 0.31 port (§37) at
-> June-stack speed (§38–§40: 20–22 tok/s with DSpark; the June stack via
-> `ds4_engine: delegate` measures 17–24).
+> DS4 (DeepSeek-V4-Flash-Vision-Exp) runs on the native 0.31 port: correct
+> since §37, **25–26 tok/s** with DSpark since §41 (the June stack via
+> `ds4_engine: delegate` measures 17–24), image input works, and 512K context
+> fits (needles pass at the full 512K window). Table below.
 
 | metric (GLM-5.3-Flash AWQ W4A16, TP=2, DFlash2 k=3, CUDA graphs) | value |
 |---|---|
@@ -18,8 +19,19 @@
 | tool calling | ✅ 8/8 on the captured opencode request; opencode replay 3/3 |
 | image input | ✅ (vision encoder in BF16; 448×448 probe answered correctly, 9.1 s) |
 
+| metric (DeepSeek-V4-Flash-Vision-Exp, TP=2, DSpark k=5, eager) | value |
+|---|---|
+| decode | **25.4–26.1 / 23.2–25.7 tok/s** prose / JSON, counting 48–51 tok/s, acceptance 2.6–2.8 (110 ms step) — was 2.2 tok/s at the start of §35 |
+| decode, spec off | 15.4 tok/s eager, 16.7 with PIECEWISE graphs |
+| CUDA graphs | work, but with DSpark they are slower (20.8 / 21.6 tok/s), so DS4 runs eager (§39, §41) |
+| prefill | ~300 tok/s at 8K, 263 at 32K, 232 at 64K; slower beyond (quadratic indexer) |
+| time to first token | 0.4 s for a short prompt, 23 s at 8K, 2.1 min at 32K, 4.7 min at 64K, 11.6 min at 128K, 32.0 min at 256K, 96.7 min at the full 512K window (thinking off) |
+| context | 512K max (`ds4_max_ctx`); KV pool 1.35M tokens (fp8_ds_mla, 2.58 × 512K); needles 3/3 at 32K–512K (§41 table) |
+| image input | ✅ OCR, colours/shapes, a table cell, a 1920×1080 image; 1.5–3.4 s per image request; counting slips (7 discs → 6) |
+| thinking / tools | thinking mode ✅ (`chat_template_kwargs.thinking`); `deepseek_v4` tool + reasoning parsers |
+
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§40). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§41). This README is the current state only.
 
 ---
 
@@ -50,7 +62,7 @@ plumbing plus the gfx1151 fixes below.
 Both models share the `vllm-glm` container and API port 1234 — either/or at
 runtime. Site config: `~/vsh-config.yaml` (flat keys → `VSH_*` env vars;
 template in `host/vsh-config.yaml`). The template ships `ds4_engine: native`
-(the 0.31 port: correct since §37, June-level speed since §38); set
+(the 0.31 port: correct since §37, faster than the June stack since §41); set
 `ds4_engine: delegate` for the June stack.
 
 ## Patch set (current)
@@ -102,9 +114,11 @@ and column-overwrite force-tail are superseded by §27 and are inert.
 **DS4 native port** (`container/patches/ds4-native-fixed-refs/` plus the `vsh-ds4-*` patches):
 serves correctly since §37. On top of the 09-30 gfx1151 port: `vsh-ds4-decode-inv-rope.py`
 (the decode kernel's missing inverse RoPE, §37), `vsh-fp8-gemv.py` (HIP FP8 GEMV for the
-block-FP8 linears, §36/§38), `vsh-mxfp4-direct.py` (direct MXFP4 MoE, §38/§40),
-`vsh-ds4-mmf32.py` (compressor scores on the bf16 GEMV, §40), `cgfusion-soft.py` (§35);
-speed and remaining work in Known issues 5.
+block-FP8 linears at decode sizes, §36/§38), `vsh-fp8-prefill.py` (the same linears at
+prefill sizes: exact bf16 weight + hipBLASLt, §41), `vsh-mxfp4-direct.py` + `vsh_moe_int4.hip`
+(direct MXFP4 MoE, v5 kernel tuned on real routing, §38–§41), `vsh-ds4-mmf32.py` (compressor
+scores on the bf16 GEMV, §40), `cgfusion-soft.py` (§35); speed and remaining work in Known
+issues 5.
 
 ## Architecture
 
@@ -124,22 +138,27 @@ speed and remaining work in Known issues 5.
 - **Image**: `vllm-strix-halo:local` from `container/Dockerfile` (base
   `kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.30.0`; vLLM pinned
   at `73859fec`; `container/pinned-vllm/` + `container/pinned-triton/` carry
-  the byte-exact patched files for reproducible rebuilds). Snapshot of the
-  running stack on both boxes: `vllm-strix-halo:glm-perf40-20261006`
-  (`:local` points at it)
-- **KV cache**: 16 GiB pinned, 256K max context
+  the byte-exact patched files for reproducible rebuilds). Last snapshot on
+  both boxes: `vllm-strix-halo:glm-perf40-20261006` (`:local` points at it;
+  through §40 — §41's DS4 kernels are live in the containers and in
+  `container/pinned-vllm/`, not yet in a snapshot)
+- **KV cache**: 16 GiB pinned, 256K max context (GLM); DS4: 6 GiB pinned = 1.35M
+  tokens of fp8_ds_mla, 512K max context
 - **Speculative decoding**: DFlash2 drafter, k=3 (`glm53_spec_method: dflash`,
   `glm53_mtp_tokens: 3`); MTP (`glm5_next_mtp`) is the fallback and spec-off
   works too (§34)
 - **Execution**: CUDA graphs, PIECEWISE breakable capture, sizes 1/2/4/8;
-  `glm53_enforce_eager: 1` reverts to eager (§33)
+  `glm53_enforce_eager: 1` reverts to eager (§33). DS4 runs eager with DSpark k=5
+  (`ds4_enforce_eager: 1`, `ds4_mtp_tokens: 5`; graphs are slower with DSpark, §41)
 - **Quantization**: AWQ W4A16 for MoE experts (checkpoint). The checkpoint's
   BF16 linears (KDA/MLA projections, shared experts, dense MLPs) are
   re-quantized to int8 group-128 at load (§28); `lm_head` gets an int8 copy
   (§30); the router gate, `kv_b_proj`, `wk_weights_proj`, embeddings and the
-  vision encoder stay BF16
+  vision encoder stay BF16. DS4 runs its checkpoint as shipped: MXFP4 routed
+  experts and block-FP8 linears (decoded by the HIP kernels of §36–§41), BF16
+  router gate, compressor and vision encoder
 
-## Measured performance (2026-10-03)
+## Measured performance (GLM 2026-10-03, DS4 2026-10-06)
 
 See the table at the top. Receipts and methods:
 `scripts/vsh_ab.py` (matched A/B with engine-side step accounting + tool-call
@@ -147,9 +166,11 @@ gate), `scripts/vsh_bench.py` (per-request decode/TTFT with spec and
 prefix-cache deltas), `scripts/stepbench.py` (unprofiled decode step time),
 `scripts/trace_*.py` (kernel share, GPU duty cycle, copies, blocking ops),
 `scripts/bf16_bw.py` (linear bandwidth at real weight shapes). Numbers are
-medians of ≥2 boots or ≥5 repetitions. DS4: `scripts/ds4len.py` (battery + speed),
-`scripts/ds4trace.py` / `ds4who.py` (torch-profiler trace: step wall vs GPU busy, top
-kernels, kernel → launching op).
+medians of ≥2 boots or ≥5 repetitions. DS4: `scripts/ds4len.py` (battery),
+`scripts/ds4speed.py` (decode), `scripts/ds4ctx.py` (long-context needles + TTFT),
+`scripts/ds4image.py` (image probes), `scripts/ds4trace.py` / `ds4who.py` / `ds4prefill.py`
+(torch-profiler traces: step wall vs GPU busy, top kernels, kernel → launching op),
+`scripts/moe_replay.py` (MoE kernels on recorded DS4 routing).
 
 ## Repository layout
 
@@ -164,8 +185,8 @@ vllm-strix-halo/
 │   ├── pinned-vllm/         # byte-exact patched vllm files (authoritative rebuild input)
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
-├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§40)
+├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, ds4*, moe_*, test_*, trace_*)
+├── PATCHES.md               # detailed patch history and lessons (§1–§41)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
@@ -190,13 +211,15 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-5. **DS4 native** — correct since §37 and at June-stack speed since §38:
-   22.0 / 20.3 tok/s prose / JSON with DSpark k=5 (acceptance 2.6–2.8, §40), 14.3 tok/s
-   without spec (§38). Needles, counting to 100 and thinking mode pass. CUDA graphs
-   (`ds4_enforce_eager: 0`, PIECEWISE) work since §39 but bring no speedup, so DS4
-   stays eager. Decode is GPU-bound (124 ms step, 114 ms GPU busy; the host runs
-   behind it). Remaining levers: the MoE (44 % of GPU time, ~125 GB/s at full expert
-   spread), the bf16 `wo_a` grouped einsum on hipBLASLt (11 ms/step), an int8 DS4
-   `lm_head`. DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both ranks — the
+5. **DS4 native** — correct since §37; with MoE v5 and the FP8 prefill path (§41)
+   25.4–26.1 / 23.2–25.7 tok/s prose / JSON with DSpark k=5 (eager), 15.4 tok/s
+   without spec. Needles, counting, thinking mode and image input pass; 512K context
+   fits (needles 3/3 up to the full 512K window, 97 min to the first token there).
+   CUDA graphs work but are slower with DSpark (+8 % without spec), so DS4 stays
+   eager. Remaining levers: prefill — the indexer logits kernel (one program per
+   query row, re-reading every earlier key: quadratic) dominates long prompts, then
+   the MoE prefill matmul, the all-reduce over Thunderbolt and mHC; decode — the
+   MoE (38 % of GPU time), the bf16 `wo_a` einsum (10.7 ms/step), ~8.6 ms/step of
+   GPU idle. DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both ranks — the
    DS4 restart/reserve scripts pass them, and every restart script refuses to start
    when the two boxes' env files differ.

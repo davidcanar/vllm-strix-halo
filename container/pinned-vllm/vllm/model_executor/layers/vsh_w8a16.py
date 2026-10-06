@@ -271,3 +271,42 @@ def mm_f32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if w16_ok(weight, x):
         return w16_gemv(x, weight)
     return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+# ---- FP8 block-scaled linear at prefill sizes [vsh-fp8-prefill] -----------------------
+# M > 8 rows: one HIP pass fp8 -> bf16 weight (exact with e8m0 block scales), then
+# torch.mm on hipBLASLt. 5-8x the stock Triton block GEMM at 64-512 rows on gfx1151
+# and more exact (the stock path quantises the activation to fp8 first).
+def fp8_prefill_ok(x2d: torch.Tensor, weight: torch.Tensor, block_scale, group_shape) -> bool:
+    return (os.environ.get("VSH_FP8_PREFILL", "1") not in ("", "0", "off")
+            and x2d.dtype == torch.bfloat16 and x2d.dim() == 2 and x2d.shape[0] > MAX_ROWS
+            and weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz) and weight.dim() == 2
+            and weight.stride(1) == 1 and weight.stride(0) >= weight.shape[1]
+            and weight.stride(0) % 16 == 0 and weight.data_ptr() % 16 == 0
+            and weight.shape[1] % 16 == 0 and x2d.shape[1] == weight.shape[1]
+            and list(group_shape) == [128, 128]
+            and block_scale is not None and block_scale.dim() == 2
+            and block_scale.shape[0] * 128 >= weight.shape[0]
+            and block_scale.shape[1] * 128 >= weight.shape[1])
+
+
+def fp8_dequant(weight: torch.Tensor, block_scale: torch.Tensor) -> torch.Tensor:
+    n, k = weight.shape
+    s = _fp8_scales(block_scale)
+    y = torch.empty((n, k), dtype=torch.bfloat16, device=weight.device)
+    lib = _lib()
+    if not getattr(lib, "_fp8dq_init", False):
+        lib.vsh_fp8_dequant.restype = ctypes.c_int
+        lib.vsh_fp8_dequant.argtypes = ([ctypes.c_void_p] * 4 + [ctypes.c_int] * 2
+                                        + [ctypes.c_long] * 3 + [ctypes.c_int])
+        lib._fp8dq_init = True
+    rc = lib.vsh_fp8_dequant(torch.cuda.current_stream().cuda_stream, weight.data_ptr(), s.data_ptr(),
+                             y.data_ptr(), n, k, weight.stride(0), s.stride(0), y.stride(0),
+                             int(weight.dtype == torch.float8_e4m3fnuz))
+    if rc != 0:
+        raise RuntimeError(f"vsh_fp8_dequant failed: {rc}")
+    return y
+
+
+def fp8_prefill_mm(x2d: torch.Tensor, weight: torch.Tensor, block_scale: torch.Tensor) -> torch.Tensor:
+    return torch.mm(x2d, fp8_dequant(weight, block_scale).t())

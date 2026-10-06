@@ -21,7 +21,7 @@ def stock(x, tw, ids):
     down = G.matmul(act, w2, None, rd.ragged, None, None, None, p2, gammas=rd.gate_scal)
     acc = torch.zeros((M, H), dtype=torch.float32, device=dev); acc.index_add_(0, rd.gather_tok.to(torch.int64), down.to(torch.float32))
     return acc.to(torch.bfloat16)
-for ver in ("1", "3", "4"):
+for ver in ("1", "3", "4", "5"):
     os.environ["VSH_MOE_MXFP4_V"] = ver
     for M, npad in ((2, 1), (6, 2), (8, 3)):
         x = (torch.randn(M, H, device=dev) * 0.5).bfloat16()

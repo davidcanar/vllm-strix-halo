@@ -37,16 +37,17 @@ glm53_odl_ar2: 1                     # 1 = odl_ar2 decode all-reduce over OdinLi
 # Delegates to the deployed ds4-vllm stack (AlexKGwyn/ds4-vllm image + units).
 ds4_unit: ds4-vllm
 ds4_api_port: 1234
-ds4_engine: native                   # native = vllm-strix-halo image (0.31.0, same vllm-glm container); delegate = old ds4-vllm stack
+ds4_engine: native                   # native = the 0.31 port in this image (vllm-glm container; PATCHES 35-41); delegate = the June ds4-vllm stack
 ds4_model_dir: /home/davidcanar/models/DeepSeek-V4-Flash-Vision-Exp
 ds4_container: vllm-glm              # shared with glm53 (same image, one Ray cluster at a time)
 ds4_delegate_unit: ds4-vllm          # used when ds4_engine: delegate
-ds4_mtp_tokens: 5                    # DSpark MTP draft tokens (old stack default)
-ds4_async_sched: 1                   # padded drafter batches + --async-scheduling
-ds4_kv_dtype: auto                   # bf16; fp8 asserts on the aiter sparse path on this build
-ds4_kv_bytes: 6442450944             # 6 GiB pin (old stack value; bf16 ~= 650K tokens)
+ds4_mtp_tokens: 5                    # DSpark MTP draft tokens (production; 0 = spec decode off)
+ds4_async_sched: 0                   # padded drafter + async: OFF until validated on the upstream dspark path
+ds4_enforce_eager: 1                 # 0 = PIECEWISE CUDA graphs: slower with DSpark, ~8 % faster without (PATCHES 41)
+ds4_kv_dtype: auto                   # leave auto: DS4 always uses DeepSeek's fp8_ds_mla KV format on this build
+ds4_kv_bytes: 6442450944             # 6 GiB pin = 1,353,463 tokens of fp8_ds_mla KV (2.58 sessions at 512K)
 ds4_gpu_util: 0.83                   # inert while kv_bytes is pinned
-ds4_max_ctx: 524288                  # 512K (old stack profile)
+ds4_max_ctx: 524288                  # 512K, as the June stack (needle-tested, PATCHES 41)
 ds4_max_batched: 512                 # indexer workspace lesson -- do not raise
 ds4_warmup_ctx: 32768
 

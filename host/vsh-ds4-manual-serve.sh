@@ -17,15 +17,14 @@
 # the old host/ds4-vllm-manual-serve.sh for the full lessons):
 #   --kv-cache-memory-bytes  Pin KV; --gpu-memory-utilization is INERT while
 #     it is set. The pool is a fixed-size LRU and does not grow with
-#     --max-model-len. bf16 KV ≈ 9.3 B/token on this model, so the 6 GiB pin
-#     holds ~650K tokens: one 512K-context session with prefix-cache slack.
+#     --max-model-len. DS4 always runs DeepSeek's fp8_ds_mla KV format on this
+#     build: the 6 GiB pin holds 1,353,463 tokens (2.58 sessions at 512K).
 #   --max-num-batched-tokens 512  NOT 2048; the indexer/top-k workspace scales
 #     with batch x context and 2048 costs ~10 GiB more at 256K.
 #
-# KV dtype: auto (bf16). The old ds4 engine ran fp8 KV, but on this build the
-# ROCM_AITER_MLA_SPARSE fp8 decode path asserts on the first request (same
-# failure measured on GLM-5.3, vsh-config 2026-09-28 note; V4 uses the same
-# aiter sparse backend). Retest fp8 after an upstream fix; ds4_kv_dtype knob.
+# KV dtype: leave auto. vLLM selects DeepSeek's fp8_ds_mla cache format for
+# this model by itself (boot log: "Using DeepSeek's fp8_ds_mla KV cache
+# format"); ds4_kv_dtype stays as a knob.
 #
 # Do not add comments inside the backslash-continued `vllm serve` command
 # below: a '#' there silently comments out every remaining argument.
@@ -103,17 +102,17 @@ fi
 TOOLS=(--enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}')
 echo "[vsh-ds4-serve] tool-call + reasoning parsers ON (deepseek_v4)"
 
-# KV cache dtype knob (see header: fp8 asserts on this build's aiter path).
+# KV cache dtype knob (see header).
 KVD=()
 if [ -n "${VSH_DS4_KV_DTYPE:-}" ] && [ "${VSH_DS4_KV_DTYPE}" != "auto" ]; then
   KVD=(--kv-cache-dtype "$VSH_DS4_KV_DTYPE")
   echo "[vsh-ds4-serve] KV cache dtype: $VSH_DS4_KV_DTYPE"
 fi
 
-# Eager by default: the GLM lesson on this build (capture OK, first replay
-# wedges the MTP drafter on the hybrid attention backends) plus the old
-# stack's drafter-capture constraint. ds4_enforce_eager: 0 re-enables the
-# old stack's PIECEWISE graphs (unproven on 0.31.0 for V4).
+# Eager by default: PIECEWISE graphs work on this pin (PATCHES 39) but with
+# DSpark they decode slower than eager (PATCHES 41: 20.8 vs 26.1 tok/s prose);
+# without speculative decoding they are ~8 % faster. ds4_enforce_eager: 0
+# switches them on.
 EAGER=(--enforce-eager)
 CGS=()
 if [ "${VSH_DS4_ENFORCE_EAGER:-1}" != "1" ]; then

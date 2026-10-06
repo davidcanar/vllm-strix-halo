@@ -212,8 +212,10 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
     lib = _lib()
     if not getattr(lib, "_mx_init", False):
         for fn in (lib.vsh_moe_mxfp4_direct, lib.vsh_moe_mxfp4_v2, lib.vsh_moe_mxfp4_v3,
-                   lib.vsh_moe_mxfp4_v4, lib.vsh_moe_swiglu):
+                   lib.vsh_moe_mxfp4_v4, lib.vsh_moe_mxfp4_v5, lib.vsh_moe_swiglu):
             fn.restype = ctypes.c_int
+        lib.vsh_moe_mxfp4_v5.argtypes = ([ctypes.c_void_p] + [ctypes.c_int] * 3 + [ctypes.c_void_p] * 6
+                                         + [ctypes.c_int] * 4 + [ctypes.c_long] * 7 + [ctypes.c_int])
         lib.vsh_moe_mxfp4_v4.argtypes = ([ctypes.c_void_p] + [ctypes.c_int] * 3 + [ctypes.c_void_p] * 6
                                          + [ctypes.c_int] * 4 + [ctypes.c_long] * 7 + [ctypes.c_int])
         lib.vsh_moe_mxfp4_v3.argtypes = ([ctypes.c_void_p, ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 6
@@ -229,7 +231,7 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
             _direct_init(lib)
         lib._mx_init = True
     st = torch.cuda.current_stream().cuda_stream
-    ver = os.environ.get("VSH_MOE_MXFP4_V", "4")
+    ver = os.environ.get("VSH_MOE_MXFP4_V", "5")
     if ver == "1":      # v1: LDS-staged kernel, fused SwiGLU
         rc = lib.vsh_moe_mxfp4_direct(st, 1, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
                                       tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k, plan["clamp"],
@@ -238,6 +240,27 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
             rc = lib.vsh_moe_mxfp4_direct(st, 2, c1.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
                                           tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k, plan["clamp"],
                                           c1.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
+    elif ver == "5":
+        # Tiles from replaying real DS4 decode routing (PATCHES 41): token tile 8 for w13
+        # and 4 for w2 above M=4; one row per wave for w13 at M <= 2 (more blocks, no
+        # tail round), four rows otherwise; tile-major grid order (+100) for both phases.
+        act = torch.empty((P, b["K"]), dtype=torch.bfloat16, device=x.device)
+        mt1 = 1 if M <= 1 else 2 if M <= 2 else 4 if M <= 4 else 8
+        mt2 = min(mt1, 4)
+        mt1 = int(os.environ.get("VSH_MX5_MT1", mt1))
+        mt2 = int(os.environ.get("VSH_MX5_MT2", mt2))
+        rc1 = int(os.environ.get("VSH_MX5_RC1", 111 if M <= 2 else 141))
+        rc2 = int(os.environ.get("VSH_MX5_RC2", 141))
+        rc = lib.vsh_moe_mxfp4_v5(st, 1, mt1, rc1, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
+                                  tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k,
+                                  x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"], a["E"])
+        if rc == 0:
+            rc = lib.vsh_moe_swiglu(st, c1.data_ptr(), act.data_ptr(), P, b["K"], plan["clamp"],
+                                    c1.stride(0), act.stride(0))
+        if rc == 0:
+            rc = lib.vsh_moe_mxfp4_v5(st, 2, mt2, rc2, act.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
+                                      tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k,
+                                      act.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
     elif ver == "4":
         act = torch.empty((P, b["K"]), dtype=torch.bfloat16, device=x.device)
         mt = 1 if M <= 1 else 2 if M <= 2 else 4

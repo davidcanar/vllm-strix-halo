@@ -169,7 +169,7 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
     # [vsh-fp8-gemv] gfx1151 decode: HIP block-scaled fp8 GEMV (bf16 activations)
     _vsh_fp8 = None
-    _vsh_fp8_logged = [False, False, False]
+    _vsh_fp8_logged = [False, False, False, False, False]
 
     @classmethod
     def _vsh_fp8_on(cls) -> bool:
@@ -211,6 +211,22 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                                 input_2d.shape[0], tuple(w.shape), w.dtype, tuple(w.stride()),
                                 None if bs is None else tuple(bs.shape),
                                 None if bs is None else bs.dtype)
+            elif input_2d.shape[0] > 8:
+                # [vsh-fp8-prefill] prefill rows: exact bf16 weight + hipBLASLt (5-8x the Triton block GEMM)
+                from vllm.model_executor.layers import vsh_w8a16 as _w8
+
+                params = self._get_layer_params(layer)
+                if _w8.fp8_prefill_ok(input_2d, params.weight, params.block_scale,
+                                      list(self.weight_group_shape)):
+                    out = _w8.fp8_prefill_mm(input_2d, params.weight, params.block_scale)
+                    if not cls._vsh_fp8_logged[3]:
+                        cls._vsh_fp8_logged[3] = True
+                        logger.info("[vsh-fp8-prefill] active (M=%d N=%d K=%d)", input_2d.shape[0],
+                                    params.weight.shape[0], params.weight.shape[1])
+                    if bias is not None:
+                        out = out + bias
+                    return out.to(dtype=self.config.out_dtype).view(
+                        *x.shape[:-1], params.weight.shape[0])
         return super().apply_weights(layer, x, bias, **kwargs)
 
     def apply_block_scaled_mm(
@@ -236,6 +252,19 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                         logger.info("[vsh-fp8-gemv] active on pre-quantized input (M=%d N=%d K=%d)",
                                     A.shape[0], B.shape[0], B.shape[1])
                     return _w8.fp8_gemv(a_bf, B, Bs).to(self.config.out_dtype)
+        if (cls._vsh_fp8_on() and A.dim() == 2 and A.shape[0] > 8
+                and A.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                and As is not None and As.dim() == 2):
+            # [vsh-fp8-prefill] pre-quantized prefill rows: back to bf16, then the bf16 weight + hipBLASLt
+            from vllm.model_executor.layers import vsh_w8a16 as _w8
+
+            a_bf = _w8.dequant_act_fp8(A, As)
+            if a_bf is not None and _w8.fp8_prefill_ok(a_bf, B, Bs, list(self.weight_group_shape)):
+                if not cls._vsh_fp8_logged[4]:
+                    cls._vsh_fp8_logged[4] = True
+                    logger.info("[vsh-fp8-prefill] active on pre-quantized input (M=%d N=%d K=%d)",
+                                A.shape[0], B.shape[0], B.shape[1])
+                return _w8.fp8_prefill_mm(a_bf, B, Bs).to(self.config.out_dtype)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
             A,
             B,

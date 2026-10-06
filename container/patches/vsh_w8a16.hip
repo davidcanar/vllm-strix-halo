@@ -492,3 +492,47 @@ extern "C" int vsh_sigmoid_bias_topk(void* stream, const void* logits, const voi
                      scale, renorm);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+
+
+// ---- FP8 block-scaled weight -> bf16 (DS4 prefill: dequant + hipBLASLt) [vsh-fp8-prefill] ----
+// One thread turns 16 consecutive fp8 of a row into 16 bf16 with the row's 128x128
+// block scale (fp32, [N/128][K/128]). e8m0 scales are powers of two, so the result
+// is exact; the caller multiplies with torch.mm (hipBLASLt).
+template <int FNUZ>
+__global__ __launch_bounds__(256) void fp8_dequant_kernel(const uint8_t* __restrict__ W, const float* __restrict__ S,
+                                                         uint16_t* __restrict__ Y, int N, int K, long ldw, long ss,
+                                                         long ldy) {
+  const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int kq = K / 16;
+  if (idx >= (long)N * kq) return;
+  const int n = (int)(idx / kq), k0 = (int)(idx % kq) * 16;
+  const uint4 w = *(const uint4*)(W + (long)n * ldw + k0);
+  const float s = S[(long)(n >> 7) * ss + (k0 >> 7)];
+  const uint32_t wu[4] = {w.x, w.y, w.z, w.w};
+  uint32_t o[8];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float f0 = fp8_to_f32<FNUZ>(wu[j] & 0xFF) * s, f1 = fp8_to_f32<FNUZ>((wu[j] >> 8) & 0xFF) * s;
+    const float f2 = fp8_to_f32<FNUZ>((wu[j] >> 16) & 0xFF) * s, f3 = fp8_to_f32<FNUZ>(wu[j] >> 24) * s;
+    o[2 * j] = (uint32_t)f2bf(f0) | ((uint32_t)f2bf(f1) << 16);
+    o[2 * j + 1] = (uint32_t)f2bf(f2) | ((uint32_t)f2bf(f3) << 16);
+  }
+  uint4* dst = (uint4*)(Y + (long)n * ldy + k0);
+  dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+  dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+}
+
+extern "C" int vsh_fp8_dequant(void* stream, const void* W, const void* S, void* Y, int N, int K,
+                               long ldw, long ss, long ldy, int fnuz) {
+  if (K % 16 || ldw < K || (ldw & 15) || (ldy & 7) || N < 1) return -1;
+  const long total = (long)N * (K / 16);
+  dim3 block(256), grid((unsigned)((total + 255) / 256));
+  hipStream_t st = (hipStream_t)stream;
+  if (fnuz)
+    hipLaunchKernelGGL(fp8_dequant_kernel<1>, grid, block, 0, st, (const uint8_t*)W, (const float*)S, (uint16_t*)Y,
+                       N, K, ldw, ss, ldy);
+  else
+    hipLaunchKernelGGL(fp8_dequant_kernel<0>, grid, block, 0, st, (const uint8_t*)W, (const float*)S, (uint16_t*)Y,
+                       N, K, ldw, ss, ldy);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}

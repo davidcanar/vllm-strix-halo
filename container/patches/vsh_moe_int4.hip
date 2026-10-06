@@ -981,3 +981,226 @@ extern "C" int vsh_moe_mxfp4_v4(void* stream, int phase, int mt, int rp, const v
 #undef ARGS4
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+
+
+// ---- MXFP4 direct path v5 --------------------------------------------------------
+// v4 at M=6 was LDS-bound (32 KB of staged activations per block -> 6 waves/SIMD)
+// and spent ~7 ALU ops per e2m1 value on the decode, at the 2100 MHz SCLK cap. v5:
+//  * activations staged per 1024-value K chunk, as fp16 (2 KB per token per chunk);
+//  * each wave owns R consecutive rows: one 2- or 4-byte scale load per lane;
+//  * e2m1 -> fp16 with one v_perm_b32 per value pair: the fp16 low byte of every e2m1
+//    value is 0, so an 8-entry byte LUT {00 38 3C 3E 40 42 44 46} gives the high byte;
+//    the sign bit is OR-ed in, and v_dot2_f32_f16 multiplies against fp16 activations.
+// Pairing: one fp16x2 word holds values (j, j+4) of an 8-value nibble word, so the
+// staged activations use the same (j, j+4) order. Values are exact (e2m1 and bf16
+// both fit fp16; |activation| > 65504 saturates in cvt_pkrtz).
+typedef _Float16 vsh_half2 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ uint32_t mx5_pair(uint32_t sel, uint32_t sign) {
+  return __builtin_amdgcn_perm(0x46444240u, 0x3E3C3800u, sel | 0x000C000Cu) | sign;
+}
+
+__device__ __forceinline__ void mx5_decode8(uint32_t w, uint32_t p[4]) {
+  p[0] = mx5_pair((w & 0x00070007u) << 8, (w & 0x00080008u) << 12);   // (v0, v4)
+  p[1] = mx5_pair((w & 0x00700070u) << 4, (w & 0x00800080u) << 8);    // (v1, v5)
+  p[2] = mx5_pair(w & 0x07000700u, (w & 0x08000800u) << 4);           // (v2, v6)
+  p[3] = mx5_pair((w >> 4) & 0x07000700u, w & 0x80008000u);           // (v3, v7)
+}
+
+__device__ __forceinline__ float mx5_dot2(uint32_t a, uint32_t b, float c) {
+  return __builtin_amdgcn_fdot2(__builtin_bit_cast(vsh_half2, a), __builtin_bit_cast(vsh_half2, b), c, false);
+}
+
+__device__ __forceinline__ uint32_t mx5_h2(float a, float b) {
+  return __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(a, b));
+}
+
+// 8 bf16 (x0..x7) -> fp16 pairs (x0,x4) (x1,x5) (x2,x6) (x3,x7)
+__device__ __forceinline__ uint4 mx5_stage8(uint4 v) {
+  const float x0 = __uint_as_float(v.x << 16), x1 = __uint_as_float(v.x & 0xFFFF0000u);
+  const float x2 = __uint_as_float(v.y << 16), x3 = __uint_as_float(v.y & 0xFFFF0000u);
+  const float x4 = __uint_as_float(v.z << 16), x5 = __uint_as_float(v.z & 0xFFFF0000u);
+  const float x6 = __uint_as_float(v.w << 16), x7 = __uint_as_float(v.w & 0xFFFF0000u);
+  return make_uint4(mx5_h2(x0, x4), mx5_h2(x1, x5), mx5_h2(x2, x6), mx5_h2(x3, x7));
+}
+
+template <int K, int MT, int R, int RP>
+__global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v5_kernel(
+    const uint16_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ C,
+    const uint8_t* __restrict__ S, const float* __restrict__ topk_w,
+    const int32_t* __restrict__ ids, int P, int N, int top_k, int phase,
+    long stride_am, long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg,
+    int E, int vec_scale, int tile_major) {
+  constexpr int CV = WS * 32;               // values per K chunk: 32 per lane = one scale group
+  constexpr int NCH = K / CV;
+  constexpr int TILE = WAVES * R * RP;
+  static_assert(K % CV == 0, "K must be a multiple of 1024");
+  static_assert(R == 1 || R == 2 || R == 4, "R must be 1, 2 or 4");
+  __shared__ uint4 xs[MT][CV / 8];          // fp16 pairs, 2 KB per token
+  __shared__ int toks[64];
+  __shared__ int ntok, dup;
+  const int p = tile_major ? blockIdx.y : blockIdx.x;
+  const int ty = tile_major ? blockIdx.x : blockIdx.y;
+  const int e = ids[p];
+  const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
+  if (threadIdx.x == 0) { ntok = 0; dup = 0; }
+  __syncthreads();
+  if (threadIdx.x < P && ids[threadIdx.x] == e) {
+    if ((int)threadIdx.x < p) dup = 1;
+    else { int s = atomicAdd(&ntok, 1); toks[s] = threadIdx.x; }
+  }
+  __syncthreads();
+  if (dup) return;
+  const int nt = ntok;
+  if (e < 0 || e >= E) {   // padding sentinel (-1) / out of range: contributes nothing
+    for (int i = threadIdx.x; i < nt * TILE; i += WAVES * WS) {
+      const int n = ty * TILE + i % TILE;
+      if (n < N) C[(long)toks[i / TILE] * stride_cm + n] = 0;
+    }
+    return;
+  }
+  const uint8_t* Be = B + (long)e * stride_be;
+  const uint8_t* Se = S + (long)e * sse;
+  for (int t0 = 0; t0 < nt; t0 += MT) {
+    const int tn = min(MT, nt - t0);
+    float acc[RP][R][MT];
+#pragma unroll
+    for (int rp = 0; rp < RP; ++rp)
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < MT; ++t) acc[rp][r][t] = 0.f;
+    for (int c = 0; c < NCH; ++c) {
+      __syncthreads();
+      for (int i = threadIdx.x; i < tn * (CV / 8); i += WAVES * WS) {
+        const int t = i / (CV / 8), q = i % (CV / 8);
+        const int tok = toks[t0 + t];
+        const uint4* src = (const uint4*)(A + (long)(phase == 1 ? tok / top_k : tok) * stride_am + (long)c * CV);
+        xs[t][q] = mx5_stage8(src[q]);
+      }
+      __syncthreads();
+      const long g = (long)c * WS + lane;   // this lane's scale group
+#pragma unroll
+      for (int rp = 0; rp < RP; ++rp) {
+        const int n0 = ty * TILE + (rp * WAVES + wave) * R;
+        if (n0 >= N) break;
+        uint4 w[R];
+        uint32_t sb[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          const int n = min(n0 + r, N - 1);
+          w[r] = *(const uint4*)(Be + (long)n * stride_bn + (long)c * (CV / 2) + lane * 16);
+        }
+        if (R > 1 && vec_scale && n0 + R <= N) {
+          const uint8_t* sp = Se + g * ssg + n0;
+          const uint32_t sv = R == 4 ? *(const uint32_t*)sp : (uint32_t)*(const uint16_t*)sp;
+#pragma unroll
+          for (int r = 0; r < R; ++r) sb[r] = (sv >> (8 * r)) & 0xFFu;
+        } else {
+#pragma unroll
+          for (int r = 0; r < R; ++r) sb[r] = Se[(long)min(n0 + r, N - 1) * ssn + g * ssg];
+        }
+        float s[R][MT];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+          for (int t = 0; t < MT; ++t) s[r][t] = 0.f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          uint32_t pw[R][4];
+#pragma unroll
+          for (int r = 0; r < R; ++r) {
+            const uint32_t word = q == 0 ? w[r].x : q == 1 ? w[r].y : q == 2 ? w[r].z : w[r].w;
+            mx5_decode8(word, pw[r]);
+          }
+#pragma unroll
+          for (int t = 0; t < MT; ++t) {
+            if (t < tn) {
+              const uint4 xa = xs[t][lane * 4 + q];
+#pragma unroll
+              for (int r = 0; r < R; ++r) {
+                float v = s[r][t];
+                v = mx5_dot2(pw[r][0], xa.x, v);
+                v = mx5_dot2(pw[r][1], xa.y, v);
+                v = mx5_dot2(pw[r][2], xa.z, v);
+                v = mx5_dot2(pw[r][3], xa.w, v);
+                s[r][t] = v;
+              }
+            }
+          }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          const float sc = sb[r] ? __uint_as_float(sb[r] << 23) : 0.f;   // 2^(sb-127)
+#pragma unroll
+          for (int t = 0; t < MT; ++t) acc[rp][r][t] += s[r][t] * sc;
+        }
+      }
+    }
+#pragma unroll
+    for (int rp = 0; rp < RP; ++rp) {
+      const int n0 = ty * TILE + (rp * WAVES + wave) * R;
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          if (t < tn) {
+            float v = acc[rp][r][t];
+#pragma unroll
+            for (int off = WS / 2; off > 0; off >>= 1) v += __shfl_xor(v, off, WS);
+            if (lane == 0 && n0 + r < N) {
+              const int tok = toks[t0 + t];
+              const float wgt = phase == 2 ? topk_w[tok] : 1.f;
+              C[(long)tok * stride_cm + n0 + r] = f2bf(v * wgt);
+            }
+          }
+        }
+    }
+  }
+}
+
+template <int K, int MT, int R, int RP>
+static int mx5_launch(hipStream_t s, int phase, const void* A, const void* B, void* C, const void* S,
+                      const void* topk_w, const void* ids, int P, int N, int top_k, long stride_am,
+                      long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E,
+                      int vec, int tile_major) {
+  const int tiles = (N + WAVES * R * RP - 1) / (WAVES * R * RP);
+  dim3 grid = tile_major ? dim3(tiles, P) : dim3(P, tiles), block(WAVES * WS);
+  hipLaunchKernelGGL((moe_mxfp4_v5_kernel<K, MT, R, RP>), grid, block, 0, s, (const uint16_t*)A,
+                     (const uint8_t*)B, (uint16_t*)C, (const uint8_t*)S, (const float*)topk_w,
+                     (const int32_t*)ids, P, N, top_k, phase, stride_am, stride_be, stride_bn,
+                     stride_cm, sse, ssn, ssg, E, vec, tile_major);
+  return 0;
+}
+
+// mt: token tile (1, 2, 4, 8); rc: rows per wave R x passes RP as 10*R + RP (11, 21, 22, 41, 42, 44),
+// + 100 for tile-major grid order (the N tiles of one expert in consecutive blocks)
+extern "C" int vsh_moe_mxfp4_v5(void* stream, int phase, int mt, int rc, const void* A, const void* B,
+                                void* C, const void* S, const void* topk_w, const void* ids, int P,
+                                int N, int K, int top_k, long stride_am, long stride_be,
+                                long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
+  if (P > 64 || P < 1) return -1;
+  hipStream_t s = (hipStream_t)stream;
+  const int vec = (ssn == 1 && ssg % 4 == 0 && sse % 4 == 0 && ((uintptr_t)S % 4) == 0) ? 1 : 0;
+  const int tm = rc >= 100 ? 1 : 0;
+  rc %= 100;
+#define ARGS5 s, phase, A, B, C, S, topk_w, ids, P, N, top_k, stride_am, stride_be, stride_bn, stride_cm, sse, ssn, ssg, E, vec, tm
+#define BYRC(KK, MM) do { switch (rc) { \
+    case 11: mx5_launch<KK, MM, 1, 1>(ARGS5); break;     case 21: mx5_launch<KK, MM, 2, 1>(ARGS5); break;     case 22: mx5_launch<KK, MM, 2, 2>(ARGS5); break; \
+    case 41: mx5_launch<KK, MM, 4, 1>(ARGS5); break; \
+    case 42: mx5_launch<KK, MM, 4, 2>(ARGS5); break; \
+    case 44: mx5_launch<KK, MM, 4, 4>(ARGS5); break; \
+    default: return -4; } } while (0)
+#define BYMT5(KK) do { if (mt <= 1) BYRC(KK, 1); else if (mt <= 2) BYRC(KK, 2); else if (mt <= 4) BYRC(KK, 4); \
+                       else BYRC(KK, 8); } while (0)
+  switch (K) {
+    case 4096: BYMT5(4096); break;
+    case 2048: BYMT5(2048); break;
+    case 1024: BYMT5(1024); break;
+    default: return -2;
+  }
+#undef BYMT5
+#undef BYRC
+#undef ARGS5
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
