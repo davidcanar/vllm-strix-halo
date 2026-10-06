@@ -174,7 +174,7 @@ __global__ __launch_bounds__(WAVES * WS) void moe_int4_direct_kernel(
     const uint16_t* __restrict__ S, const float* __restrict__ topk_w,
     const int32_t* __restrict__ ids, int P, int N, int top_k, float L,
     long stride_am, long stride_be, long stride_bn, long stride_cm,
-    long stride_se, long stride_sn) {
+    long stride_se, long stride_sn, int E) {
   constexpr int KB = K / 2;
   constexpr int ITERS = KB / (WS * 16);
   static_assert(KB % (WS * 16) == 0, "K must be a multiple of 1024");
@@ -193,6 +193,13 @@ __global__ __launch_bounds__(WAVES * WS) void moe_int4_direct_kernel(
   __syncthreads();
   if (dup) return;
   const int nt = ntok;
+  if (e < 0 || e >= E) {   // padding sentinel (-1) / out of range: contributes nothing
+    for (int i = threadIdx.x; i < nt * WAVES * ROWS; i += WAVES * WS) {
+      const int n = blockIdx.y * WAVES * ROWS + i % (WAVES * ROWS);
+      if (n < N) C[(long)toks[i / (WAVES * ROWS)] * stride_cm + n] = 0;
+    }
+    return;
+  }
   const int n0 = (blockIdx.y * WAVES + wave) * ROWS;
   const uint8_t* Be = B + (long)e * stride_be;
   const uint16_t* Se = S + (long)e * stride_se;
@@ -295,7 +302,7 @@ __global__ void moe_topk_sum_kernel(const uint16_t* __restrict__ in, uint16_t* _
 extern "C" int vsh_moe_int4_direct(void* stream, int phase, const void* A, const void* B, void* C,
                                    const void* S, const void* topk_w, const void* ids, int P, int N,
                                    int K, int top_k, float L, long stride_am, long stride_be,
-                                   long stride_bn, long stride_cm, long stride_se, long stride_sn) {
+                                   long stride_bn, long stride_cm, long stride_se, long stride_sn, int E) {
   if (P > 64 || P < 1) return -1;
   dim3 grid(P, (N + WAVES * ROWS - 1) / (WAVES * ROWS));
   dim3 block(WAVES * WS);
@@ -304,7 +311,7 @@ extern "C" int vsh_moe_int4_direct(void* stream, int phase, const void* A, const
   hipLaunchKernelGGL((moe_int4_direct_kernel<KK, PH>), grid, block, 0, s, (const uint16_t*)A,   \
                      (const uint8_t*)B, (uint16_t*)C, (const uint16_t*)S, (const float*)topk_w,  \
                      (const int32_t*)ids, P, N, top_k, L, stride_am, stride_be, stride_bn,       \
-                     stride_cm, stride_se, stride_sn)
+                     stride_cm, stride_se, stride_sn, E)
   if (phase == 1) {
     switch (K) {
       case 4096: LAUNCHD(4096, 1); break;
@@ -352,7 +359,7 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_direct_kernel(
     const uint8_t* __restrict__ S, const float* __restrict__ topk_w,
     const int32_t* __restrict__ ids, int P, int N, int top_k, float L,
     long stride_am, long stride_be, long stride_bn, long stride_cm,
-    long sse, long ssn, long ssg) {
+    long sse, long ssn, long ssg, int E) {
   constexpr int KB = K / 2;
   constexpr int ITERS = KB / (WS * 16);
   static_assert(KB % (WS * 16) == 0, "K must be a multiple of 1024");
@@ -371,6 +378,13 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_direct_kernel(
   __syncthreads();
   if (dup) return;
   const int nt = ntok;
+  if (e < 0 || e >= E) {   // padding sentinel (-1) / out of range: contributes nothing
+    for (int i = threadIdx.x; i < nt * WAVES * ROWS; i += WAVES * WS) {
+      const int n = blockIdx.y * WAVES * ROWS + i % (WAVES * ROWS);
+      if (n < N) C[(long)toks[i / (WAVES * ROWS)] * stride_cm + n] = 0;
+    }
+    return;
+  }
   const int n0 = (blockIdx.y * WAVES + wave) * ROWS;
   const uint8_t* Be = B + (long)e * stride_be;
   const uint8_t* Se = S + (long)e * sse;
@@ -463,7 +477,7 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_direct_kernel(
 extern "C" int vsh_moe_mxfp4_direct(void* stream, int phase, const void* A, const void* B, void* C,
                                     const void* S, const void* topk_w, const void* ids, int P, int N,
                                     int K, int top_k, float L, long stride_am, long stride_be,
-                                    long stride_bn, long stride_cm, long sse, long ssn, long ssg) {
+                                    long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
   if (P > 64 || P < 1) return -1;
   dim3 grid(P, (N + WAVES * ROWS - 1) / (WAVES * ROWS));
   dim3 block(WAVES * WS);
@@ -472,7 +486,7 @@ extern "C" int vsh_moe_mxfp4_direct(void* stream, int phase, const void* A, cons
   hipLaunchKernelGGL((moe_mxfp4_direct_kernel<KK, PH>), grid, block, 0, s, (const uint16_t*)A,  \
                      (const uint8_t*)B, (uint16_t*)C, (const uint8_t*)S, (const float*)topk_w,   \
                      (const int32_t*)ids, P, N, top_k, L, stride_am, stride_be, stride_bn,       \
-                     stride_cm, sse, ssn, ssg)
+                     stride_cm, sse, ssn, ssg, E)
   if (phase == 1) {
     switch (K) {
       case 4096: LAUNCHX(4096, 1); break;
@@ -503,7 +517,7 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v2_kernel(
     const uint16_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ C,
     const uint8_t* __restrict__ S, const float* __restrict__ topk_w,
     const int32_t* __restrict__ ids, int P, int N, int top_k,
-    long stride_am, long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg) {
+    long stride_am, long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
   constexpr int KB = K / 2;
   constexpr int ITERS = KB / (WS * 16);
   static_assert(KB % (WS * 16) == 0, "K must be a multiple of 1024");
@@ -521,6 +535,13 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v2_kernel(
   __syncthreads();
   if (dup) return;
   const int nt = ntok;
+  if (e < 0 || e >= E) {   // padding sentinel (-1) / out of range: contributes nothing
+    for (int i = threadIdx.x; i < nt * WAVES * R; i += WAVES * WS) {
+      const int n = blockIdx.y * WAVES * R + i % (WAVES * R);
+      if (n < N) C[(long)toks[i / (WAVES * R)] * stride_cm + n] = 0;
+    }
+    return;
+  }
   const int n0 = (blockIdx.y * WAVES + wave) * R;
   if (n0 >= N) return;
   const uint8_t* Be = B + (long)e * stride_be;
@@ -617,7 +638,7 @@ __global__ void moe_swiglu_kernel(const uint16_t* __restrict__ c1, uint16_t* __r
 extern "C" int vsh_moe_mxfp4_v2(void* stream, int phase, const void* A, const void* B, void* C,
                                 const void* S, const void* topk_w, const void* ids, int P, int N,
                                 int K, int top_k, long stride_am, long stride_be, long stride_bn,
-                                long stride_cm, long sse, long ssn, long ssg) {
+                                long stride_cm, long sse, long ssn, long ssg, int E) {
   if (P > 64 || P < 1) return -1;
   constexpr int R = 2;
   dim3 grid(P, (N + WAVES * R - 1) / (WAVES * R));
@@ -625,7 +646,7 @@ extern "C" int vsh_moe_mxfp4_v2(void* stream, int phase, const void* A, const vo
   hipStream_t s = (hipStream_t)stream;
 #define LV2(KK, PH) hipLaunchKernelGGL((moe_mxfp4_v2_kernel<KK, PH, 8, R>), grid, block, 0, s,    \
       (const uint16_t*)A, (const uint8_t*)B, (uint16_t*)C, (const uint8_t*)S, (const float*)topk_w, \
-      (const int32_t*)ids, P, N, top_k, stride_am, stride_be, stride_bn, stride_cm, sse, ssn, ssg)
+      (const int32_t*)ids, P, N, top_k, stride_am, stride_be, stride_bn, stride_cm, sse, ssn, ssg, E)
   if (phase == 1) {
     switch (K) { case 4096: LV2(4096, 1); break; case 2048: LV2(2048, 1); break;
                  case 1024: LV2(1024, 1); break; default: return -2; }
@@ -657,7 +678,7 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v3_kernel(
     const uint16_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ C,
     const uint8_t* __restrict__ S, const float* __restrict__ topk_w,
     const int32_t* __restrict__ ids, int P, int N, int top_k, int phase,
-    long stride_am, long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg) {
+    long stride_am, long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
   constexpr int KB = K / 2;
   constexpr int ITERS = KB / (WS * 16);
   static_assert(KB % (WS * 16) == 0, "K must be a multiple of 1024");
@@ -676,6 +697,13 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v3_kernel(
   __syncthreads();
   if (dup) return;
   const int nt = ntok;
+  if (e < 0 || e >= E) {   // padding sentinel (-1) / out of range: contributes nothing
+    for (int i = threadIdx.x; i < nt * WAVES * R; i += WAVES * WS) {
+      const int n = blockIdx.y * WAVES * R + i % (WAVES * R);
+      if (n < N) C[(long)toks[i / (WAVES * R)] * stride_cm + n] = 0;
+    }
+    return;
+  }
   const int n0 = (blockIdx.y * WAVES + wave) * R;
   const uint8_t* Be = B + (long)e * stride_be;
   const uint8_t* Se = S + (long)e * sse;
@@ -763,12 +791,12 @@ __global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v3_kernel(
 template <int K, int MT, int R>
 static int mx3_launch(hipStream_t s, int phase, const void* A, const void* B, void* C, const void* S,
                       const void* topk_w, const void* ids, int P, int N, int top_k, long stride_am,
-                      long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg) {
+                      long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
   dim3 grid(P, (N + WAVES * R - 1) / (WAVES * R)), block(WAVES * WS);
   hipLaunchKernelGGL((moe_mxfp4_v3_kernel<K, MT, R>), grid, block, 0, s, (const uint16_t*)A,
                      (const uint8_t*)B, (uint16_t*)C, (const uint8_t*)S, (const float*)topk_w,
                      (const int32_t*)ids, P, N, top_k, phase, stride_am, stride_be, stride_bn,
-                     stride_cm, sse, ssn, ssg);
+                     stride_cm, sse, ssn, ssg, E);
   return 0;
 }
 
@@ -776,11 +804,11 @@ static int mx3_launch(hipStream_t s, int phase, const void* A, const void* B, vo
 extern "C" int vsh_moe_mxfp4_v3(void* stream, int phase, int mt, const void* A, const void* B,
                                 void* C, const void* S, const void* topk_w, const void* ids, int P,
                                 int N, int K, int top_k, long stride_am, long stride_be,
-                                long stride_bn, long stride_cm, long sse, long ssn, long ssg) {
+                                long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
   if (P > 64 || P < 1) return -1;
   hipStream_t s = (hipStream_t)stream;
   constexpr int R = 2;
-#define ARGS s, phase, A, B, C, S, topk_w, ids, P, N, top_k, stride_am, stride_be, stride_bn, stride_cm, sse, ssn, ssg
+#define ARGS s, phase, A, B, C, S, topk_w, ids, P, N, top_k, stride_am, stride_be, stride_bn, stride_cm, sse, ssn, ssg, E
 #define BYMT(KK) do { if (mt <= 1) mx3_launch<KK, 1, R>(ARGS); else if (mt <= 2) mx3_launch<KK, 2, R>(ARGS); \
                       else if (mt <= 4) mx3_launch<KK, 4, R>(ARGS); else mx3_launch<KK, 6, R>(ARGS); } while (0)
   switch (K) {

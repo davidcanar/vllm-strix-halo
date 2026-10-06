@@ -2412,3 +2412,38 @@ DS4 (FP8 GEMV + inverse-RoPE fix + this), battery all PASS (`scripts/ds4len.py`)
 
 Acceptance 2.6-2.8. That is the June stack's range (17-24 tok/s). GLM unaffected
 (shares both libraries; 96 / 100 / 98 ms/step, needle 3/3, replay 3/3).
+
+
+## 39. DS4 CUDA graphs: work after a padding fix, but no speedup — DS4 stays eager (2026-10-05)
+
+1. **Launcher.** `ds4_enforce_eager: 0` used to set only `VLLM_USE_BREAKABLE_CUDAGRAPH=1`,
+   leaving vLLM's default FULL-style capture — the mode whose first replay hangs in RCCL
+   (§29). `vsh-ds4-manual-serve.sh` now mirrors GLM's §33 setup:
+   `--compilation-config {"cudagraph_mode": "PIECEWISE"}` and capture sizes `1 2 4 6 8`
+   (6 = the DSpark k=5 verify, so it is not padded to 8); knobs `VSH_DS4_CG_MODE` /
+   `VSH_DS4_CG_SIZES`, passed by the reserve/restart scripts. DS4's attention needs no
+   change: on the V1 model runner it is one wide eager break
+   (`_prepare_and_attn_eager`, upstream's fix for #51430), and the TP collectives are
+   eager breaks via §33's `vsh-cg-eager-collectives`.
+2. **Padding fix (all direct-MoE kernels).** With graphs, batches are padded to a capture
+   size and vLLM's routers mark the padding rows with expert id **-1**
+   (`VLLM_MOE_SKIP_PADDING`, `topk_ids.masked_fill(is_padding, -1)`; the stock kernels
+   skip those slots). Our direct kernels indexed expert -1 → GPU memory fault in
+   `moe_mxfp4_v3_kernel` during the DSpark capture. Every direct kernel (GLM's int4 §31,
+   MXFP4 v1/v2/v3) now takes the expert count and zero-fills the rows of slots outside
+   `[0, E)`; the extern entry points take `E` as their last argument
+   (`scripts/test_pad_ids.py`: real rows match the stock path, padding rows exactly 0).
+   GLM was not exposed in practice — its grouped router opts out of skip-padding
+   (`skip_padding=False` unless DeepEP-v2) — but the kernels no longer rely on that.
+3. **Result** (battery all PASS in both modes):
+
+   | DS4 | eager (§38) | PIECEWISE graphs |
+   |---|---|---|
+   | spec off | 14.3 tok/s (70 ms) | 14.4 tok/s (69 ms) |
+   | DSpark k=5, prose / JSON | 20.0 / 17.9 | 17.5 / 17.9 |
+
+   No gain: per layer, the attention block (compressor, indexer, sparse attention,
+   inverse RoPE) is one eager region on this pin, and what the graphs capture — the
+   projections and the MoE — already launches as a handful of HIP calls. **DS4 stays
+   eager by default** (`ds4_enforce_eager: 1`); graphs are a working option. GLM after
+   the window: 97 / 101 / 99 ms/step, needle 3/3, replay 3/3.

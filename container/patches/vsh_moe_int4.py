@@ -57,7 +57,8 @@ MAX_PAIRS = 64
 def _direct_init(lib):
     lib.vsh_moe_int4_direct.restype = ctypes.c_int
     lib.vsh_moe_int4_direct.argtypes = ([ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 6
-                                        + [ctypes.c_int] * 4 + [ctypes.c_float] + [ctypes.c_long] * 6)
+                                        + [ctypes.c_int] * 4 + [ctypes.c_float] + [ctypes.c_long] * 6
+                                        + [ctypes.c_int])
     lib.vsh_moe_topk_sum.restype = ctypes.c_int
     lib.vsh_moe_topk_sum.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long] * 2
     lib._direct_init = True
@@ -120,12 +121,12 @@ def direct_moe(x, w13, w2, s13, s2, topk_weights, topk_ids, clamp):
     rc = lib.vsh_moe_int4_direct(st, 1, x.data_ptr(), w13.data_ptr(), c1.data_ptr(), s13.data_ptr(),
                                  tw.data_ptr(), ids.data_ptr(), P, N1, K, top_k, float(clamp),
                                  x.stride(0), w13.stride(0), w13.stride(1), c1.stride(0),
-                                 s13.stride(0), s13.stride(1))
+                                 s13.stride(0), s13.stride(1), w13.size(0))
     if rc == 0:
         rc = lib.vsh_moe_int4_direct(st, 2, c1.data_ptr(), w2.data_ptr(), c3.data_ptr(), s2.data_ptr(),
                                      tw.data_ptr(), ids.data_ptr(), P, N2, N1 // 2, top_k, float(clamp),
                                      c1.stride(0), w2.stride(0), w2.stride(1), c3.stride(0),
-                                     s2.stride(0), s2.stride(1))
+                                     s2.stride(0), s2.stride(1), w2.size(0))
     if rc == 0:
         rc = lib.vsh_moe_topk_sum(st, c3.data_ptr(), out.data_ptr(), M, N2, top_k, c3.stride(0), out.stride(0))
     if rc != 0:
@@ -213,11 +214,12 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
         for fn in (lib.vsh_moe_mxfp4_direct, lib.vsh_moe_mxfp4_v2, lib.vsh_moe_mxfp4_v3, lib.vsh_moe_swiglu):
             fn.restype = ctypes.c_int
         lib.vsh_moe_mxfp4_v3.argtypes = ([ctypes.c_void_p, ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 6
-                                         + [ctypes.c_int] * 4 + [ctypes.c_long] * 7)
+                                         + [ctypes.c_int] * 4 + [ctypes.c_long] * 7 + [ctypes.c_int])
         lib.vsh_moe_mxfp4_direct.argtypes = ([ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 6
-                                             + [ctypes.c_int] * 4 + [ctypes.c_float] + [ctypes.c_long] * 7)
+                                             + [ctypes.c_int] * 4 + [ctypes.c_float] + [ctypes.c_long] * 7
+                                             + [ctypes.c_int])
         lib.vsh_moe_mxfp4_v2.argtypes = ([ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 6
-                                         + [ctypes.c_int] * 4 + [ctypes.c_long] * 7)
+                                         + [ctypes.c_int] * 4 + [ctypes.c_long] * 7 + [ctypes.c_int])
         lib.vsh_moe_swiglu.argtypes = ([ctypes.c_void_p] * 3 + [ctypes.c_int] * 2 + [ctypes.c_float]
                                        + [ctypes.c_long] * 2)
         if not getattr(lib, "_direct_init", False):
@@ -228,37 +230,37 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
     if ver == "1":      # v1: LDS-staged kernel, fused SwiGLU
         rc = lib.vsh_moe_mxfp4_direct(st, 1, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
                                       tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k, plan["clamp"],
-                                      x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"])
+                                      x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"], a["E"])
         if rc == 0:
             rc = lib.vsh_moe_mxfp4_direct(st, 2, c1.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
                                           tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k, plan["clamp"],
-                                          c1.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"])
+                                          c1.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
     elif ver == "3":
         act = torch.empty((P, b["K"]), dtype=torch.bfloat16, device=x.device)
         mt = 1 if M <= 1 else 2 if M <= 2 else 4      # sweep: 4 beats 6 at M=6 (occupancy)
         mt = int(os.environ.get("VSH_MX_MT", mt))
         rc = lib.vsh_moe_mxfp4_v3(st, 1, mt, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
                                   tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k,
-                                  x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"])
+                                  x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"], a["E"])
         if rc == 0:
             rc = lib.vsh_moe_swiglu(st, c1.data_ptr(), act.data_ptr(), P, b["K"], plan["clamp"],
                                     c1.stride(0), act.stride(0))
         if rc == 0:
             rc = lib.vsh_moe_mxfp4_v3(st, 2, mt, act.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
                                       tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k,
-                                      act.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"])
+                                      act.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
     else:
         act = torch.empty((P, b["K"]), dtype=torch.bfloat16, device=x.device)
         rc = lib.vsh_moe_mxfp4_v2(st, 1, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
                                   tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k,
-                                  x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"])
+                                  x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"], a["E"])
         if rc == 0:
             rc = lib.vsh_moe_swiglu(st, c1.data_ptr(), act.data_ptr(), P, b["K"], plan["clamp"],
                                     c1.stride(0), act.stride(0))
         if rc == 0:
             rc = lib.vsh_moe_mxfp4_v2(st, 2, act.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
                                       tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k,
-                                      act.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"])
+                                      act.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
     if rc == 0:
         rc = lib.vsh_moe_topk_sum(st, c3.data_ptr(), out.data_ptr(), M, b["N"], top_k, c3.stride(0), out.stride(0))
     if rc != 0:

@@ -115,10 +115,18 @@ fi
 # stack's drafter-capture constraint. ds4_enforce_eager: 0 re-enables the
 # old stack's PIECEWISE graphs (unproven on 0.31.0 for V4).
 EAGER=(--enforce-eager)
+CGS=()
 if [ "${VSH_DS4_ENFORCE_EAGER:-1}" != "1" ]; then
   EAGER=()
   export VLLM_USE_BREAKABLE_CUDAGRAPH=1
-  echo "[vsh-ds4-serve] enforce-eager OFF (PIECEWISE graphs, breakable capture)"
+  # PIECEWISE only: FULL modes put the TP all-reduces inside the graph and the
+  # first replay hangs in RCCL (PATCHES 29); with breakable PIECEWISE capture
+  # every collective is an eager break (vsh-cg-eager-collectives, PATCHES 33)
+  # and DS4's attention is one wide eager region (_prepare_and_attn_eager).
+  # Size 6 = DSpark k=5 verify (1 + 5), so it is not padded to 8.
+  CGS=(--cudagraph-capture-sizes ${VSH_DS4_CG_SIZES:-1 2 4 6 8}
+       --compilation-config "{\"cudagraph_mode\": \"${VSH_DS4_CG_MODE:-PIECEWISE}\"}")
+  echo "[vsh-ds4-serve] enforce-eager OFF: cudagraph_mode ${VSH_DS4_CG_MODE:-PIECEWISE}, sizes ${VSH_DS4_CG_SIZES:-1 2 4 6 8} (breakable capture)"
 fi
 
 # gfx1151 (FNUZ aiter): upstream fused norm/act fp8-quant fusions feed
@@ -133,6 +141,7 @@ exec vllm serve "$MODEL_DIR" \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   "${EAGER[@]}" "${PROF[@]}" \
+  "${CGS[@]}" \
   "${KVD[@]}" \
   --gpu-memory-utilization ${VSH_DS4_GPU_UTIL:-0.83} \
   --kv-cache-memory-bytes ${VSH_DS4_KV_BYTES:-6442450944} \

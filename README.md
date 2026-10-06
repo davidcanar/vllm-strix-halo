@@ -19,7 +19,7 @@
 | image input | ✅ (vision encoder in BF16; 448×448 probe answered correctly, 9.1 s) |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§38). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§39). This README is the current state only.
 
 ---
 
@@ -162,7 +162,7 @@ vllm-strix-halo/
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
 ├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§38)
+├── PATCHES.md               # detailed patch history and lessons (§1–§39)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
@@ -189,8 +189,9 @@ vllm-strix-halo/
    `vsh-kpool-paged-logits` replaces it).
 5. **DS4 native** — correct since §37 and at June-stack speed since §38:
    20.0 / 17.9 tok/s prose / JSON with DSpark k=5 (acceptance 2.6–2.8), 14.3 tok/s
-   without spec. Needles, counting to 100 and thinking mode pass. Remaining levers:
-   CUDA graphs for DS4, the multi-token MoE at full expert spread (1.8 ms/layer at
-   M=6), host overhead. DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both
+   without spec. Needles, counting to 100 and thinking mode pass. CUDA graphs
+   (`ds4_enforce_eager: 0`, PIECEWISE) work since §39 but bring no speedup, so DS4
+   stays eager. Remaining levers: the multi-token MoE at full expert spread
+   (1.8 ms/layer at M=6), host overhead in the attention block. DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both
    ranks — the DS4 restart/reserve scripts pass them, and every restart script
    refuses to start when the two boxes' env files differ.
