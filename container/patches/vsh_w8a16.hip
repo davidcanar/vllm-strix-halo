@@ -263,6 +263,11 @@ extern "C" int vsh_fp8_gemv(void* stream, const void* W, const void* S, const vo
       else if (M <= 4) fp8_launch<4096, 4, 2, 2>(st, fnuz, A_);
       else fp8_launch<4096, 8, 4, 2>(st, fnuz, A_);
       break;
+    case 12288:   // DSpark drafter: 3 target hidden states (3 x 4096) -> 4096
+      if (M == 1) fp8_launch<12288, 1, 2, 2>(st, fnuz, A_);
+      else if (M <= 4) fp8_launch<12288, 4, 2, 2>(st, fnuz, A_);
+      else fp8_launch<12288, 8, 4, 2>(st, fnuz, A_);
+      break;
 #define GEN(KK, VV) case KK: \
       if (M == 1) fp8_launch<KK, 1, 1, VV>(st, fnuz, A_); \
       else if (M <= 4) fp8_launch<KK, 4, 1, VV>(st, fnuz, A_); \

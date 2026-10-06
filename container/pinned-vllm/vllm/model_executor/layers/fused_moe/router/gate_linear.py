@@ -232,6 +232,18 @@ class GateLinear(ReplicatedLinear):
 
             if _w8.w16_ok(self.weight, x):
                 return self._return(_w8.w16_gemv(x, self.weight))
+        # [vsh-gate-bf16-diag] a decode-sized call reaching here missed the w16 GEMV: say why, once
+        if (current_platform.is_rocm() and x.dim() == 2 and 0 < x.shape[0] <= 8
+                and not GateLinear.__dict__.get("_vsh_w16_why", False)):
+            GateLinear._vsh_w16_why = True
+            import logging as _vlog
+
+            _vlog.getLogger(__name__).warning(
+                "[vsh-gate-bf16] decode gate not on w16: x %s %s stride %s | w %s %s stride %s"
+                " | allow_cublas %s out_dtype %s",
+                tuple(x.shape), x.dtype, tuple(x.stride()), tuple(self.weight.shape),
+                self.weight.dtype, tuple(self.weight.stride()),
+                self.allow_cublas_router_gemm, self.out_dtype)
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)

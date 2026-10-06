@@ -203,7 +203,7 @@ def sigmoid_bias_topk(router_logits, bias, top_k, renormalize, scale):
 # 3-11 GB/s at decode sizes (1.4-2.7 ms per call, ~87 % of the DS4 step;
 # PATCHES 35). vsh_fp8_gemv streams the fp8 weight with in-register decode and
 # takes the bf16 activation directly.
-_FP8_K = (512, 1024, 1536, 2048, 3072, 4096, 6144, 7168, 8192)
+_FP8_K = (512, 1024, 1536, 2048, 3072, 4096, 6144, 7168, 8192, 12288)
 _FP8_SCALES: dict = {}
 
 
@@ -264,3 +264,10 @@ def fp8_gemv(x2d: torch.Tensor, weight: torch.Tensor, block_scale: torch.Tensor)
     if rc != 0:
         raise RuntimeError(f"vsh_fp8_gemv failed: {rc}")
     return y
+
+
+def mm_f32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """torch.mm(x, weight.T, out_dtype=float32) with the w16 GEMV for decode rows."""
+    if w16_ok(weight, x):
+        return w16_gemv(x, weight)
+    return torch.mm(x, weight.T, out_dtype=torch.float32)

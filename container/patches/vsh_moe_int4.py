@@ -211,8 +211,11 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
     out = output.view(M, b["N"])
     lib = _lib()
     if not getattr(lib, "_mx_init", False):
-        for fn in (lib.vsh_moe_mxfp4_direct, lib.vsh_moe_mxfp4_v2, lib.vsh_moe_mxfp4_v3, lib.vsh_moe_swiglu):
+        for fn in (lib.vsh_moe_mxfp4_direct, lib.vsh_moe_mxfp4_v2, lib.vsh_moe_mxfp4_v3,
+                   lib.vsh_moe_mxfp4_v4, lib.vsh_moe_swiglu):
             fn.restype = ctypes.c_int
+        lib.vsh_moe_mxfp4_v4.argtypes = ([ctypes.c_void_p] + [ctypes.c_int] * 3 + [ctypes.c_void_p] * 6
+                                         + [ctypes.c_int] * 4 + [ctypes.c_long] * 7 + [ctypes.c_int])
         lib.vsh_moe_mxfp4_v3.argtypes = ([ctypes.c_void_p, ctypes.c_int, ctypes.c_int] + [ctypes.c_void_p] * 6
                                          + [ctypes.c_int] * 4 + [ctypes.c_long] * 7 + [ctypes.c_int])
         lib.vsh_moe_mxfp4_direct.argtypes = ([ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 6
@@ -226,7 +229,7 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
             _direct_init(lib)
         lib._mx_init = True
     st = torch.cuda.current_stream().cuda_stream
-    ver = os.environ.get("VSH_MOE_MXFP4_V", "3")
+    ver = os.environ.get("VSH_MOE_MXFP4_V", "4")
     if ver == "1":      # v1: LDS-staged kernel, fused SwiGLU
         rc = lib.vsh_moe_mxfp4_direct(st, 1, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
                                       tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k, plan["clamp"],
@@ -235,6 +238,22 @@ def mxfp4_direct_moe(output, x, plan, topk_weights, topk_ids):
             rc = lib.vsh_moe_mxfp4_direct(st, 2, c1.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
                                           tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k, plan["clamp"],
                                           c1.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
+    elif ver == "4":
+        act = torch.empty((P, b["K"]), dtype=torch.bfloat16, device=x.device)
+        mt = 1 if M <= 1 else 2 if M <= 2 else 4
+        mt = int(os.environ.get("VSH_MX_MT", mt))
+        rp1 = int(os.environ.get("VSH_MX_RP1", "2"))
+        rp2 = int(os.environ.get("VSH_MX_RP2", "4"))
+        rc = lib.vsh_moe_mxfp4_v4(st, 1, mt, rp1, x.data_ptr(), a["v"].data_ptr(), c1.data_ptr(), a["s"].data_ptr(),
+                                  tw.data_ptr(), ids.data_ptr(), P, a["N"], a["K"], top_k,
+                                  x.stride(0), a["sbe"], a["sbn"], c1.stride(0), a["sse"], a["ssn"], a["ssg"], a["E"])
+        if rc == 0:
+            rc = lib.vsh_moe_swiglu(st, c1.data_ptr(), act.data_ptr(), P, b["K"], plan["clamp"],
+                                    c1.stride(0), act.stride(0))
+        if rc == 0:
+            rc = lib.vsh_moe_mxfp4_v4(st, 2, mt, rp2, act.data_ptr(), b["v"].data_ptr(), c3.data_ptr(), b["s"].data_ptr(),
+                                      tw.data_ptr(), ids.data_ptr(), P, b["N"], b["K"], top_k,
+                                      act.stride(0), b["sbe"], b["sbn"], c3.stride(0), b["sse"], b["ssn"], b["ssg"], b["E"])
     elif ver == "3":
         act = torch.empty((P, b["K"]), dtype=torch.bfloat16, device=x.device)
         mt = 1 if M <= 1 else 2 if M <= 2 else 4      # sweep: 4 beats 6 at M=6 (occupancy)

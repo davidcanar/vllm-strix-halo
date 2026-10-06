@@ -2447,3 +2447,76 @@ Acceptance 2.6-2.8. That is the June stack's range (17-24 tok/s). GLM unaffected
    projections and the MoE — already launches as a handful of HIP calls. **DS4 stays
    eager by default** (`ds4_enforce_eager: 1`); graphs are a working option. GLM after
    the window: 97 / 101 / 99 ms/step, needle 3/3, replay 3/3.
+
+
+## 40. DS4 decode: MXFP4 MoE v4, FP8 GEMV at K=12288, compressor scores on the bf16 GEMV (2026-10-06)
+
+A torch-profiler trace of DSpark k=5 decode (`VSH_DS4_PROFILER_DIR`, now passed by
+`vsh-ds4-reserve.sh`; read with `scripts/ds4trace.py` and `scripts/ds4who.py`) put the
+step at 133 ms wall for 127 ms of GPU work. DS4 decode is GPU-bound: the main thread's
+~80 ms/step of host work runs behind the GPU, so host overhead (a lever in §38/§39) is
+not one. Three fixes from the kernel list:
+
+1. **MXFP4 MoE v4** (`moe_mxfp4_v4_kernel<K, MT, R, RP>`, new default
+   `VSH_MOE_MXFP4_V=4`). A v3 workgroup covered 16 rows of one expert; in w2 (K=1024) a
+   wave streamed 1 KB of weights and exited, so the dedup prologue, the LDS staging and
+   the barriers dominated when the draft tokens hit many distinct experts. v4 keeps the
+   staged activations and walks `RP` row pairs per wave (`VSH_MX_RP1` = 2 for w13,
+   `VSH_MX_RP2` = 4 for w2; `scripts/moe_v4sweep.py`). Output bit-identical to v3. E=256:
+
+   | case | v3 | v4 |
+   |---|---|---|
+   | M=1 | 0.211 ms | **0.187** (1.13x) |
+   | M=6, random experts | 1.95 | **1.84** (1.06x) |
+   | M=6, half shared | 1.37 | **1.23** (1.11x) |
+   | M=6, all shared | 0.67 | **0.60** (1.12x) |
+
+2. **FP8 GEMV at K=12288.** The DSpark drafter's 4096 x 12288 FP8 linear (row stride
+   12544, e8m0 scales 32 x 96) was not in the GEMV's K list and fell back to Triton's
+   `_w8a8_triton_block_scaled_mm`: one call per step, 8.4 ms. It now gets the K=4096
+   tiles (`<1,2,2>` / `<4,2,2>` / `<8,4,2>` by M): 0.25-0.34 ms at M=1-6, 199-148 GB/s
+   (`scripts/time12288.py`), rel err 1.7e-3 as at the other K.
+3. **Compressor scores on the bf16 GEMV** (`vsh-ds4-mmf32.py`). `compressor_kv_score` and
+   `indexer_compressor_kv_score` ran `torch.mm(hidden, fused_wkv_wgate.weight.T,
+   out_dtype=float32)` on hipBLASLt — 62 calls, 9.1 ms per step. They now call
+   `vsh_w8a16.mm_f32`: `vsh_w16_gemv` for <= 8 rows, `torch.mm` above (max diff vs
+   `torch.mm` 3-6e-5). The script also adds a one-time `[vsh-gate-bf16] decode gate not
+   on w16` warning when a decode-sized `GateLinear` call reaches the cuBLAS tier. The
+   router gates were already on the GEMV (46 calls per step); the warning has not fired
+   for DS4 or GLM.
+
+Result (battery all PASS, `scripts/ds4len.py`; acceptance 2.6-2.8):
+
+| DS4, DSpark k=5 | prose | JSON | counting to 100 | step: wall / GPU busy |
+|---|---|---|---|---|
+| §38 (MoE v3) | 20.0 tok/s | 17.9 | 34 | — |
+| + MoE v4 | 21.0 | 18.7 | 39.9 | 133 / 127 ms |
+| + K=12288 GEMV + compressor GEMV | **22.0** | **20.3** | **43.5** | **124 / 114 ms** |
+
+Spec off was not re-measured (14.3 tok/s at §38). GPU time per step now (rank 0):
+
+| kernels | ms/step |
+|---|---|
+| MoE, v4 w13 + w2 (45 calls) | 49.7 |
+| FP8 GEMV | 21.4 |
+| hipBLASLt bf16, mostly the attention output's grouped `wo_a` einsum (bmm) | 11.1 |
+| `odl2_wait` (decode all-reduce) | 7.0 |
+| sparse attention decode | 5.8 |
+| bf16 GEMV: gates + compressor scores (107 calls) | 4.6 |
+| mHC fused pre/post | 4.4 |
+| `wvSplitK` bf16 skinny GEMMs (lm_head) | 3.6 |
+| KV compress + indexer insert | 3.0 |
+
+Main-thread host self time is 62 ms/step, all behind the GPU. Remaining levers: the
+MoE (44 % of GPU time; at full expert spread v4 moves ~125 GB/s of the ~215 GB/s DRAM
+rate), the bf16 `wo_a` einsum, the ~10 ms of GPU idle per step, an int8 DS4 `lm_head`.
+GLM after the window: 98 / 101 / 98 ms/step, needle 3/3, replay 3/3.
+
+Housekeeping at the snapshot (`glm-perf40-20261006`): box2's container had lagged box1
+since 10-02 on four files — the tool-call parser (`abstract_parser.py`), the APC-align KV
+coordinator, the adaptive-k scheduler (all head-only code box2 never runs) and §19's
+`shm_broadcast.py` spin knob (unset, so stock behaviour). Box1's copies are now on both
+boxes, `shm_broadcast.py` joins `container/pinned-vllm/`, and `pinned-vllm`'s
+`vsh_kpool_paged_logits.py` now carries the running bytes (CRLF, plus the `_calls`
+counter that `debug/vsh-kpl-diag.py` reads). Both images match the 44-file overlay; the
+only remaining difference between the boxes is box1's aiter JIT build cache.

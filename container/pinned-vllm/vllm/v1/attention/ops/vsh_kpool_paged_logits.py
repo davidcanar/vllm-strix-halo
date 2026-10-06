@@ -15,6 +15,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+_calls = 0
+
 
 @triton.jit
 def _e4m3fn_bits_to_f32(b):
@@ -83,6 +85,8 @@ def kpool_paged_mqa_logits(q_fp8, kv_cache, weights, context_lens, block_tables,
                            max_model_len, out=None):
     """q_fp8 [B, next_n, H, D] e4m3fn; kv_cache raw uint8 [num_pages, PAGE, (1,) D+4];
     returns fp32 logits [B*next_n, max_model_len] (-inf where not visible)."""
+    global _calls
+    _calls += 1
     B, next_n, H, D = q_fp8.shape
     page = kv_cache.shape[1]
     assert page % 16 == 0 and D % 16 == 0 and q_fp8.stride(-1) == 1

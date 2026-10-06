@@ -821,3 +821,163 @@ extern "C" int vsh_moe_mxfp4_v3(void* stream, int phase, int mt, const void* A, 
 #undef ARGS
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
+
+
+// ---- MXFP4 direct path v4: v3 with RP row-pair passes per wave ----------------
+// In v3 a workgroup covers only WAVES*R = 16 rows of one expert: in w2 (K=1024)
+// a wave streams 1 KB of weights and exits, so the dedup prologue, the LDS
+// staging and the barriers dominate when the draft tokens hit many distinct
+// experts. v4 keeps the staged activations and walks RP row pairs per wave.
+template <int K, int MT, int R, int RP>
+__global__ __launch_bounds__(WAVES * WS) void moe_mxfp4_v4_kernel(
+    const uint16_t* __restrict__ A, const uint8_t* __restrict__ B, uint16_t* __restrict__ C,
+    const uint8_t* __restrict__ S, const float* __restrict__ topk_w,
+    const int32_t* __restrict__ ids, int P, int N, int top_k, int phase,
+    long stride_am, long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg,
+    int E) {
+  constexpr int KB = K / 2;
+  constexpr int ITERS = KB / (WS * 16);
+  constexpr int TILE = WAVES * R * RP;
+  static_assert(KB % (WS * 16) == 0, "K must be a multiple of 1024");
+  __shared__ uint16_t xs[MT][K];
+  __shared__ int toks[64];
+  __shared__ int ntok, dup;
+  const int p = blockIdx.x;
+  const int e = ids[p];
+  const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
+  if (threadIdx.x == 0) { ntok = 0; dup = 0; }
+  __syncthreads();
+  if (threadIdx.x < P && ids[threadIdx.x] == e) {
+    if ((int)threadIdx.x < p) dup = 1;
+    else { int s = atomicAdd(&ntok, 1); toks[s] = threadIdx.x; }
+  }
+  __syncthreads();
+  if (dup) return;
+  const int nt = ntok;
+  if (e < 0 || e >= E) {   // padding sentinel (-1) / out of range: contributes nothing
+    for (int i = threadIdx.x; i < nt * TILE; i += WAVES * WS) {
+      const int n = blockIdx.y * TILE + i % TILE;
+      if (n < N) C[(long)toks[i / TILE] * stride_cm + n] = 0;
+    }
+    return;
+  }
+  const uint8_t* Be = B + (long)e * stride_be;
+  const uint8_t* Se = S + (long)e * sse;
+  for (int t0 = 0; t0 < nt; t0 += MT) {
+    const int tn = min(MT, nt - t0);
+    __syncthreads();
+    for (int t = 0; t < tn; ++t) {
+      const int tok = toks[t0 + t];
+      const uint4* src = (const uint4*)(A + (long)(phase == 1 ? tok / top_k : tok) * stride_am);
+      uint4* dst = (uint4*)xs[t];
+      for (int i = threadIdx.x; i < K / 8; i += WAVES * WS) dst[i] = src[i];
+    }
+    __syncthreads();
+    for (int rp = 0; rp < RP; ++rp) {
+      const int n0 = blockIdx.y * TILE + (rp * WAVES + wave) * R;
+      if (n0 >= N) break;
+      float acc[R][MT];
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < MT; ++t) acc[r][t] = 0.f;
+#pragma unroll
+      for (int it = 0; it < ITERS; ++it) {
+        const int byte0 = it * WS * 16 + lane * 16;
+        const int k0 = byte0 * 2;
+        uint4 w[R];
+        float sc[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          const int n = min(n0 + r, N - 1);
+          w[r] = *(const uint4*)(Be + (long)n * stride_bn + byte0);
+          const uint32_t sb = Se[(long)n * ssn + (long)(k0 >> 5) * ssg];
+          sc[r] = sb ? __uint_as_float((sb - 1u) << 23) : 0.f;   // 2^(sb-127) / 2
+        }
+        float wf[R][32];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          const uint32_t wb[4] = {w[r].x, w[r].y, w[r].z, w[r].w};
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+              const uint32_t byte = (wb[j] >> (8 * b)) & 0xFF;
+              wf[r][j * 8 + b * 2] = e2m1x2(byte & 0xF);
+              wf[r][j * 8 + b * 2 + 1] = e2m1x2(byte >> 4);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          if (t >= tn) break;
+          const uint4* xp = (const uint4*)(&xs[t][k0]);
+          float s[R];
+#pragma unroll
+          for (int r = 0; r < R; ++r) s[r] = 0.f;
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const uint4 v = xp[q];
+            const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              const float x0 = __uint_as_float(u[j] << 16), x1 = __uint_as_float(u[j] & 0xFFFF0000u);
+#pragma unroll
+              for (int r = 0; r < R; ++r) s[r] += wf[r][q * 8 + j * 2] * x0 + wf[r][q * 8 + j * 2 + 1] * x1;
+            }
+          }
+#pragma unroll
+          for (int r = 0; r < R; ++r) acc[r][t] += s[r] * sc[r];
+        }
+      }
+#pragma unroll
+      for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < MT; ++t)
+#pragma unroll
+          for (int off = WS / 2; off > 0; off >>= 1) acc[r][t] += __shfl_xor(acc[r][t], off, WS);
+      if (lane == 0) {
+        for (int t = 0; t < tn; ++t) {
+          const int tok = toks[t0 + t];
+          const float wgt = phase == 2 ? topk_w[tok] : 1.f;
+          for (int r = 0; r < R; ++r)
+            if (n0 + r < N) C[(long)tok * stride_cm + n0 + r] = f2bf(acc[r][t] * wgt);
+        }
+      }
+    }
+  }
+}
+
+template <int K, int MT, int R, int RP>
+static int mx4_launch(hipStream_t s, int phase, const void* A, const void* B, void* C, const void* S,
+                      const void* topk_w, const void* ids, int P, int N, int top_k, long stride_am,
+                      long stride_be, long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
+  dim3 grid(P, (N + WAVES * R * RP - 1) / (WAVES * R * RP)), block(WAVES * WS);
+  hipLaunchKernelGGL((moe_mxfp4_v4_kernel<K, MT, R, RP>), grid, block, 0, s, (const uint16_t*)A,
+                     (const uint8_t*)B, (uint16_t*)C, (const uint8_t*)S, (const float*)topk_w,
+                     (const int32_t*)ids, P, N, top_k, phase, stride_am, stride_be, stride_bn,
+                     stride_cm, sse, ssn, ssg, E);
+  return 0;
+}
+
+// rp = row-pair passes per wave (1, 2, 4); mt as for v3
+extern "C" int vsh_moe_mxfp4_v4(void* stream, int phase, int mt, int rp, const void* A, const void* B,
+                                void* C, const void* S, const void* topk_w, const void* ids, int P,
+                                int N, int K, int top_k, long stride_am, long stride_be,
+                                long stride_bn, long stride_cm, long sse, long ssn, long ssg, int E) {
+  if (P > 64 || P < 1) return -1;
+  hipStream_t s = (hipStream_t)stream;
+#define ARGS4 s, phase, A, B, C, S, topk_w, ids, P, N, top_k, stride_am, stride_be, stride_bn, stride_cm, sse, ssn, ssg, E
+#define BYRP(KK, MM) do { if (rp <= 1) mx4_launch<KK, MM, 2, 1>(ARGS4); else if (rp <= 2) mx4_launch<KK, MM, 2, 2>(ARGS4); \
+                          else mx4_launch<KK, MM, 2, 4>(ARGS4); } while (0)
+#define BYMT4(KK) do { if (mt <= 1) BYRP(KK, 1); else if (mt <= 2) BYRP(KK, 2); else BYRP(KK, 4); } while (0)
+  switch (K) {
+    case 4096: BYMT4(4096); break;
+    case 2048: BYMT4(2048); break;
+    case 1024: BYMT4(1024); break;
+    default: return -2;
+  }
+#undef BYMT4
+#undef BYRP
+#undef ARGS4
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
