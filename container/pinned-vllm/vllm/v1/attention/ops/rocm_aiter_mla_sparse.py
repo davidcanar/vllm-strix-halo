@@ -3970,6 +3970,14 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             num_warps=8,
         )
+        # [vsh-ds4-decode-inv-rope] this kernel has no fused inverse-RoPE epilogue, but callers
+        # (rocm_sparse_attn_decode) report the rows as rotated whenever
+        # inv_rope_positions is given -- rotate them here (gfx1151 and other
+        # un-tuned archs; gfx942/950 rotate in _sparse_attn_decode_reduce_kernel).
+        if inv_rope_positions is not None:
+            assert inv_rope_cos_sin_cache is not None
+            rocm_inverse_rope_rows_(out, inv_rope_positions, inv_rope_cos_sin_cache,
+                                    rope_head_dim)
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.

@@ -5,8 +5,9 @@
 > 6.8K–255K, including adversarial), tool calling works (8/8 on the captured
 > opencode request), image input works, prefix caching works, and decode is
 > **20–28 tok/s** (DFlash2 k=3, CUDA graphs) after the §28–§33 decode rounds.
-> DS4 (DeepSeek-V4-Flash) runs on the June 2026 stack (`ds4_engine: delegate`,
-> 19–24 tok/s); the native 0.31 port is still open (§ Known issues).
+> DS4 (DeepSeek-V4-Flash) runs correctly on the native 0.31 port since §37
+> (10–11 tok/s with DSpark); the June stack (`ds4_engine: delegate`, 19–24 tok/s)
+> is still the faster option (§ Known issues 5).
 
 | metric (GLM-5.3-Flash AWQ W4A16, TP=2, DFlash2 k=3, CUDA graphs) | value |
 |---|---|
@@ -18,7 +19,7 @@
 | image input | ✅ (vision encoder in BF16; 448×448 probe answered correctly, 9.1 s) |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§34). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§37). This README is the current state only.
 
 ---
 
@@ -49,8 +50,8 @@ plumbing plus the gfx1151 fixes below.
 Both models share the `vllm-glm` container and API port 1234 — either/or at
 runtime. Site config: `~/vsh-config.yaml` (flat keys → `VSH_*` env vars;
 template in `host/vsh-config.yaml`). The template ships `ds4_engine: native`
-(the 0.31 port, not production-ready); set `ds4_engine: delegate` for the
-June stack.
+(the 0.31 port: correct since §37, slower than June); set `ds4_engine: delegate`
+for the June stack.
 
 ## Patch set (current)
 
@@ -98,8 +99,11 @@ deterministic top-k, WNA16 OOM), and the OdinLink hooks (`odl_ar2`, `odl_mq`).
 The older gather-site block-table expansion (`vsh-idx-bt-gather-v4-ops.py`)
 and column-overwrite force-tail are superseded by §27 and are inert.
 
-**DS4 native port** (`container/patches/ds4-native-fixed-refs/`): boots and
-serves; decode quality/speed unresolved (Known issues 5).
+**DS4 native port** (`container/patches/ds4-native-fixed-refs/` plus the `vsh-ds4-*` patches):
+serves correctly since §37. On top of the 09-30 gfx1151 port: `vsh-ds4-decode-inv-rope.py`
+(the decode kernel's missing inverse RoPE, §37), `vsh-fp8-gemv.py` (HIP FP8 GEMV for the
+block-FP8 linears, ~4x decode, §36), `cgfusion-soft.py` (§35); speed and remaining work in
+Known issues 5.
 
 ## Architecture
 
@@ -158,7 +162,7 @@ vllm-strix-halo/
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
 ├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§34)
+├── PATCHES.md               # detailed patch history and lessons (§1–§37)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
@@ -183,14 +187,11 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-5. **DS4 native decode** — §35-§36. Prompts are read correctly at every
-   length (first token right from 16 to 1,102-token prompts), but **every decode
-   step degrades**, sooner the longer the context (coherent below ~100 positions,
-   debris past ~150; the 8K needle stops after 2 tokens). The earlier
-   "chat-template bug" was this: thinking mode adds 79 prompt tokens. Pre-existing
-   (identical with our split-KV and FP8 GEMV off); prime suspect is the BF16-KV
-   decode path (June ran FP8 KV, which asserts in aiter here). Speed: the FP8 GEMV
-   (§36) cut decode from ~580 to ~150 ms/token; the MXFP4 MoE (~99 ms) is next.
-   DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both ranks — the DS4
-   restart/reserve scripts pass them, and every restart script refuses to start
-   when the two boxes' env files differ.
+5. **DS4 native** — correct since §37 (decode on gfx1151 skipped the
+   inverse RoPE of the attention output): needles, counting to 100, thinking mode
+   and tool-free chat all right. Speed: 6.6 tok/s without spec, 10.4–11.3 tok/s
+   with DSpark k=5 on prose/JSON (acceptance 2.6–2.8) — still behind the June
+   stack (17–24 tok/s). Next: MXFP4 MoE decode kernel (~99 ms/step), 6-row FP8
+   GEMV, CUDA graphs. DS4 boots need `VSH_W8A16=0 VSH_W8A16_LMHEAD=0` on both
+   ranks — the DS4 restart/reserve scripts pass them, and every restart script
+   refuses to start when the two boxes' env files differ.

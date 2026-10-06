@@ -2328,3 +2328,42 @@ Boot: `DS4OV_MTP=0 ~/vsh-ds4-reserve.sh` (no spec). Probes: `scripts/ds4probe.py
    off: decode ~150 ms/token vs ~580 (5.6-6.4 vs 1.68 tok/s incl. prefill), same outputs
    as stock on the battery (the decode bug is unchanged). GLM has no FP8 linears.
    Next: fix the decode bug; then the MXFP4 MoE port (~99 ms/step) and DSpark.
+
+
+## 37. DS4 decode fixed: the gfx1151 decode kernel never inverse-RoPE'd its output (2026-10-05)
+
+Root cause of §36's decode failure. `DeepseekV4ROCMAiterMLAAttention.forward_mqa` lets
+`rocm_sparse_attn_decode` fold the inverse RoPE of the attention output into its
+reduce epilogue (`inv_rope_positions`), and `rocm_sparse_attn_decode` reports every
+row as rotated whenever positions are passed — so the standalone
+`rocm_inverse_rope_rows_` pass skips decode rows. But
+`_rocm_sparse_attn_decode_ragged_triton` only has that epilogue on its tuned
+gfx942/gfx950 path (`_sparse_attn_decode_reduce_kernel`, `FUSE_INV_ROPE`); every
+other architecture takes the "fallback path for un-tuned architectures" — one
+`_sparse_attn_decode_ragged_kernel`, no rotation — and returns. On gfx1151 every
+decode step's attention output therefore reached `wo_a` with its RoPE half still
+rotated by its position: prefill (rotated by the standalone pass) was right, decode
+error grew with position. The June stack predates the fused epilogue.
+
+Fix (`vsh-ds4-decode-inv-rope.py`, marker `vsh-ds4-decode-inv-rope`): the fallback
+path applies `rocm_inverse_rope_rows_` itself when `inv_rope_positions` is given,
+so the function honours its contract on every architecture (DS4.1's ROCm decode
+uses the same function). GLM does not use this path.
+
+Battery `scripts/ds4len.py` + `scripts/ds4speed.py`, FP8 GEMV on:
+
+| probe | before (§36) | after |
+|---|---|---|
+| chat, prompts 16-1,102 tokens | first token right | right |
+| count 1..100 | '1, 2, 3, 4, 5, 5, 5, 6, 6, 6' | **1..100 correct** |
+| raw continuation, prompts 22-548 | debris past ~150 positions | coherent at every length |
+| 8K needle | 'AM' | **AMBER-FALCON-4455** |
+| thinking on | degenerate | 'Capital of France: Paris.' → Paris |
+| decode, spec off | (degenerate) | **6.6 tok/s** (152 ms/token), prose + JSON coherent |
+| decode, DSpark k=5 | acceptance collapsed to 0 | **10.4-11.3 tok/s** prose/JSON (23 tok/s on counting), acceptance length 2.6-2.8 steady |
+
+DSpark output is identical to the spec-off greedy output, so upstream's
+`TRITON_UNFUSED` "MTP bug" does not show here. GLM after the window: 97 / 98 ms/step,
+needle 3/3. Remaining DS4 speed work: the MXFP4 MoE (~99 ms/step at M=1, more at
+the 6-row DSpark verify), the 6-row FP8 GEMV, CUDA graphs. The June stack is still
+faster (17-24 tok/s).
