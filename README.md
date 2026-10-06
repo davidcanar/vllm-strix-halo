@@ -145,7 +145,7 @@ remaining work in Known issues 5.
   `kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.30.0`; vLLM pinned
   at `73859fec`; `container/pinned-vllm/` + `container/pinned-triton/` carry
   the byte-exact patched files for reproducible rebuilds). Snapshot of the
-  stack on both boxes: `vllm-strix-halo:glm-perf42-20261006` (through §42;
+  stack on both boxes: `vllm-strix-halo:glm-perf44-20261006` (through §44;
   `:local` points at it)
 - **KV cache**: 16 GiB pinned, 256K max context (GLM); DS4: 6 GiB pinned = 901,584
   tokens of fp8_ds_mla with 2048-token prefill chunks, 512K max context
