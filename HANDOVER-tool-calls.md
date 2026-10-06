@@ -1,5 +1,13 @@
 # Handover: GLM-5.3-Flash tool-call degeneration on the 2× Strix Halo rig
 
+> **Resolved 2026-10-03 (PATCHES.md §27, §27.1).** The degeneration was neither
+> the model nor the AWQ checkpoint. Four stacked sparse-attention bugs left the
+> model unable to read anything past ~4K tokens, and opencode's tool-format
+> instruction sits ~5K tokens into its prompt. With the fixes, the captured
+> opencode request passes 8/8 (re-checked on 2026-10-06, §44). Kept as history.
+> The rig details below are dated: production now decodes with DFlash2 k=3
+> under PIECEWISE CUDA graphs, not MTP k=3 eager.
+
 **Audience:** an engineer/agent with SSH access to the two boxes. Everything below was measured on
 this rig; commands are copy-pasteable. Read PATCHES.md §25–§26 for the long form.
 

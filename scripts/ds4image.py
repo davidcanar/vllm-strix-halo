@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """DS4 image-input probes (Vision-Exp checkpoint, multimodal wrapper): synthetic images with
 known content -> OCR, colours/shapes, counting, a table cell, a large wide image.
-usage: ds4image.py [port]   (needs Pillow; run inside the container)"""
-import base64, io, json, sys, time, urllib.request
+usage: [VSH_MODEL=glm-5.3-flash] ds4image.py [port]   (needs Pillow; run inside the container)"""
+import base64, io, json, os, sys, time, urllib.request
 from PIL import Image, ImageDraw, ImageFont
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "1234"
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+MODEL = os.environ.get("VSH_MODEL", "deepseek-v4-flash")
+GLM = MODEL.startswith("glm")
 
 def font(size):
     for f in ("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -25,8 +27,9 @@ def b64(img):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 def ask(img, question, max_tokens=160, thinking=False):
-    body = {"model": "deepseek-v4-flash", "max_tokens": max_tokens, "temperature": 0,
-            "chat_template_kwargs": {"thinking": thinking},
+    kw = {"reasoning_effort": "high" if thinking else "low"} if GLM else {"thinking": thinking}
+    body = {"model": MODEL, "max_tokens": max(max_tokens, 1200) if GLM else max_tokens, "temperature": 0,
+            "chat_template_kwargs": kw,
             "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": b64(img)}},
                                                       {"type": "text", "text": question}]}]}
     t0 = time.time()
@@ -37,7 +40,7 @@ def ask(img, question, max_tokens=160, thinking=False):
     except urllib.error.HTTPError as e:
         return f"HTTP {e.code}: {e.read().decode()[:300]}", {}, time.time() - t0
     m = d["choices"][0]["message"]
-    return (m.get("content") or "") + ((" [reasoning] " + m["reasoning_content"]) if m.get("reasoning_content") else ""), d.get("usage", {}), time.time() - t0
+    return (m.get("content") or "") + ((" [reasoning] " + m["reasoning_content"]) if m.get("reasoning_content") and not GLM else ""), d.get("usage", {}), time.time() - t0
 
 def show(tag, ok, ans, usage, dt):
     print(f"{tag:34s} {'PASS' if ok else 'FAIL'}  prompt={usage.get('prompt_tokens', 0):5d} gen={usage.get('completion_tokens', 0):4d} "

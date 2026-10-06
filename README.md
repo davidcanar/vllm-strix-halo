@@ -4,7 +4,8 @@
 > long-context retrieval passes at every tested length (mid-context and tail,
 > 6.8K–255K, including adversarial), tool calling works (8/8 on the captured
 > opencode request), image input works, prefix caching works, and decode is
-> **20–28 tok/s** (DFlash2 k=3, CUDA graphs) after the §28–§33 decode rounds.
+> **20–28 tok/s** (DFlash2 k=3, CUDA graphs) after the §28–§33 decode rounds,
+> regression-checked on the current container (§44).
 > DS4 (DeepSeek-V4-Flash-Vision-Exp) runs on the native 0.31 port: correct
 > since §37, **25–27 tok/s** with DSpark (§41; the June stack via
 > `ds4_engine: delegate` measures 17–24), image input works, 512K context fits
@@ -13,12 +14,13 @@
 
 | metric (GLM-5.3-Flash AWQ W4A16, TP=2, DFlash2 k=3, CUDA graphs) | value |
 |---|---|
-| decode | **26.5 / 28.5 / 19.9 tok/s** JSON / tools / prose (`vsh_ab.py`), 96–100 ms/step — was 12.0 tok/s before §28 |
-| prefill | 285–296 tok/s cold at 4.8K–16.7K (the first large prefill after a boot can stall on Triton JIT) |
-| TTFT, 13.9K context | ~50 s cold → **0.95 s cached** (§20) |
-| long-context retrieval | ✅ 3/3 mid-context at 6.8K/13K/32K; tail needles PASS to 255K; adversarial PASS |
-| tool calling | ✅ 8/8 on the captured opencode request; opencode replay 3/3 |
-| image input | ✅ (vision encoder in BF16; 448×448 probe answered correctly, 9.1 s) |
+| decode | **23–27 / 25–29 / 19.6–19.9 tok/s** JSON / tools / prose (`vsh_ab.py`; tok/s moves with draft acceptance), 95–99 ms/step (§44) — was 12.0 tok/s before §28 |
+| prefill | 278–294 tok/s cold at 5.8K–19.9K (§44); for ~2.5 min after a boot the warm-up prefill holds the engine |
+| TTFT, 13.9K context | ~50 s cold → **0.95 s cached** (§20); hits land on 2304-token boundaries, so a repeat recomputes the tail past the last one (16.1K prompt: 57 s → 8.4 s, §44) |
+| long-context retrieval | ✅ 3/3 mid-context at 6.8K/13K/32K/69K (§44); tail needles PASS to 255K; adversarial PASS |
+| tool calling | ✅ 8/8 on the captured opencode request (§27.1, §44); opencode replay 3/3 |
+| greedy reproducibility | ⚠️ reproducible up to ~2K prompt tokens, not above (upstream kernel arithmetic, §15.8, §44) |
+| image input | ✅ vision encoder in BF16; 5/5 probes (OCR, colours, counting, a table cell, 1920×1080), 3.8–16.5 s (§44) |
 
 | metric (DeepSeek-V4-Flash-Vision-Exp, TP=2, DSpark k=5, eager) | value |
 |---|---|
@@ -33,7 +35,7 @@
 | thinking / tools | thinking mode ✅ (`chat_template_kwargs.thinking`); `deepseek_v4` tool + reasoning parsers |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§43). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§44). This README is the current state only.
 
 ---
 
@@ -120,7 +122,7 @@ block-FP8 linears at decode sizes, §36/§38), `vsh-fp8-prefill.py` (the same li
 prefill sizes: exact bf16 weight + hipBLASLt, §41), `vsh-mxfp4-direct.py` + `vsh_moe_int4.hip`
 (direct MXFP4 MoE, v5 kernel tuned on real routing, §38–§41), `vsh-ds4-mmf32.py` (compressor
 scores on the bf16 GEMV, §40), `vsh-ds4-idx-logits.py` (prefill indexer on fp16 WMMA, §42),
-`vsh-ds4-mhc-cfg.py` (gfx1151 mHC tiles, §42), `vsh-ds4-decode-rows.py` (bounded
+`vsh-ds4-mhc-cfg.py` (gfx1151 mHC tiles, §42; GLM uses them too, §44), `vsh-ds4-decode-rows.py` (bounded
 decode-logits workspace for 2048-token chunks, §42), `cgfusion-soft.py` (§35); speed and
 remaining work in Known issues 5.
 
@@ -190,7 +192,7 @@ vllm-strix-halo/
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
 ├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, ds4*, moe_*, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§43)
+├── PATCHES.md               # detailed patch history and lessons (§1–§44)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
@@ -207,14 +209,24 @@ vllm-strix-halo/
 2. **CUDA graphs** — on by default since §33: PIECEWISE breakable capture,
    every TP collective an eager break (odl_ar2 serves them as in eager
    mode). FULL modes still hang on the first replay (RCCL inside the graph,
-   §29); root cause not isolated. The first request after a boot can stall
-   ~2 min on Triton JIT. Revert with `glm53_enforce_eager: 1`.
-3. **Prefill MoE is untuned** — 41.5 % of prefill GPU time runs at 12–18 % of
-   achievable FLOPS (tuned tiles cover M≤512; prefill chunks run M~65k).
+   §29); root cause not isolated. Revert with `glm53_enforce_eager: 1`.
+   For ~2.5 min after a boot the warm-up prefill (~39K tokens; it absorbs the
+   Triton JIT) holds the engine, so requests sent then wait for it (§44).
+3. **Prefill** — 278–294 tok/s (§44). Biggest lever: the routed-expert MoE,
+   41.5 % of prefill GPU time at 12–18 % of achievable FLOPS (profiled before
+   §28). Its AWQ Triton tiles are tuned only up to M≤512 while prefill chunks run
+   M~65k; decode uses the HIP kernel, so a large-M tile sweep is config-only.
+   Smaller levers: the prefill all-reduce over Thunderbolt (~10–15 %; the
+   OdinLink RCCL plugin was never A/B'd against sockets for prefill, §15.3), the
+   KDA prefill kernels (unprofiled since the pin bump), and, for long prompts,
+   DS4's fp16-WMMA indexer kernel (§42) at GLM's indexer call site.
 4. **Upstream** — drop `59412-*` (and the inert gather-site expansion) at the
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
-   `vsh-kpool-paged-logits` replaces it).
+   `vsh-kpool-paged-logits` replaces it). Still open upstream: greedy decoding
+   above ~2K prompt tokens is not reproducible (5 of 5 distinct at 7.2K, §44;
+   arithmetic nondeterminism in the kernels that run once pool selection
+   starts, §15.8).
 5. **DS4 native** — correct since §37; 24.4 / 24.7 tok/s prose / JSON with DSpark k=5
    and the default sampling (§43; 27.2 / 23.1 greedy), 15.4 tok/s without spec. Needles, counting, thinking mode
    and image input pass; 512K context fits. Prefill ~330–460 tok/s up to 128K (§42);

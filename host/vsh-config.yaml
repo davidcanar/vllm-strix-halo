@@ -9,7 +9,7 @@ glm53_container: vllm-glm            # toolbox/podman container name (both boxes
 glm53_image: vllm-strix-halo:local   # image the container is created from
 glm53_model_dir: /home/davidcanar/models/GLM-5.3-Flash-AWQ-W4A16
 glm53_api_port: 1234  # single testing port: whichever model is up serves :1234 (stacks are either/or)
-glm53_max_ctx: 131072                # 128K context (native limit is 1M; TTFT is the real cap)
+glm53_max_ctx: 262144                # 256K context (native limit is 1M; TTFT is the real cap)
 glm53_kv_bytes: 17179869184          # 16 GiB pinned GPU KV. The box ceiling is ~124 GiB GTT
                                      # with 82.4 GiB weights per rank; >20 GiB KV risks host OOM.
                                      # fp8 KV (below) fits ~2.05M tokens in this pin (7.8x at 256K).
@@ -17,8 +17,9 @@ glm53_kv_dtype: auto                  # bf16. fp8 KV ALLOCATES fine (2.05M token
                                      # ROCM_AITER_MLA_SPARSE fp8 decode path asserts on the first request
                                      # (aiter static_per_tensor_quant: e4m3fn not in _torch_to_aiter_dtype).
                                      # Half-wired upstream on this backend; leave auto. Tested 2026-09-28.
-glm53_max_batched: 4096              # prefill chunk; 512 -> 4096 is +30% prefill (PATCHES.md §8)
+glm53_max_batched: 8192              # prefill chunk; 512 -> 4096 is +30% prefill (PATCHES.md §8), 8192 parity (§15.5)
 glm53_max_seqs: 32                   # single-user profile (2026-09-28): 32 is plenty, frees Mamba blocks
+glm53_warmup_ctx: 32768              # boot warm-up prompt (JIT-warms the indexer buckets; holds the engine ~2.5 min, PATCHES 44)
 glm53_mtp_tokens: 3                  # draft tokens (DFlash2 k=3 measured best, PATCHES 28.7)
 glm53_spec_method: dflash    # DFlash2 k=3 beats MTP k=3 after 27-28 (PATCHES 28.7); glm5_next_mtp to revert
 glm53_draft_model: /home/davidcanar/models/GLM-5.3-Flash-DFlash2
@@ -26,6 +27,8 @@ glm53_draft_model: /home/davidcanar/models/GLM-5.3-Flash-DFlash2
                                      # corruption with spec decode) may have fixed it — re-enable and
                                      # validate before relying on it.
 glm53_tool_parsing: 1                # 1 = --enable-auto-tool-choice + glm47 tool/reasoning parsers
+# glm53_profiler_dir: /home/davidcanar/glmprof   # torch profiler (inert until POST /start_profile)
+# glm53_profiler_active: 40               # profiler active steps per capture
 glm53_gpu_sclk_max: 2100              # iGPU max SCLK MHz (power sharing with CPU; PATCHES 28). empty = stock 2900
 glm53_enforce_eager: 0               # 0 = CUDA graphs (breakable PIECEWISE, collectives eager; PATCHES 33); 1 = eager
 glm53_cg_mode: PIECEWISE            # FULL_DECODE_ONLY / FULL_AND_PIECEWISE hang on first replay (PATCHES 29)

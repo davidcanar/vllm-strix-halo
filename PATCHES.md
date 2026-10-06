@@ -1,23 +1,29 @@
 # PATCHES.md — what this repo patches, and why (review of `AlexKGwyn/ds4-vllm`)
 
-> ## ⚠️ Correctness warnings (2026-09-04)
+> ## The 2026-09-04 correctness warnings: status as of 2026-10-06
 >
-> Three defects were found after the performance work below was written, and
-> some of the claims in this file were wrong. Read
-> **[PENDINGWORK.md](PENDINGWORK.md)** before trusting any quality claim here.
+> Three defects were found on 2026-09-04, after the early sections below were
+> written. [PENDINGWORK.md](PENDINGWORK.md) keeps that investigation as history.
 >
-> 1. **MTP corrupts structured output on gfx1151.** `glm53_mtp_tokens: 0` is
->    now the recommended setting, not `3`. See §1 item 4.
-> 2. **Greedy decoding is not reproducible on this rig** at `temperature 0` —
->    5 identical requests give 5 different completions, at every prompt length
->    down to 244 tokens. Reported upstream:
+> 1. **MTP corrupted structured output — fixed.** Upstream #58454 (kpool
+>    corruption under speculative decoding) arrived with the §15 pin; §15.4
+>    measured clean tool calls with MTP. Production now drafts with DFlash2
+>    k=3 (§28.7).
+> 2. **Greedy decoding was not reproducible — fixed up to ~2K prompt tokens,
+>    still open above.** The deterministic MoE-router top-k (§12, §14) and the
+>    §15 pin made short prompts reproducible (1 distinct completion of 5 at
+>    1.2K tokens, §15.4, §44). Above ~2K, where sparse attention starts
+>    selecting pools, it is still 5 of 5 distinct at 7.2K (§44): §15.8 traced
+>    that to arithmetic nondeterminism in upstream kernels, and §27's fixes did
+>    not change it. Reported upstream:
 >    [vllm#54521](https://github.com/vllm-project/vllm/issues/54521)
 >    ([our data](https://github.com/vllm-project/vllm/issues/54521#issuecomment-5545047644)).
-> 3. **Tool calling collapses above ~10k prompt tokens** — the model stops
->    emitting `</tool_call>`, so agent harnesses stall silently on HTTP 200.
+> 3. **Tool calling collapsed above ~10K prompt tokens — fixed (§27).** Not the
+>    checkpoint: four stacked sparse-attention bugs past ~4K tokens. The
+>    captured opencode request passes 8/8 (§27.1, §44).
 >
-> The *timing* results below (prefill tok/s, ms/step, TTFT) are unaffected —
-> they do not depend on which token is emitted. The *quality* claims are.
+> The *timing* results (prefill tok/s, ms/step, TTFT) were never affected —
+> they do not depend on which token is emitted.
 
 This is the review you asked for: *which patches from the DeepSeek-V4-Flash
 Strix Halo build are required to run **GLM-5.3-Flash** on the same 2-box
@@ -2701,3 +2707,81 @@ The production setting is probabilistic drafting with k=5. The recipe's
 `enable_adaptive_verification` needs FULL CUDA graphs, which hang on this stack (§29),
 so it is off (`ds4_adaptive_verify`, empty). Greedy requests behave as before (battery all
 PASS); greedy prose was 27.2 tok/s.
+
+
+## 44. GLM regression on the current container; doc and config cleanup (2026-10-06)
+
+GLM had not run since §41–§43 changed the shared container. Those changes are gated
+to DS4 with one exception: §42's gfx1151 mHC tiles (`VSH_MHC_CFG`, on by default),
+which GLM picks up too because it runs the same aiter mHC ops with the same shapes
+(hidden 4096, hc_mult 4). `scripts/glm_regress.sh` re-runs the §33/§34 receipts on
+that stack (DFlash2 k=3, PIECEWISE graphs, 8192-token chunks; ~30 min):
+
+| check | baseline | 2026-10-06 |
+|---|---|---|
+| NLL, patches / agents / pyfile | 2.1948 / 1.8068 / 0.9520 (§33); 2.1979 / 1.8059 / 0.9644 (§34) | 2.1978 / 1.7998 / 0.9644 |
+| greedy, 5 identical requests, 1.2K tokens | 1 distinct (§15.4) | 1 distinct |
+| greedy, 7.2K tokens | 5 distinct (§15.4, §15.8) | 5 distinct |
+| decode step, JSON / tools / prose | 96 / 100 / 98 ms (§33) | **95 / 99 / 97 ms** |
+| decode tok/s (moves with acceptance) | 26.5 / 28.5 / 19.9 (§33); 23.4 JSON (§34) | 23.4 / 25.3 / 19.6 (2.26 / 2.52 / 1.91 tok/step) |
+| cold prefill | 285–296 tok/s at 4.8K–16.7K (§34) | 291–294 at 5.8K, 281–282 at 11.5K, 278 at 19.9K |
+| prefix cache, 16.1K-token prompt | — | 57.3 s cold → 8.4 s on the first repeat |
+| mid-context needles | 3/3 at 6.8K / 13K / 32K (§27) | 3/3 at 7.4K, 14.1K (3 seeds), 34.6K, 69.3K |
+| opencode tool-call replay | 8/8 (§27.1) | 8/8 |
+| tool calls, `vsh_ab --mode tools` | 5/5 | 5/5 |
+| images (`VSH_MODEL=glm-5.3-flash scripts/ds4image.py`) | 448×448 probe OK (§33) | 5/5: OCR, colours, 7 discs, table cell, 1920×1080 |
+
+**No regression.** The decode step is 1 ms faster in every mode, about what §42
+measured for the mHC tiles at decode sizes (not A/B'd here). The serve journal
+logged no errors. The prefix-cache repeat matched 13,824 tokens (6 x 2304): hits
+land on the 2304-token retention boundaries, so a repeat recomputes the tail past
+the last one, here 2.2K tokens (8 s). §20's 0.95 s case ended just past a boundary.
+
+Findings:
+
+1. **Greedy decoding above ~2K tokens is still not reproducible.** §27 expected its
+   bug family to account for the >2K divergence ("Re-measure them"); it does not.
+   Five byte-identical requests at 7.2K, each with its own `cache_salt` so the
+   prefix cache cannot serve them, gave five completions (`scripts/greedy_repro.py`).
+   At 1.2K tokens (no pool selection) all five matched, including through decode,
+   where §42's split-k mHC runs, so the mHC tiles are not the source. §15.8's
+   attribution stands: arithmetic nondeterminism in the kernels that run once
+   pool selection starts.
+2. **The "first request after a boot stalls ~2 min" (§33/§34) is mostly the boot
+   warm-up.** `vsh-warmup.py` fires a ~39K-token prefill (`glm53_warmup_ctx: 32768`)
+   as soon as the API answers. That prefill takes ~144 s and is what pays the Triton JIT.
+   A 391-token request sent 18 s into that window took 118 s, because it queued
+   behind the warm-up's prefill chunks. Once the warm-up finishes, requests run at
+   full speed.
+3. **Box2's Triton `driver.c` lagged the pin.** Box1 and `container/pinned-triton/`
+   have carried the env-gated `[vsh-triton-ptr-cache]` change since 2026-10-02 (§21;
+   off unless `VSH_TRITON_PTR_CACHE=1`), but box2 still had the stock file. Behaviour
+   was identical; the trees were not. Box2 is now synced (md5 `fca4ea3c` on both).
+4. **The two ranks can load different aiter JIT builds.** aiter imports a JIT module
+   from site-packages when one is there, else from `~/.aiter/jit`.
+   - Root `podman exec` test runs had built `module_aiter_core` and `module_quant`
+     (09-29) and `module_mhc` (today, §42's sweeps) into box1's site-packages.
+   - So box1's rank loads those builds, while box2's rank loads its own `~/.aiter`
+     builds; the serving user cannot write site-packages.
+   - Checked: the two `module_mhc` builds have byte-identical gfx1151 `.text` and
+     `.rodata` (only the `__hip_cuid_*` symbol differs). `module_aiter_core` has no
+     device code, and `module_rmsnorm_quant` is the same file on both boxes.
+   - So no functional difference, but a full-tree md5 check flags it unless it
+     skips `aiter/jit/build/` and `aiter/jit/*.so`.
+5. **NLL texts frozen.** `nll.py` scored slices of PATCHES.md and AGENTS.md, so
+   editing near the top of either file moved its baseline. The exact slices it
+   scored (unchanged in git since 10-03) are now `scripts/data/nll_*.txt`.
+
+Docs and config:
+- The PATCHES.md banner now gives each 2026-09-04 warning its status.
+- PENDINGWORK.md and HANDOVER-tool-calls.md carry historical/resolved banners.
+- AGENTS.md:
+  - GLM serves on :1234, not :1235.
+  - §6 describes DS4 native, either/or with GLM.
+  - The knob table matches the deployed defaults: DFlash2, PIECEWISE graphs,
+    SCLK cap, warm-up size, `VSH_MHC_CFG`.
+  - §9 carries today's numbers.
+- `host/vsh-config.yaml` had drifted to 128K context and 4096-token chunks. It now
+  matches production (256K, 8192), and the deployed `~/vsh-config.yaml` is
+  byte-identical to it.
+- `scripts/ds4image.py` takes `VSH_MODEL`.

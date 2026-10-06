@@ -1,5 +1,14 @@
 # PENDINGWORK.md — state of play, last reviewed 2026-09-05
 
+> **Status 2026-10-06: historical.** This file records the September 2026
+> correctness investigation. Every defect it describes is resolved. The
+> PATCHES.md banner maps each one to its fix (§12/§14 router top-k, the upstream
+> fixes in the §15 pin, §27's four sparse-attention bugs), and §44 re-measures
+> them on the current stack. The current state is README.md; its "Known issues
+> and next steps" is the live to-do list. Statements below such as "not
+> currently trustworthy" or "`glm53_mtp_tokens: 0` is recommended" were true
+> on 2026-09-05 and no longer are.
+
 Working notes for picking this up later, most likely once the upstream issues
 below are fixed. Two threads of work happened here: a **performance** push that
 succeeded, and a **correctness** investigation that found three defects — one
