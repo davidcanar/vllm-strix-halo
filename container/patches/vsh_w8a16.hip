@@ -147,65 +147,101 @@ __device__ __forceinline__ float fp8_to_f32(uint32_t b) {
   return (b & 0x80u) ? -v : v;
 }
 
-template <int K, int MT, int VEC, int FNUZ>
+template <int K, int MT, int ROWS, int VEC, int FNUZ>
 __global__ __launch_bounds__(WAVES * WS) void fp8_gemv_kernel(
     const uint8_t* __restrict__ W, const float* __restrict__ S, const uint16_t* __restrict__ X,
     uint16_t* __restrict__ Y, const uint16_t* __restrict__ bias, int N, int M, long ldw, long ss,
     long sx, long sy) {
+  // ROWS output rows per wave: each activation load is reused for ROWS rows
+  // (the 4-6-row DSpark verify was L2-bound on re-reading x; PATCHES 38 sweep)
   constexpr int STEP = WS * 16 * VEC;
   static_assert(K % STEP == 0 && 16 * VEC <= 128, "tile");
   const int lane = threadIdx.x % WS, wave = threadIdx.x / WS;
-  const int n = blockIdx.x * WAVES + wave;
-  if (n >= N) return;
-  float acc[MT];
+  const int n0 = (blockIdx.x * WAVES + wave) * ROWS;
+  if (n0 >= N) return;
+  float acc[ROWS][MT];
 #pragma unroll
-  for (int t = 0; t < MT; ++t) acc[t] = 0.f;
-  const uint8_t* wrow = W + (long)n * ldw;
-  const float* srow = S + (long)(n >> 7) * ss;
+  for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < MT; ++t) acc[r][t] = 0.f;
   for (int it = 0; it < K / STEP; ++it) {
     const int k0 = it * STEP + lane * 16 * VEC;
-    uint4 w[VEC];
-    const uint4* p = (const uint4*)(wrow + k0);
+    uint4 w[ROWS][VEC];
+    float sc[ROWS];
 #pragma unroll
-    for (int v = 0; v < VEC; ++v) w[v] = p[v];
-    const float sc = srow[k0 >> 7];
-    float part[MT];
+    for (int r = 0; r < ROWS; ++r) {
+      const int n = min(n0 + r, N - 1);
+      const uint4* p = (const uint4*)(W + (long)n * ldw + k0);
 #pragma unroll
-    for (int t = 0; t < MT; ++t) part[t] = 0.f;
+      for (int v = 0; v < VEC; ++v) w[r][v] = p[v];
+      sc[r] = S[(long)(n >> 7) * ss + (k0 >> 7)];
+    }
+    float part[ROWS][MT];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+      for (int t = 0; t < MT; ++t) part[r][t] = 0.f;
 #pragma unroll
     for (int v = 0; v < VEC; ++v) {
-      const uint32_t wu[4] = {w[v].x, w[v].y, w[v].z, w[v].w};
-      float wf[16];
+      float wf[ROWS][16];
 #pragma unroll
-      for (int j = 0; j < 4; ++j)
+      for (int r = 0; r < ROWS; ++r) {
+        const uint32_t wu[4] = {w[r][v].x, w[r][v].y, w[r][v].z, w[r][v].w};
 #pragma unroll
-        for (int b = 0; b < 4; ++b) wf[4 * j + b] = fp8_to_f32<FNUZ>((wu[j] >> (8 * b)) & 0xFF);
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+          for (int b = 0; b < 4; ++b) wf[r][4 * j + b] = fp8_to_f32<FNUZ>((wu[j] >> (8 * b)) & 0xFF);
+      }
 #pragma unroll
       for (int t = 0; t < MT; ++t) {
         if (t >= M) break;
         const uint4* xp = (const uint4*)(X + (long)t * sx + k0 + v * 16);
         const uint4 xa = xp[0], xb = xp[1];
         const uint32_t xu[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
-        float s = 0.f;
+        float xf[16];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          s += wf[2 * j] * __uint_as_float(xu[j] << 16);
-          s += wf[2 * j + 1] * __uint_as_float(xu[j] & 0xFFFF0000u);
+          xf[2 * j] = __uint_as_float(xu[j] << 16);
+          xf[2 * j + 1] = __uint_as_float(xu[j] & 0xFFFF0000u);
         }
-        part[t] += s;
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+          float s = 0.f;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) s += wf[r][j] * xf[j];
+          part[r][t] += s;
+        }
       }
     }
 #pragma unroll
-    for (int t = 0; t < MT; ++t) acc[t] += part[t] * sc;
+    for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+      for (int t = 0; t < MT; ++t) acc[r][t] += part[r][t] * sc[r];
   }
 #pragma unroll
-  for (int t = 0; t < MT; ++t)
+  for (int r = 0; r < ROWS; ++r)
 #pragma unroll
-    for (int off = WS / 2; off > 0; off >>= 1) acc[t] += __shfl_xor(acc[t], off, WS);
+    for (int t = 0; t < MT; ++t)
+#pragma unroll
+      for (int off = WS / 2; off > 0; off >>= 1) acc[r][t] += __shfl_xor(acc[r][t], off, WS);
   if (lane == 0) {
-    const float b = bias ? bf2f(bias[n]) : 0.f;
-    for (int t = 0; t < M; ++t) Y[(long)t * sy + n] = f2bf(acc[t] + b);
+    for (int r = 0; r < ROWS; ++r) {
+      if (n0 + r >= N) break;
+      const float b = bias ? bf2f(bias[n0 + r]) : 0.f;
+      for (int t = 0; t < M; ++t) Y[(long)t * sy + n0 + r] = f2bf(acc[r][t] + b);
+    }
   }
+}
+
+template <int K, int MT, int ROWS, int VEC>
+static void fp8_launch(hipStream_t st, int fnuz, const void* W, const void* S, const void* X, void* Y,
+                       const void* bias, int N, int M, long ldw, long ss, long sx, long sy) {
+  dim3 grid((N + WAVES * ROWS - 1) / (WAVES * ROWS)), block(WAVES * WS);
+#define FL(FZ) hipLaunchKernelGGL((fp8_gemv_kernel<K, MT, ROWS, VEC, FZ>), grid, block, 0, st, \
+      (const uint8_t*)W, (const float*)S, (const uint16_t*)X, (uint16_t*)Y, (const uint16_t*)bias, \
+      N, M, ldw, ss, sx, sy)
+  if (fnuz) FL(1); else FL(0);
+#undef FL
 }
 
 extern "C" int vsh_fp8_gemv(void* stream, const void* W, const void* S, const void* X, void* Y,
@@ -213,29 +249,30 @@ extern "C" int vsh_fp8_gemv(void* stream, const void* W, const void* S, const vo
                             long sy, int fnuz) {
   if (M < 1 || M > MMAX) return -1;
   if (ldw < K || (ldw & 15)) return -4;
-  dim3 grid((N + WAVES - 1) / WAVES), block(WAVES * WS);
   hipStream_t st = (hipStream_t)stream;
-#define LF(KK, MM, VV, FZ) hipLaunchKernelGGL((fp8_gemv_kernel<KK, MM, VV, FZ>), grid, block, 0, st, \
-      (const uint8_t*)W, (const float*)S, (const uint16_t*)X, (uint16_t*)Y, (const uint16_t*)bias, \
-      N, M, ldw, ss, sx, sy)
-#define LFM(KK, VV, FZ) do { if (M == 1) LF(KK, 1, VV, FZ); else if (M <= 4) LF(KK, 4, VV, FZ); \
-      else LF(KK, 8, VV, FZ); } while (0)
-#define LFK(KK, VV) do { if (fnuz) LFM(KK, VV, 1); else LFM(KK, VV, 0); } while (0)
+#define A_ W, S, X, Y, bias, N, M, ldw, ss, sx, sy
+  // tiles from the PATCHES 38 sweep (DS4 shapes: K = 1024 / 4096)
   switch (K) {
-    case 512: LFK(512, 1); break;
-    case 1024: LFK(1024, 2); break;
-    case 1536: LFK(1536, 1); break;
-    case 2048: LFK(2048, 4); break;
-    case 3072: LFK(3072, 2); break;
-    case 4096: LFK(4096, 4); break;
-    case 6144: LFK(6144, 4); break;
-    case 7168: LFK(7168, 1); break;
-    case 8192: LFK(8192, 4); break;
+    case 1024:
+      if (M == 1) fp8_launch<1024, 1, 2, 1>(st, fnuz, A_);
+      else if (M <= 4) fp8_launch<1024, 4, 2, 1>(st, fnuz, A_);
+      else fp8_launch<1024, 8, 4, 2>(st, fnuz, A_);
+      break;
+    case 4096:
+      if (M == 1) fp8_launch<4096, 1, 2, 2>(st, fnuz, A_);
+      else if (M <= 4) fp8_launch<4096, 4, 2, 2>(st, fnuz, A_);
+      else fp8_launch<4096, 8, 4, 2>(st, fnuz, A_);
+      break;
+#define GEN(KK, VV) case KK: \
+      if (M == 1) fp8_launch<KK, 1, 1, VV>(st, fnuz, A_); \
+      else if (M <= 4) fp8_launch<KK, 4, 1, VV>(st, fnuz, A_); \
+      else fp8_launch<KK, 8, 1, VV>(st, fnuz, A_); \
+      break;
+    GEN(512, 1) GEN(1536, 1) GEN(2048, 4) GEN(3072, 2) GEN(6144, 4) GEN(7168, 1) GEN(8192, 4)
+#undef GEN
     default: return -2;
   }
-#undef LFK
-#undef LFM
-#undef LF
+#undef A_
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 

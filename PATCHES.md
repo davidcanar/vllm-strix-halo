@@ -2367,3 +2367,48 @@ DSpark output is identical to the spec-off greedy output, so upstream's
 needle 3/3. Remaining DS4 speed work: the MXFP4 MoE (~99 ms/step at M=1, more at
 the 6-row DSpark verify), the 6-row FP8 GEMV, CUDA graphs. The June stack is still
 faster (17-24 tok/s).
+
+
+## 38. DS4 speed: direct MXFP4 MoE + multi-row FP8 GEMV — June-stack parity (2026-10-05)
+
+1. **MXFP4 direct MoE** (`vsh-mxfp4-direct.py`, `vsh_moe_int4.mxfp4_direct_moe`,
+   `VSH_MOE_MXFP4_DIRECT`): hooks `UnfusedOAITritonExperts.apply` (triton_kernels 3.8
+   matmul + routing build + index_add) for <= 64 token-expert pairs on gfx1151. Layout
+   as vLLM 0.31's `_swizzle_mxfp4` leaves it on gfx1151 (checked once per weight pair,
+   `mxfp4_plan`): values `uint8 [E][N][K/2]` behind a transposed view (as June's), but
+   e8m0 scales `[E][K/32][N]` (N contiguous — June's kernel assumed `[E][N][K/32]`), from
+   `PrecisionConfig.b_mx_scale`. Kernel generations (`VSH_MOE_MXFP4_V`):
+   - v1: the §31 int4 direct kernel with e2m1 decode (packed 2x{0,.5,1,1.5,2,3,4,6}
+     nibble table, 1/2 folded into the scale) — LDS-staged activations (32 KB), <= 4
+     tokens per pass; ALU-bound on experts shared by several draft tokens (re-decoded
+     every value per token).
+   - v2: activations from L2, no LDS — 3x slower (activation traffic swamps weights).
+   - **v3 (default)**: v1's LDS staging + decode-once (each value decoded per row once,
+     reused for every staged token) + a token tile sized per launch (`mt` = 1 / 2 / 4
+     for M = 1 / 2 / >2; 4 beat 6 at M=6 — occupancy over fewer passes), SwiGLU in its
+     own small kernel.
+   Unit tests vs the stock pipeline on the same swizzled weights
+   (`scripts/test_mxfp4_direct.py`): rel err 0 at M=1, <= 6e-4 up to M=10. E=256:
+
+   | case | stock | v1 | v3 |
+   |---|---|---|---|
+   | M=1 | 2.2 ms | 0.38 | **0.25** (8.7x) |
+   | M=6, 34 distinct experts | 4.0 | 2.6 | 1.78 |
+   | M=6, half shared | — | 1.6 | 1.30 |
+   | M=6, all shared | — | 1.0 | 0.65 |
+
+2. **Multi-row FP8 GEMV** (`fp8_gemv_kernel<K, MT, ROWS, VEC>`): ROWS output rows per
+   wave so each activation load serves several rows (sweep `scripts/fp8sweep.*`). K=1024:
+   2x16 B (M<=4), 4x32 B (M>4); K=4096: 2x32 B (M<=4), 4x32 B (M>4). M=6: 4096x4096
+   107 -> 86 us, 1536x4096 49 -> 38 us; accuracy unchanged (1.8e-3).
+
+DS4 (FP8 GEMV + inverse-RoPE fix + this), battery all PASS (`scripts/ds4len.py`):
+
+| | spec off | DSpark k=5 prose / JSON |
+|---|---|---|
+| §37 | 6.6 tok/s (152 ms/token) | 11.3 / 10.4 tok/s |
+| + MXFP4 v1 | 13.2 (76 ms) | 16.7 / 15.7 |
+| + v3 + multi-row FP8 | **14.3 (70 ms)** | **20.0 / 17.9** (counting 34) |
+
+Acceptance 2.6-2.8. That is the June stack's range (17-24 tok/s). GLM unaffected
+(shares both libraries; 96 / 100 / 98 ms/step, needle 3/3, replay 3/3).
