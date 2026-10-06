@@ -2676,3 +2676,28 @@ Next levers:
   and sparse attention.
 - **GLM.** GLM-5.3 could take the same indexer kernel at its own call site after a GLM
   validation run.
+
+
+## 43. DS4 sampling defaults from the model card; probabilistic DSpark drafting (2026-10-06)
+
+The DS4 server used to force greedy decoding (`--override-generation-config
+{"temperature":0.0}` from the old stack) with `reasoning_effort: high`. The model card
+evaluates at **temperature 1.0, top_p 0.95, `max` reasoning effort**, and the checkpoint's
+`generation_config.json` samples too. Greedy decoding is also the usual trigger for
+repetition in long answers. These are now the defaults, as config keys `ds4_temperature`,
+`ds4_top_p` and `ds4_reasoning_effort`. Requests that set their own values still override
+them, which is how the test scripts keep `temperature 0`.
+
+Sampling lowers DSpark acceptance, so decode speed was measured with the server defaults
+(`scripts/ds4speed_sampled.py`, thinking off, median of 3 runs; runs vary by about ±2 tok/s):
+
+| DSpark config | prose | JSON | counting (greedy) |
+|---|---|---|---|
+| greedy drafting, k=5 (as before) | 23.6 tok/s | 22.9 | 52.0 |
+| **probabilistic drafting, k=5** (`ds4_draft_sample`) | **24.4** | **24.7** | **52.1** |
+| probabilistic drafting, k=3 (the vLLM recipe's k) | 25.7 | 23.5 | 40.6 |
+
+The production setting is probabilistic drafting with k=5. The recipe's
+`enable_adaptive_verification` needs FULL CUDA graphs, which hang on this stack (§29),
+so it is off (`ds4_adaptive_verify`, empty). Greedy requests behave as before (battery all
+PASS); greedy prose was 27.2 tok/s.

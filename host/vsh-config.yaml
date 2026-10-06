@@ -50,6 +50,10 @@ ds4_gpu_util: 0.83                   # inert while kv_bytes is pinned
 ds4_max_ctx: 524288                  # 512K, as the June stack (needle-tested, PATCHES 41)
 ds4_max_batched: 2048                # prefill chunk; 512 -> 2048 = 1.2-1.3x prefill (PATCHES 42); needs ds4_max_seqs
 ds4_max_seqs: 16                     # caps the gfx1151 decode-logits workspace at 16 x (1+k) rows (12 GiB at 512K)
+ds4_temperature: 1.0                 # default sampling (model card: temperature 1.0, top_p 0.95, max effort)
+ds4_top_p: 0.95
+ds4_reasoning_effort: max            # none | high | max (clients can override per request)
+ds4_draft_sample: probabilistic       # DSpark drafting under sampling (vLLM recipe); adaptive verification needs FULL graphs -> off
 ds4_warmup_ctx: 32768
 
 # ---------------- site ------------------------------------------------------

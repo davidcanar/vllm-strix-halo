@@ -22,7 +22,8 @@
 
 | metric (DeepSeek-V4-Flash-Vision-Exp, TP=2, DSpark k=5, eager) | value |
 |---|---|
-| decode | **25.4–27.3 / 23.1–25.7 tok/s** prose / JSON, counting 48–52 tok/s, acceptance 2.6–2.8 (110 ms step) — was 2.2 tok/s at the start of §35 |
+| decode | **24.4 / 24.7 tok/s** prose / JSON with the default sampling (temperature 1.0, top_p 0.95, §43); 27.2 / 23.1 greedy; counting 52 tok/s — was 2.2 tok/s at the start of §35 |
+| sampling defaults | model card: temperature 1.0, top_p 0.95, `max` reasoning effort; requests can override (`ds4_temperature`, `ds4_top_p`, `ds4_reasoning_effort`) |
 | decode, spec off | 15.4 tok/s eager, 16.7 with PIECEWISE graphs |
 | CUDA graphs | work, but with DSpark they are slower (20.8 / 21.6 tok/s), so DS4 runs eager (§39, §41) |
 | prefill | ~460 tok/s at 8K, 408 at 32K, 378 at 64K, 331 at 128K (§42: indexer kernel, mHC tiles, 2048-token chunks) |
@@ -32,7 +33,7 @@
 | thinking / tools | thinking mode ✅ (`chat_template_kwargs.thinking`); `deepseek_v4` tool + reasoning parsers |
 
 The detailed history — every bug, fix, measurement and dead end — lives in
-[PATCHES.md](PATCHES.md) (§1–§42). This README is the current state only.
+[PATCHES.md](PATCHES.md) (§1–§43). This README is the current state only.
 
 ---
 
@@ -150,8 +151,9 @@ remaining work in Known issues 5.
   `glm53_mtp_tokens: 3`); MTP (`glm5_next_mtp`) is the fallback and spec-off
   works too (§34)
 - **Execution**: CUDA graphs, PIECEWISE breakable capture, sizes 1/2/4/8;
-  `glm53_enforce_eager: 1` reverts to eager (§33). DS4 runs eager with DSpark k=5
-  (`ds4_enforce_eager: 1`, `ds4_mtp_tokens: 5`; graphs are slower with DSpark, §41)
+  `glm53_enforce_eager: 1` reverts to eager (§33). DS4 runs eager with DSpark k=5 and
+  probabilistic drafting (`ds4_enforce_eager: 1`, `ds4_mtp_tokens: 5`,
+  `ds4_draft_sample: probabilistic`; graphs are slower with DSpark, §41, §43)
 - **Quantization**: AWQ W4A16 for MoE experts (checkpoint). The checkpoint's
   BF16 linears (KDA/MLA projections, shared experts, dense MLPs) are
   re-quantized to int8 group-128 at load (§28); `lm_head` gets an int8 copy
@@ -188,7 +190,7 @@ vllm-strix-halo/
 │   └── pinned-triton/       # pinned Triton AMD driver
 ├── odinlink/                # OdinLink (odl_tb5) driver patch, odl_ar2, build/install scripts
 ├── scripts/                 # harnesses + unit tests (vsh_ab, stepbench, nll, ds4*, moe_*, test_*, trace_*)
-├── PATCHES.md               # detailed patch history and lessons (§1–§42)
+├── PATCHES.md               # detailed patch history and lessons (§1–§43)
 ├── FRESH-EYES-20tps.md      # decode-speed analysis behind §28–§33
 └── README.md                # this file
 ```
@@ -213,8 +215,8 @@ vllm-strix-halo/
    next rebase; worth reporting: gfx1151's `rocm_fp8_paged_mqa_logits`
    stage1 fallback scores paged SHUFFLE caches at random (our
    `vsh-kpool-paged-logits` replaces it).
-5. **DS4 native** — correct since §37; 25.4–27.3 / 23.1–25.7 tok/s prose / JSON with
-   DSpark k=5 (eager, §41), 15.4 tok/s without spec. Needles, counting, thinking mode
+5. **DS4 native** — correct since §37; 24.4 / 24.7 tok/s prose / JSON with DSpark k=5
+   and the default sampling (§43; 27.2 / 23.1 greedy), 15.4 tok/s without spec. Needles, counting, thinking mode
    and image input pass; 512K context fits. Prefill ~330–460 tok/s up to 128K (§42);
    it still slows with context because the indexer scores every earlier compressed
    position (now on fp16 WMMA, ~9x aiter's kernel). CUDA graphs work but are slower

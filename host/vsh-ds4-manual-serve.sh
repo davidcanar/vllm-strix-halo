@@ -92,9 +92,9 @@ if [ "${VSH_DS4_MTP_TOKENS:-5}" -gt 0 ]; then
   # deepseek_mtp k=5 under its own contract; upstream rejects that (n_predict=3
   # divisibility). Async scheduling OFF until validated on this path.
   if [ "${VSH_DS4_ASYNC_SCHED:-0}" = "1" ]; then
-    SPEC=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${VSH_DS4_MTP_TOKENS:-5},\"enforce_eager\":true}" --async-scheduling)
+    SPEC=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${VSH_DS4_MTP_TOKENS:-5},\"enforce_eager\":true${VSH_DS4_DRAFT_SAMPLE:+,\"draft_sample_method\":\"$VSH_DS4_DRAFT_SAMPLE\"}${VSH_DS4_ADAPTIVE_VERIFY:+,\"enable_adaptive_verification\":$VSH_DS4_ADAPTIVE_VERIFY}}" --async-scheduling)
   else
-    SPEC=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${VSH_DS4_MTP_TOKENS:-5},\"enforce_eager\":true}")
+    SPEC=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":${VSH_DS4_MTP_TOKENS:-5},\"enforce_eager\":true${VSH_DS4_DRAFT_SAMPLE:+,\"draft_sample_method\":\"$VSH_DS4_DRAFT_SAMPLE\"}${VSH_DS4_ADAPTIVE_VERIFY:+,\"enable_adaptive_verification\":$VSH_DS4_ADAPTIVE_VERIFY}}")
   fi
   echo "[vsh-ds4-serve] DSpark MTP ON (method=dspark, k=${VSH_DS4_MTP_TOKENS:-5})"
 else
@@ -102,7 +102,12 @@ else
 fi
 
 # Tool calling + reasoning separation (upstream deepseek_v4 parsers).
-TOOLS=(--enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --default-chat-template-kwargs '{"thinking":true,"reasoning_effort":"high"}')
+# Sampling defaults (requests that set their own values still win): the model card's
+# benchmark settings, temperature 1.0 / top_p 0.95 / max reasoning effort (PATCHES 43).
+# Knobs: ds4_temperature, ds4_top_p, ds4_reasoning_effort.
+GENCFG="{\"temperature\":${VSH_DS4_TEMPERATURE:-1.0},\"top_p\":${VSH_DS4_TOP_P:-0.95}}"
+TOOLS=(--enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --default-chat-template-kwargs "{\"thinking\":true,\"reasoning_effort\":\"${VSH_DS4_REASONING_EFFORT:-max}\"}")
+echo "[vsh-ds4-serve] sampling defaults $GENCFG, reasoning_effort ${VSH_DS4_REASONING_EFFORT:-max}"
 echo "[vsh-ds4-serve] tool-call + reasoning parsers ON (deepseek_v4)"
 
 # max_num_seqs knob: vLLM picks 1024 on a >70 GiB device, and on gfx1151 the
@@ -162,7 +167,7 @@ exec vllm serve "$MODEL_DIR" \
   "${MAXSEQS[@]}" \
   --trust-remote-code \
   --tokenizer-mode deepseek_v4 \
-  --override-generation-config '{"temperature":0.0,"top_p":1.0}' \
+  --override-generation-config "$GENCFG" \
   "${TOOLS[@]}" \
   "${SPEC[@]}" \
   --kernel-config "{\"linear_backend\":\"triton\"${VSH_DS4_MOE_KC}}" \
