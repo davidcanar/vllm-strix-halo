@@ -142,9 +142,8 @@ remaining work in Known issues 5.
   `kyuz0/vllm-therock-gfx1151:rocm10.0.0-torch2.11.0-vllm0.30.0`; vLLM pinned
   at `73859fec`; `container/pinned-vllm/` + `container/pinned-triton/` carry
   the byte-exact patched files for reproducible rebuilds). Snapshot of the
-  stack on both boxes: `vllm-strix-halo:glm-perf41-20261006` (through §41;
-  `:local` points at it; §42's DS4 prefill work is live in the containers and in
-  `container/pinned-vllm/`, not yet in a snapshot)
+  stack on both boxes: `vllm-strix-halo:glm-perf42-20261006` (through §42;
+  `:local` points at it)
 - **KV cache**: 16 GiB pinned, 256K max context (GLM); DS4: 6 GiB pinned = 901,584
   tokens of fp8_ds_mla with 2048-token prefill chunks, 512K max context
 - **Speculative decoding**: DFlash2 drafter, k=3 (`glm53_spec_method: dflash`,
