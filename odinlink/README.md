@@ -5,6 +5,26 @@ driver ([Geramy/OdinLink-Five](https://github.com/Geramy/OdinLink-Five),
 fetched at a pinned revision — nothing vendored). This is the cluster fabric,
 selected with `transport: odl` in `ds4-config.yaml`.
 
+> **Multi-link (3+ boxes) supersedes the single-cable rule below.**
+> This directory is the original vLLM/DS4 single-cable deployment. For more
+> than one OdinLink peer per host — and for 3-box TP=3 — use the maintained
+> kit in
+> [davidcanar/ExLlamaV3ROCm · `odinlink-multilink/`](https://github.com/davidcanar/ExLlamaV3ROCm/tree/main/odinlink-multilink),
+> which carries the same driver series plus:
+>
+> - `patches/linux/0001` — thunderbolt core source-XDomain protocol handlers
+>   (ABI-preserving: it does **not** extend `struct tb_protocol_handler`, which
+>   `thunderbolt_net` embeds — a mid-struct field addition corrupts
+>   `net->napi.state` and plugging a cable hangs the box);
+> - `patches/odinlink/0004` — demux LOGIN/LOGOUT by source XDomain instead of
+>   route, so both point-to-point peers complete their handshake;
+> - `patches/odinlink/0005` — bounded connect retries (the `-22` retry storm
+>   can wedge the USB4 controller and freeze a Strix Halo box);
+> - `docs/RUNBOOK.md` — bring-up order, MAC-bound addressing, verification.
+>
+> Upstream: Geramy/OdinLink-Five issue #35 and PR #37. Keep a single copy of
+> this code: do not grow a second divergent series here.
+
 ## Why this builds on a stock kernel
 
 Nothing here needs a patched kernel: no out-of-tree thunderbolt core, no
@@ -102,9 +122,11 @@ bring the cluster up normally (`transport: odl` is the default in
 
 ## Operating constraints
 
-- **Single cable only**: with two cables the identical-route XDomains cross
-  DMA paths — see "Why this builds on a stock kernel" above. tbnet coexists on
-  the same XDomain and carries the control plane (`thunderbolt0`).
+- **Single cable only** *in this deployment*: with two cables the
+  identical-route XDomains cross DMA paths — see "Why this builds on a stock
+  kernel" above. Multi-link is solved in the ExLlamaV3ROCm kit linked at the
+  top of this file (source-XDomain demux + patched core). tbnet coexists on the
+  same XDomain and carries the control plane (`thunderbolt0`).
 - `ring_size=1024` is the ceiling on these boxes (no CMA pool; the 4096
   ring's 16 MB contiguous alloc fails). `cma=256M` on the kernel cmdline
   would lift it. `odl-swap.sh` defaults to 1024 for that reason.
